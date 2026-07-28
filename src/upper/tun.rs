@@ -6,7 +6,8 @@
 //!
 //! Platform-specific implementations:
 //! - Linux: Uses the `tun` crate with `rtnetlink` for interface configuration
-//! - macOS: Uses the `tun` crate with `ifconfig`/`route` for interface configuration
+//! - macOS/FreeBSD: Uses the `tun` crate with `ifconfig`/`route` for interface
+//!   configuration
 //! - Windows: Uses the `wintun` crate for TUN device support
 
 #[cfg(windows)]
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::fs::File;
 #[cfg(unix)]
 use std::io::Read;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 #[cfg(unix)]
 use std::io::Write;
 use std::net::Ipv6Addr;
@@ -31,7 +32,7 @@ use tracing::error;
 use tracing::{debug, trace};
 #[cfg(windows)]
 use tracing::{error, warn};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use tun::Layer;
 
 /// Read-only handle to the per-destination path MTU map. Populated by
@@ -237,16 +238,20 @@ impl TunDevice {
         // Create the TUN device. `mut` is only exercised on linux/macos, where
         // the name/layer/mtu are set below; other unix targets (android) pass
         // the default config through unchanged.
-        #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")),
+            allow(unused_mut)
+        )]
         let mut tun_config = tun::Configuration::default();
 
-        // On macOS, utun devices get kernel-assigned names (utun0, utun1, ...),
-        // so we skip setting the name and read it back after creation.
         #[cfg(target_os = "linux")]
         #[allow(deprecated)]
         tun_config.name(name).layer(Layer::L3).mtu(mtu);
 
-        #[cfg(target_os = "macos")]
+        // On macOS and FreeBSD the kernel assigns the device name (utun0...,
+        // tun0...), so the name is not set here and is read back after
+        // creation.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         {
             #[allow(deprecated)]
             tun_config.layer(Layer::L3).mtu(mtu);
@@ -254,7 +259,25 @@ impl TunDevice {
 
         let device = tun::create(&tun_config)?;
 
-        // Read the actual device name (on macOS this is the kernel-assigned utun* name)
+        // FreeBSD: enable TUNSIFHEAD. Without it, tunoutput() rejects every
+        // non-IPv4 packet with EAFNOSUPPORT, so nothing IPv6 can be sent
+        // through the interface. With it, every frame on the fd carries a
+        // 4-byte network-order address-family prefix (like macOS utun),
+        // which the reader and writer handle.
+        #[cfg(target_os = "freebsd")]
+        {
+            const TUNSIFHEAD: libc::c_ulong = 0x8004_7460; // _IOW('t', 96, int)
+            let enable: libc::c_int = 1;
+            if unsafe { libc::ioctl(device.as_raw_fd(), TUNSIFHEAD, &enable) } != 0 {
+                return Err(TunError::Configure(format!(
+                    "TUNSIFHEAD ioctl failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        // Read the actual device name (on macOS and FreeBSD this is the
+        // kernel-assigned utunN / tunN name)
         let actual_name = {
             use tun::AbstractDevice;
             device
@@ -368,6 +391,7 @@ impl TunDevice {
 /// `AF_INET6` on Darwin). Used as the 4-byte big-endian packet-info
 /// header prepended to every utun frame.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 const UTUN_AF_INET6: u32 = 30;
 
 /// Build the 4-byte big-endian utun packet-info header for an IPv6 frame.
@@ -375,9 +399,12 @@ const UTUN_AF_INET6: u32 = 30;
 /// utun devices on macOS require a 4-byte address-family prefix on every
 /// frame: a single big-endian `u32` carrying the protocol family. For
 /// IPv6 traffic (the only family FIPS sends) this is `AF_INET6 = 30`,
-/// which serializes as `[0x00, 0x00, 0x00, 0x1e]`.
+/// which serializes as `[0x00, 0x00, 0x00, 0x1e]`. The writer builds the
+/// header from `libc::AF_INET6` directly (shared with FreeBSD); this
+/// helper pins the wire format for the round-trip tests below.
 #[cfg(target_os = "macos")]
 #[inline]
+#[allow(dead_code)]
 fn utun_af_inet6_header() -> [u8; 4] {
     UTUN_AF_INET6.to_be_bytes()
 }
@@ -421,7 +448,7 @@ impl TunWriter {
     ///
     /// Blocks forever, reading packets from the channel and writing them
     /// to the TUN device. Returns when the channel is closed (all senders dropped).
-    #[cfg_attr(target_os = "macos", allow(unused_mut))]
+    #[cfg_attr(any(target_os = "macos", target_os = "freebsd"), allow(unused_mut))]
     pub fn run(mut self) {
         use super::tcp_mss::clamp_tcp_mss;
 
@@ -445,14 +472,17 @@ impl TunWriter {
                 );
             }
 
-            // On macOS, utun devices require a 4-byte packet information header
-            // prepended to each packet. The tun crate handles this for its own
-            // Read/Write impl, but we use a dup'd fd directly. We use writev
-            // to avoid allocating a buffer on every packet.
-            #[cfg(target_os = "macos")]
+            // On macOS (utun) and FreeBSD (tun with TUNSIFHEAD), the device
+            // requires a 4-byte network-order address-family header prepended
+            // to each packet; the AF value differs per OS (macOS 30, FreeBSD
+            // 28) but both are the target's `libc::AF_INET6`. The tun crate
+            // handles this for its own Read/Write impl, but we use a dup'd fd
+            // directly. We use writev to avoid allocating a buffer on every
+            // packet.
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             let write_result = {
                 use std::os::unix::io::AsRawFd;
-                let af_header = utun_af_inet6_header();
+                let af_header = (libc::AF_INET6 as u32).to_be_bytes();
                 let iov = [
                     libc::iovec {
                         iov_base: af_header.as_ptr() as *mut libc::c_void,
@@ -478,7 +508,7 @@ impl TunWriter {
                     }
                 }
             };
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             let write_result = self.file.write_all(&packet);
 
             if let Err(e) = write_result {
@@ -507,7 +537,7 @@ impl TunWriter {
 /// This is designed to run in a dedicated thread since TUN reads are blocking.
 /// The loop exits when the TUN interface is deleted (EFAULT) or an unrecoverable
 /// error occurs.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 #[cfg(unix)]
 pub fn run_tun_reader(
     mut device: TunDevice,
@@ -551,10 +581,10 @@ pub fn run_tun_reader(
 ///
 /// Used to ensure the shutdown pipe read-end is always closed when
 /// `run_tun_reader` returns, regardless of which exit path is taken.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 struct ShutdownFd(std::os::unix::io::RawFd);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 impl Drop for ShutdownFd {
     fn drop(&mut self) {
         unsafe {
@@ -563,12 +593,14 @@ impl Drop for ShutdownFd {
     }
 }
 
-/// TUN packet reader loop (macOS).
+/// TUN packet reader loop (macOS / FreeBSD).
 ///
 /// Uses `select()` to multiplex between the TUN fd and a shutdown pipe,
 /// avoiding the need to close the TUN fd externally (which would cause a
-/// double-close when `TunDevice` drops).
-#[cfg(target_os = "macos")]
+/// double-close when `TunDevice` drops). Both platforms need the pipe
+/// because downing the interface does not reliably unblock a thread
+/// parked in a blocking TUN read on either of them.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_tun_reader(
     mut device: TunDevice,
@@ -630,8 +662,26 @@ pub fn run_tun_reader(
         loop {
             match device.read_packet(&mut buf) {
                 Ok(n) if n > 0 => {
+                    // FreeBSD (TUNSIFHEAD): every frame starts with a 4-byte
+                    // network-order address-family prefix. Strip it and skip
+                    // non-IPv6 frames. (On macOS the tun crate's Read impl
+                    // strips the utun prefix itself.)
+                    #[cfg(target_os = "freebsd")]
+                    let start = {
+                        if n <= 4 {
+                            continue;
+                        }
+                        let af = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        if af != libc::AF_INET6 as u32 {
+                            continue;
+                        }
+                        4
+                    };
+                    #[cfg(not(target_os = "freebsd"))]
+                    let start = 0;
+
                     if !handle_tun_packet(
-                        &mut buf[..n],
+                        &mut buf[start..n],
                         max_mss,
                         &name,
                         our_addr,
@@ -647,8 +697,12 @@ pub fn run_tun_reader(
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         break; // Done for this select round
                     }
-                    // EBADF is expected during shutdown when the fd is closed
-                    if e.raw_os_error() != Some(libc::EBADF) {
+                    // EBADF is expected during shutdown when the fd is
+                    // closed; ENXIO when the interface was destroyed out
+                    // from under the fd (FreeBSD).
+                    if e.raw_os_error() != Some(libc::EBADF)
+                        && e.raw_os_error() != Some(libc::ENXIO)
+                    {
                         error!(name = %name, error = %e, "TUN read error");
                     }
                     return; // _shutdown_fd closes on drop
@@ -1362,19 +1416,34 @@ mod platform {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod platform {
     use super::TunError;
     use std::net::Ipv6Addr;
     use tokio::process::Command;
 
     /// Check if IPv6 is disabled system-wide.
+    #[cfg(target_os = "macos")]
     pub fn is_ipv6_disabled() -> bool {
         // macOS: check via sysctl; if the key doesn't exist, IPv6 is enabled
         std::process::Command::new("sysctl")
             .args(["-n", "net.inet6.ip6.disabled"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false)
+    }
+
+    /// Check if IPv6 is disabled system-wide.
+    #[cfg(target_os = "freebsd")]
+    pub fn is_ipv6_disabled() -> bool {
+        // kern.features.inet6 is 1 when the kernel has IPv6 support. On a
+        // kernel built without INET6 the OID is absent entirely and sysctl
+        // exits nonzero, so a failed lookup means disabled. Only a failure
+        // to run sysctl at all assumes enabled.
+        std::process::Command::new("sysctl")
+            .args(["-n", "kern.features.inet6"])
+            .output()
+            .map(|o| !o.status.success() || String::from_utf8_lossy(&o.stdout).trim() != "1")
             .unwrap_or(false)
     }
 
@@ -1392,9 +1461,11 @@ mod platform {
 
     /// Shut down a network interface by name.
     ///
-    /// On macOS, utun devices are automatically destroyed when the file
-    /// descriptor is closed. Bringing the interface down causes any
-    /// blocking reads to return an error, which unblocks the reader thread.
+    /// utun (macOS) and devfs-cloned tun (FreeBSD) devices are
+    /// automatically destroyed by the kernel when the last file
+    /// descriptor closes. Bringing the interface down causes any
+    /// blocking reads to return an error, which unblocks the reader
+    /// thread.
     pub async fn delete_interface(name: &str) -> Result<(), TunError> {
         run_cmd("ifconfig", &[name, "down"]).await
     }
@@ -1408,6 +1479,12 @@ mod platform {
         )
         .await?;
 
+        // FreeBSD: a manually-configured interface with no autoconf
+        // link-local comes up with ND6_IFF_IFDISABLED set, which silently
+        // drops all IPv6.
+        #[cfg(target_os = "freebsd")]
+        run_cmd("ifconfig", &[name, "inet6", "-ifdisabled"]).await?;
+
         // Set MTU
         run_cmd("ifconfig", &[name, "mtu", &mtu.to_string()]).await?;
 
@@ -1415,6 +1492,7 @@ mod platform {
         run_cmd("ifconfig", &[name, "up"]).await?;
 
         // Add route for fd00::/8 (FIPS address space) via this interface
+        #[cfg(target_os = "macos")]
         run_cmd(
             "route",
             &[
@@ -1428,6 +1506,25 @@ mod platform {
             ],
         )
         .await?;
+
+        // FreeBSD: a leftover route from a previous run is not an error.
+        #[cfg(target_os = "freebsd")]
+        {
+            let output = Command::new("route")
+                .args(["-6", "add", "fd00::/8", "-interface", name])
+                .output()
+                .await
+                .map_err(|e| TunError::Configure(format!("route failed: {}", e)))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("File exists") && !stderr.contains("already in table") {
+                    return Err(TunError::Configure(format!(
+                        "route -6 add fd00::/8 failed: {}",
+                        stderr.trim()
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1672,8 +1769,10 @@ mod tests {
         fn af_inet6_constant_matches_darwin() {
             // Darwin's <sys/socket.h> defines AF_INET6 = 30. If this ever
             // diverges, every utun write FIPS issues will be misclassified
-            // by the kernel and dropped.
+            // by the kernel and dropped. The writer builds the header from
+            // libc::AF_INET6, so pin that to the same value.
             assert_eq!(UTUN_AF_INET6, 30);
+            assert_eq!(libc::AF_INET6 as u32, UTUN_AF_INET6);
         }
 
         #[test]

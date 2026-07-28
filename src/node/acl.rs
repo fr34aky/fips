@@ -23,10 +23,16 @@ use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// Default path for the peer allow list.
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 pub const DEFAULT_PEERS_ALLOW_PATH: &str = "/etc/fips/peers.allow";
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub const DEFAULT_PEERS_ALLOW_PATH: &str = "/usr/local/etc/fips/peers.allow";
 
 /// Default path for the peer deny list.
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
 pub const DEFAULT_PEERS_DENY_PATH: &str = "/etc/fips/peers.deny";
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub const DEFAULT_PEERS_DENY_PATH: &str = "/usr/local/etc/fips/peers.deny";
 
 /// Result of evaluating a peer against the ACL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

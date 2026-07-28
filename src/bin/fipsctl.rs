@@ -294,9 +294,13 @@ fn print_response(value: &serde_json::Value) {
 
 /// Default directory for keygen output.
 fn default_key_dir() -> PathBuf {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
         PathBuf::from("/etc/fips")
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        PathBuf::from("/usr/local/etc/fips")
     }
     #[cfg(windows)]
     {

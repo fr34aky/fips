@@ -99,7 +99,13 @@ async fn run_daemon(
         _ => filter,
     };
 
-    fmt().with_env_filter(filter).with_target(true).init();
+    // ANSI color only when stdout is a terminal — under a supervisor
+    // (daemon(8), systemd) escape codes would litter the log file.
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .init();
 
     info!("FIPS {} starting", version::short_version());
 
