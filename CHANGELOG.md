@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- FreeBSD support for the daemon, `fipsctl`, and `fipstop`: native TUN
+  datapath (TUNSIFHEAD address-family framing, kernel-assigned `tunN`
+  device name as with `utun` on macOS), clean service teardown,
+  `/usr/local/etc/fips` config search path, and `/var/run/fips`
+  control-socket default (both shared with macOS). `fips-gateway`
+  remains Linux-only. Native `.pkg` packaging under `packaging/freebsd/`
+  (`make freebsd`) with rc.d services and `.fips` DNS integration for
+  `local_unbound`/`unbound`/`dnsmasq`. mDNS LAN discovery works via
+  `mdns-sd` 0.20 (`socket-pktinfo` 0.4.1, the first release that builds
+  on FreeBSD). Daemon logs now disable ANSI color when stdout is not a
+  terminal (all platforms).
+
 ### Changed
 
 - The Ethernet transport's per-interface `discovery` flag was renamed to
