@@ -26,19 +26,71 @@
 #   -h, --help           Show this help
 #
 # Integration suites (default coverage):
-#   static-mesh, static-chain, rekey, rekey-accept-off,
-#   rekey-outbound-only, gateway,
-#   acl-allowlist, firewall, nat-cone, nat-symmetric, nat-lan,
-#   nostr-publish-consume, stun-faults,
-#   chaos-smoke-10, chaos-churn-mixed-10, chaos-ethernet-mesh,
-#   chaos-ethernet-only, chaos-tcp-mesh, chaos-bottleneck-parent,
-#   chaos-cost-avoidance, chaos-cost-reeval, chaos-cost-stability,
-#   chaos-depth-vs-cost, chaos-mixed-technology, chaos-congestion-stress,
-#   chaos-bloom-storm,
+#   static-mesh, static-chain, gateway,
+#   firewall, nat-cone, nat-symmetric,
+#   nat-lan, nostr-publish-consume, stun-faults,
+#   chaos-churn-mixed-10, chaos-ethernet-mesh,
+#   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
 #   sidecar, dns-resolver, deb-install
 #
 # Opt-in (require --with-tor; depend on live Tor network):
 #   tor-socks5, tor-directory
+#
+# Deliberately not run by either runner, with the reason for each. Recorded
+# here so that "not in the suite list" stops being indistinguishable from
+# "forgotten", which is what it was until 2026-07-23:
+#   interop/         Manual. Driven by interop-stress.sh, which runs N
+#                    repetitions serially under netem and takes far longer
+#                    than a CI slot. No CI-sized entry point exists yet;
+#                    writing one is the work, not adding a line here.
+#   boringtun/       Comparative benchmark against a non-FIPS implementation.
+#                    Measures rather than asserts, and needs a boringtun
+#                    build CI does not have.
+#   iperf-test.sh    Bandwidth measurement, no pass/fail. Driven manually by
+#                    iperf-compare-refs.sh.
+#   ecn-ab-compare.sh  Manual A/B comparison, renamed from ecn-ab-test.sh
+#                    because it asserts nothing. Making it gateable needs a
+#                    calibration corpus that does not exist; see its header.
+#   mesh-lab/        Long-running multi-host lab, not a suite.
+#   acl-allowlist/   Retired from CI 2026-07-24 as redundant, not unrunnable.
+#                    The ACL decision is exhaustively unit-tested per npub over
+#                    real loaded allow/deny files (src/node/acl.rs mod tests:
+#                    allow-wins, allowlist-miss, deny-only, deny-all,
+#                    allow_all-override), and the inbound/outbound handshake-
+#                    admission path is covered in-process over loopback
+#                    (src/node/tests/acl.rs). The Docker suite's only unique
+#                    coverage was real-UDP admission, exercised by every other
+#                    real-transport suite. Still runnable by hand:
+#                    bash testing/acl-allowlist/test.sh
+#   admission-cap    Retired from CI 2026-07-24 as redundant, not unrunnable.
+#                    The inbound max_peers early-gate in handle_msg1 is unit-
+#                    tested over a real UDP socket by
+#                    handle_msg1_silent_drops_at_cap_for_new_peer in
+#                    src/node/tests/unit.rs: it sends a Msg1 from a fresh
+#                    identity at saturation and polls the sender socket to
+#                    assert no Msg2 returns — the same wire-observable
+#                    discriminator the Docker tcpdump used — plus a sibling
+#                    test for the existing-peer bypass. Still runnable by hand:
+#                    bash testing/static/scripts/admission-cap-test.sh
+#   rekey, rekey-accept-off, rekey-outbound-only
+#                    Retired from CI 2026-07-24 as redundant, not unrunnable.
+#                    The rekey timing/choreography decision (trigger, K-bit
+#                    cutover, drain, jitter, guards) is covered by the sans-IO
+#                    poll_rekey tests (src/proto/fsp/tests/core.rs,
+#                    src/proto/fmp/tests/core.rs); the data-plane continuity
+#                    across a real cutover by rekey_cutover_preserves_data_plane
+#                    (src/node/tests/session.rs, a real IK rekey over loopback);
+#                    the accept-off dual-init regression and the
+#                    udp.outbound_only rekey loop by the should_admit_msg1 and
+#                    dual-init chartests (src/node/tests/handshake.rs,
+#                    establish_chartests.rs). Still runnable by hand:
+#                    bash testing/static/scripts/rekey-test.sh
+#   ecn-ab-on, ecn-ab-off, maelstrom, maelstrom-sparse
+#                    Chaos scenarios excluded from CHAOS_SUITES. The two
+#                    ecn-ab ones are halves of the manual comparison above.
+#                    The two maelstrom ones are 600 s stress runs kept for
+#                    manual investigation. All four still load-check and
+#                    carry the default max_errors ceiling if run by hand.
 #
 # Exit codes:
 #   0   — all stages passed
@@ -92,27 +144,55 @@ ONLY_SUITE=""
 
 # All integration suites matching ci.yml
 STATIC_SUITES=(static-mesh static-chain)
-REKEY_SUITES=(rekey rekey-accept-off rekey-outbound-only)
-ADMISSION_SUITES=(admission-cap)
 # Each entry: "display-name scenario [--flag value ...]"
 CHAOS_SUITES=(
-    "smoke-10 smoke-10"
     "churn-mixed-10 churn-mixed --nodes 10 --duration 120"
     "ethernet-mesh ethernet-mesh"
     "ethernet-only ethernet-only"
     "tcp-mesh tcp-mesh"
-    "bottleneck-parent bottleneck-parent"
-    "cost-avoidance cost-avoidance"
-    "cost-reeval cost-reeval"
-    "cost-stability cost-stability"
-    "depth-vs-cost depth-vs-cost"
-    "mixed-technology mixed-technology"
     "congestion-stress congestion-stress"
-    "bloom-storm bloom-storm"
 )
+# Scenarios retired 2026-07-23 because their subject was a pure decision the
+# Docker harness could not test reliably, now covered by sans-IO unit tests:
+#   - cost-reeval, cost-avoidance, cost-stability, depth-vs-cost,
+#     mixed-technology, bottleneck-parent: the evaluate_parent() cost/depth/
+#     hysteresis decision (root election, MMP measurement lag and hold-down
+#     timing all confounded the assertions) -> src/tree/tests.rs.
+#   - congestion-drops (never landed): the SO_RXQ_OVFL detection edge. A
+#     fresh daemon reader keeps up with container-speed traffic, so the
+#     socket overflow could not be provoked deterministically; the FIPS
+#     detection logic is now unit-tested in src/node/tests/unit.rs.
+# congestion-stress stays: it exercises the ECN/MMP congestion signals,
+# which do need the real shaped bottleneck queue.
+#
+# Retired 2026-07-24 for a different reason — redundant, not unreliable:
+#   - smoke-10: a no-stressor 10-node tree-convergence sanity check (netem
+#     off, no ping). The convergence logic it exercised is covered in-process,
+#     faster and deterministically, by the loopback spanning-tree harness
+#     (src/node/tests/spanning_tree.rs: ring/star/chain/100-node/disconnected)
+#     plus end-to-end datagram delivery (src/node/tests/forwarding.rs). Real-
+#     UDP convergence smoke still runs via static-mesh and the other chaos
+#     scenarios' baseline assertions, so no Docker coverage is lost.
+#
+# Retired 2026-07-26 for a third reason — the guard's power was never
+# established, and unlike the two blocks above this one DOES lose coverage:
+#   - bloom-storm: guarded the regression in 0caef2a (fixed by 4cdf382), where
+#     a mid-chain tree update changing neither root nor depth leaked downstream
+#     as a sustained bloom announce storm. It was never once run against that
+#     regressed binary; its ceiling was inferred from a separate post-mortem
+#     harness that no longer exists in the tree. On the only regressed
+#     measurement that survives, the tail node's rate scales to ~7 sends per
+#     30s, well under the scenario's ceiling of 40 — so it is not established
+#     that the assertion could ever have fired on its own bug class. The
+#     ceiling is also uniform per node, calibrated against the flap target
+#     (legitimately ~24) while the storm's actual signature is at the tail,
+#     which sits at 0 on fixed code. COVERAGE GAP: nothing now exercises
+#     downstream containment of a mid-chain ancestor swap. The scenario, its
+#     README, the link_swap sim primitive and the mesh-lab dispatch all stay
+#     on disk and it remains runnable by hand via
+#     testing/chaos/scripts/chaos.sh bloom-storm.
 GATEWAY_SUITES=(gateway)
 SIDECAR_SUITES=(sidecar)
-ACL_SUITES=(acl-allowlist)
 FIREWALL_SUITES=(firewall)
 NAT_SUITES=(cone symmetric lan)
 NOSTR_RELAY_SUITES=(nostr-publish-consume)
@@ -145,17 +225,8 @@ list_suites() {
     echo "  Static topologies:"
     for s in "${STATIC_SUITES[@]}"; do echo "    $s"; done
     echo ""
-    echo "  Rekey:"
-    for s in "${REKEY_SUITES[@]}"; do echo "    $s"; done
-    echo ""
-    echo "  Admission cap:"
-    for s in "${ADMISSION_SUITES[@]}"; do echo "    $s"; done
-    echo ""
     echo "  Gateway:"
     for s in "${GATEWAY_SUITES[@]}"; do echo "    $s"; done
-    echo ""
-    echo "  ACL allowlist:"
-    for s in "${ACL_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Firewall baseline:"
     for s in "${FIREWALL_SUITES[@]}"; do echo "    $s"; done
@@ -233,8 +304,9 @@ record() {
 #
 # This script may be preempted (a CI worker sends SIGTERM, waits ~30s, then
 # SIGKILL) so it can restart on a newer tip. To make that safe:
-#   * every docker resource is namespaced to THIS run (compose project prefix
-#     + per-run image tags) so a restart never collides with a dying run;
+#   * every docker resource is namespaced to THIS run (compose project prefix,
+#     per-run image tags, per-run build context) so a restart never collides
+#     with a dying run, and neither does a concurrent one;
 #   * a trap tears down everything this run created on signal/exit, bounded by
 #     `timeout` so a stuck `down` cannot wedge the trap (SIGKILL is the backstop).
 
@@ -271,6 +343,14 @@ CI_LABEL_RUN="com.corganlabs.fips-ci.run=${CI_RUN_ID}"
 export FIPS_CI_RUN_ID="$CI_RUN_ID"
 export FIPS_TEST_IMAGE="$CI_IMAGE_TEST"
 export FIPS_TEST_APP_IMAGE="$CI_IMAGE_APP"
+# The build context is this run's too. testing/docker/ is a single directory in
+# the working tree, so two runs racing on its CONTENTS produce a per-run-tagged
+# image built from the other run's binaries — scoping the tag alone does not
+# close that. Absolute, and it has to be: compose interpolates this into
+# build.context but resolves a relative result against the compose FILE's
+# directory, not the working directory.
+CI_BUILD_CONTEXT="$SCRIPT_DIR/docker-${CI_RUN_ID}"
+export FIPS_BUILD_CONTEXT="$CI_BUILD_CONTEXT"
 # Docker container names are GLOBAL — a compose project name does not scope
 # them — so the suite compose files append this suffix to every explicit
 # container_name, and the suite scripts append it wherever they address a
@@ -336,6 +416,12 @@ ci_teardown() {
     for _entry in "${CHAOS_SUITES[@]}"; do
         _suffixes+=("$(ci_chaos_suffix "${_entry%% *}")")
     done
+    #    The NAT lab's host veths (vn{a,b}{token}{0,1}) carry the RUN-wide
+    #    suffix, not any chaos scenario's, so its token appears in no suffix
+    #    above and the reaper's NAT shape would match nothing at all. This is
+    #    the half of that fix that fails silently: widening the regex in
+    #    ci-cleanup.sh without this line looks correct and reaps nothing.
+    _suffixes+=("$CI_RUN_NAME_SUFFIX")
     timeout 150 bash "$SCRIPT_DIR/ci-cleanup.sh" \
         --label "$CI_LABEL" \
         --run-id "$CI_RUN_ID" \
@@ -343,15 +429,30 @@ ci_teardown() {
         --images "$CI_IMAGE_TEST $CI_IMAGE_APP" \
         --veth-suffixes "${_suffixes[*]}" >/dev/null || true
 
-    # 3. The static suite's generated configs are per-run (a shared directory
-    #    would let concurrent runs overwrite each other's node configs), so
-    #    they are this run's to remove. Only on a green run: after a failure
-    #    they are the evidence of what the failing nodes were actually
+    # 3. The static, firewall and nat suites' generated configs are per-run (a
+    #    shared directory would let concurrent runs overwrite each other's node
+    #    configs), so they are this run's to remove. Only on a green run: after
+    #    a failure they are the evidence of what the failing nodes were actually
     #    configured with. Guarded on a non-empty suffix too, since without one
     #    the path is the unscoped working directory a developer uses by hand,
     #    which is not ours to delete.
+    #
+    #    Every suite whose configs become per-run owes a line here. acl-allowlist
+    #    also generates per-run now but is not in this runner's suite list, so
+    #    this teardown never creates its directory and must not remove one.
     if [[ $run_status -eq 0 && -n "${CI_RUN_NAME_SUFFIX:-}" ]]; then
         rm -rf "$SCRIPT_DIR/static/generated-configs${CI_RUN_NAME_SUFFIX}"
+        rm -rf "$SCRIPT_DIR/firewall/generated-configs${CI_RUN_NAME_SUFFIX}"
+        rm -rf "$SCRIPT_DIR/nat/generated-configs${CI_RUN_NAME_SUFFIX}"
+    fi
+
+    # 4. This run's build context. Unlike the generated configs it is removed
+    #    on a red run too: it holds the binaries and the Dockerfiles, both
+    #    reproducible from the commit, so it is never the evidence of a
+    #    failure. Guarded on the path having been derived at all, so an early
+    #    exit cannot turn this into `rm -rf $SCRIPT_DIR/docker-`.
+    if [[ -n "${CI_BUILD_CONTEXT:-}" && "$CI_BUILD_CONTEXT" != "$SCRIPT_DIR/docker-" ]]; then
+        rm -rf "$CI_BUILD_CONTEXT"
     fi
 }
 
@@ -420,6 +521,30 @@ run_build() {
         return 1
     fi
 
+    # An optional feature means two source trees, and --all-features lints only
+    # one of them. The default build is what ships, so lint it explicitly:
+    # without this stage, code that compiles only with `profiling` enabled would
+    # pass CI while breaking every release build.
+    info "cargo clippy --all-targets -- -D warnings (default features)"
+    if cargo clippy --all-targets -- -D warnings 2>&1; then
+        record "clippy-default-features" 0
+    else
+        record "clippy-default-features" 1
+        return 1
+    fi
+
+    # Tick-body profiler: the feature-on tree must build too. Added alongside
+    # the default-feature stages rather than replacing them. Mirrored in
+    # .github/workflows/ci.yml — check-ci-parity.sh compares integration suites
+    # only and will not catch a stage added to one runner and not the other.
+    info "cargo build --workspace --features profiling"
+    if cargo build --workspace --features profiling 2>&1; then
+        record "build-profiling" 0
+    else
+        record "build-profiling" 1
+        return 1
+    fi
+
     # Guard: the effectively-immutable state lives solely in NodeContext. The
     # Node struct must not re-declare a bundled field (config/identity/
     # startup_epoch/started_at/is_leaf_only/node_profile/max_*) — a shadow field
@@ -458,6 +583,17 @@ run_tests() {
         else
             record "unit-tests" 1
         fi
+    fi
+
+    # The `profiling` feature adds a module, a recorder and a writer thread that
+    # the default-feature run above never compiles. Run the library tests once
+    # more with it on so its own tests execute at all. Mirrored in
+    # .github/workflows/ci.yml.
+    info "cargo test --lib --features profiling"
+    if cargo test --lib --features profiling 2>&1; then
+        record "unit-tests-profiling" 0
+    else
+        record "unit-tests-profiling" 1
     fi
 }
 
@@ -501,61 +637,6 @@ run_static() {
     record "static-$topology" $rc
 }
 
-# Run the rekey integration test
-run_rekey() {
-    local compose="testing/static/docker-compose.yml"
-    local rc=0
-    export COMPOSE_PROJECT_NAME="$(ci_project static)"
-
-    info "[rekey] Generating configs"
-    bash testing/static/scripts/generate-configs.sh rekey || { record "rekey" 1; return; }
-    bash testing/static/scripts/rekey-test.sh inject-config || { record "rekey" 1; return; }
-
-    info "[rekey] Starting containers"
-    docker compose -f "$compose" --profile rekey up -d || { record "rekey" 1; return; }
-
-    info "[rekey] Running rekey test"
-    if bash testing/static/scripts/rekey-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[rekey] Collecting failure logs"
-        docker compose -f "$compose" --profile rekey logs --no-color 2>&1 | tail -100
-    fi
-
-    docker compose -f "$compose" --profile rekey down --volumes --remove-orphans 2>/dev/null
-    record "rekey" $rc
-}
-
-# Run the admission-cap integration test
-# Verifies the inbound max_peers early-gate silent-drops at scale by
-# lowering node.max_peers on one mesh node and asserting via tcpdump
-# that no Msg2 responses go to the sustained-retrying denied peers.
-run_admission_cap() {
-    local compose="testing/static/docker-compose.yml"
-    local rc=0
-    export COMPOSE_PROJECT_NAME="$(ci_project static)"
-
-    info "[admission-cap] Generating configs"
-    bash testing/static/scripts/generate-configs.sh mesh || { record "admission-cap" 1; return; }
-    bash testing/static/scripts/admission-cap-test.sh inject-config || { record "admission-cap" 1; return; }
-
-    info "[admission-cap] Starting containers (mesh profile)"
-    docker compose -f "$compose" --profile mesh up -d || { record "admission-cap" 1; return; }
-
-    info "[admission-cap] Running admission-cap test"
-    if bash testing/static/scripts/admission-cap-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[admission-cap] Collecting failure logs"
-        docker compose -f "$compose" --profile mesh logs --no-color 2>&1 | tail -100
-    fi
-
-    docker compose -f "$compose" --profile mesh down --volumes --remove-orphans 2>/dev/null
-    record "admission-cap" $rc
-}
-
 # Run a chaos scenario
 run_chaos() {
     local name="$1"
@@ -594,29 +675,77 @@ run_chaos() {
     return $rc
 }
 
+# Claim a free /64 for this run's gateway-lan network (Mechanism B).
+#
+# gateway-lan cannot float like fips-net: the LAN clients' resolv.conf pins the
+# gateway's LAN address as their nameserver, which must be a literal known
+# before they start. So instead of a fixed fd02::/64 that two concurrent runs
+# both request (the second failing on "Pool overlaps"), claim-and-advance a
+# candidate /64 and let docker's create be the atomic arbiter. The claimed
+# prefix is threaded — via the exported FIPS_GW_LAN6_PREFIX — into the compose
+# ipv6_address pins, the generated resolv.conf, and gateway-test.sh, so every
+# LAN address moves with the claim. i=0 renders today's fd02::/64.
+#
+# Mirrors sidecar/scripts/test-sidecar.sh:alloc_network. Deliberately does NOT
+# discard stderr: only an address-pool conflict is worth advancing on; any other
+# failure is real and burning through 256 candidates would bury the reason.
+claim_gateway_lan6() {
+    local net="$1" i err
+    for (( i = 0; i < 256; i++ )); do
+        if err=$(docker network create --ipv6 \
+                --subnet "fd02:0:0:${i}::/64" \
+                --label "$CI_LABEL" --label "$CI_LABEL_RUN" \
+                "$net" 2>&1); then
+            export FIPS_GW_LAN6_PREFIX="fd02:0:0:${i}"
+            info "[gateway] Claimed $net on fd02:0:0:${i}::/64"
+            return 0
+        fi
+        case "$err" in
+            *"Pool overlaps"*|*"pool overlaps"*) continue ;;
+            *) fail "[gateway] docker network create: $err"; return 1 ;;
+        esac
+    done
+    fail "[gateway] no free /64 in fd02:0:0:0-255::/64 after 256 attempts"
+    return 1
+}
+
 # Run gateway integration test
 run_gateway() {
     local compose="testing/static/docker-compose.yml"
+    local ext="testing/static/docker-compose.gateway-external-net.yml"
     local rc=0
     export COMPOSE_PROJECT_NAME="$(ci_project static)"
+    export FIPS_GW_LAN_NET="fips-gateway-lan${FIPS_CI_NAME_SUFFIX:-}"
 
-    info "[gateway] Generating configs"
-    bash testing/static/scripts/generate-configs.sh gateway gateway-test || { record "gateway" 1; return; }
-    bash testing/static/scripts/gateway-test.sh inject-config || { record "gateway" 1; return; }
-
-    info "[gateway] Starting containers"
-    docker compose -f "$compose" --profile gateway up -d || { record "gateway" 1; return; }
-
-    info "[gateway] Running gateway test"
-    if bash testing/static/scripts/gateway-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[gateway] Collecting failure logs"
-        docker compose -f "$compose" --profile gateway logs --no-color 2>&1 | tail -100
+    # Claim the LAN /64 first: generate-configs writes resolv.conf from the
+    # claimed prefix, and inject-config renders the port-forward targets from
+    # it, so both must see FIPS_GW_LAN6_PREFIX before they run.
+    info "[gateway] Claiming LAN network"
+    if ! claim_gateway_lan6 "$FIPS_GW_LAN_NET"; then
+        record "gateway" 1
+        return
     fi
 
-    docker compose -f "$compose" --profile gateway down --volumes --remove-orphans 2>/dev/null
+    info "[gateway] Generating configs"
+    if bash testing/static/scripts/generate-configs.sh gateway gateway-test \
+        && bash testing/static/scripts/gateway-test.sh inject-config \
+        && { info "[gateway] Starting containers"; \
+             docker compose -f "$compose" -f "$ext" --profile gateway up -d; }; then
+        info "[gateway] Running gateway test"
+        if bash testing/static/scripts/gateway-test.sh; then
+            rc=0
+        else
+            rc=1
+            info "[gateway] Collecting failure logs"
+            docker compose -f "$compose" -f "$ext" --profile gateway logs --no-color 2>&1 | tail -100
+        fi
+    else
+        rc=1
+    fi
+
+    # compose down does not remove an external network, so drop it explicitly.
+    docker compose -f "$compose" -f "$ext" --profile gateway down --volumes --remove-orphans 2>/dev/null
+    docker network rm "$FIPS_GW_LAN_NET" >/dev/null 2>&1 || true
     record "gateway" $rc
 }
 
@@ -635,84 +764,6 @@ run_sidecar() {
     record "sidecar" $rc
 }
 
-# Run the rekey-accept-off integration variant. Same harness as run_rekey
-# but on a 2-node topology with udp.accept_connections=false on node-b.
-run_rekey_accept_off() {
-    local compose="testing/static/docker-compose.yml"
-    local rc=0
-    export COMPOSE_PROJECT_NAME="$(ci_project static)"
-
-    info "[rekey-accept-off] Generating configs"
-    bash testing/static/scripts/generate-configs.sh rekey-accept-off || \
-        { record "rekey-accept-off" 1; return; }
-    REKEY_TOPOLOGY=rekey-accept-off REKEY_ACCEPT_OFF_NODES=b \
-        bash testing/static/scripts/rekey-test.sh inject-config || \
-        { record "rekey-accept-off" 1; return; }
-
-    info "[rekey-accept-off] Starting containers"
-    docker compose -f "$compose" --profile rekey-accept-off up -d || \
-        { record "rekey-accept-off" 1; return; }
-
-    info "[rekey-accept-off] Running rekey test"
-    if REKEY_TOPOLOGY=rekey-accept-off REKEY_ACCEPT_OFF_NODES=b \
-        bash testing/static/scripts/rekey-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[rekey-accept-off] Collecting failure logs"
-        docker compose -f "$compose" --profile rekey-accept-off logs --no-color 2>&1 | tail -100
-    fi
-
-    docker compose -f "$compose" --profile rekey-accept-off down --volumes --remove-orphans 2>/dev/null
-    record "rekey-accept-off" $rc
-}
-
-# Run the rekey-outbound-only integration variant. Same harness as
-# run_rekey but with udp.outbound_only=true on node-b plus its peer
-# addrs rewritten from numeric docker IPs to docker hostnames so the
-# addr_to_link key form mismatches inbound packet source addrs (the
-# production trigger for the rekey-msg1 carve-out gap).
-run_rekey_outbound_only() {
-    local compose="testing/static/docker-compose.yml"
-    local rc=0
-    export COMPOSE_PROJECT_NAME="$(ci_project static)"
-
-    info "[rekey-outbound-only] Generating configs"
-    bash testing/static/scripts/generate-configs.sh rekey-outbound-only || \
-        { record "rekey-outbound-only" 1; return; }
-    REKEY_TOPOLOGY=rekey-outbound-only REKEY_OUTBOUND_ONLY_NODES=b \
-        bash testing/static/scripts/rekey-test.sh inject-config || \
-        { record "rekey-outbound-only" 1; return; }
-
-    info "[rekey-outbound-only] Starting containers"
-    docker compose -f "$compose" --profile rekey-outbound-only up -d || \
-        { record "rekey-outbound-only" 1; return; }
-
-    info "[rekey-outbound-only] Running rekey test"
-    if REKEY_TOPOLOGY=rekey-outbound-only REKEY_OUTBOUND_ONLY_NODES=b \
-        bash testing/static/scripts/rekey-test.sh; then
-        rc=0
-    else
-        rc=1
-        info "[rekey-outbound-only] Collecting failure logs"
-        docker compose -f "$compose" --profile rekey-outbound-only logs --no-color 2>&1 | tail -100
-    fi
-
-    docker compose -f "$compose" --profile rekey-outbound-only down --volumes --remove-orphans 2>/dev/null
-    record "rekey-outbound-only" $rc
-}
-
-# Run ACL allowlist integration test
-run_acl_allowlist() {
-    export COMPOSE_PROJECT_NAME="$(ci_project acl)"
-    info "[acl-allowlist] Running integration test"
-    if bash testing/acl-allowlist/test.sh --skip-build 2>&1; then
-        record "acl-allowlist" 0
-    else
-        record "acl-allowlist" 1
-    fi
-}
-
 # Run firewall baseline integration test
 run_firewall() {
     export COMPOSE_PROJECT_NAME="$(ci_project firewall)"
@@ -724,16 +775,138 @@ run_firewall() {
     fi
 }
 
+# ── NAT lab: per-run network claim ─────────────────────────────────────────
+#
+# The lab's two bridges pinned 172.31.254.0/24 (wan) and 172.31.10.0/24
+# (shared-lan), so two concurrent runs asked the daemon for the same address
+# space and the second died with `Pool overlaps`. Claim a free /24 for each
+# instead and let docker's own create be the atomic arbiter, exactly as
+# claim_gateway_lan6 and sidecar's alloc_network do. The run-id-derived offset
+# this task considered earlier stays rejected: it makes a collision unlikely
+# rather than impossible, and a collision is the failure being removed.
+#
+# 10.41.0.0/16 is unclaimed in-tree, sits below this host's docker pool
+# (10.128.0.0/9, per /etc/docker/daemon.json), and is also outside docker's
+# stock 172.17-31 / 192.168 default, so the choice holds either way.
+#
+# The claim lives here rather than in the suite scripts because
+# .github/workflows/ci.yml invokes nat-test.sh, nostr-relay-test.sh and
+# stun-faults-test.sh directly and testing/mesh-lab/run-loop.sh invokes
+# `nat-test.sh lan`; none of those want a claim, and all tear down with the
+# base compose file only.
+#
+# One claim per SUITE invocation, not per run — matching run_gateway. Both
+# labels are stamped so ci-cleanup.sh's label sweep can recover the networks
+# when a run is SIGKILLed, which no inline removal can cover.
+CI_NAT_NET_BASE="10.41"
+CI_NAT_NET_CANDIDATES=256
+CI_NAT_CLAIMED_PREFIX=""
+
+# Deliberately does NOT discard stderr: only an address-pool conflict is worth
+# advancing on. Any other failure is real, and burning through 256 candidates
+# would bury the reason.
+ci_claim_nat_net() {
+    local net="$1" i err
+    CI_NAT_CLAIMED_PREFIX=""
+    for (( i = 0; i < CI_NAT_NET_CANDIDATES; i++ )); do
+        if err=$(docker network create \
+                --subnet "${CI_NAT_NET_BASE}.${i}.0/24" \
+                --label "$CI_LABEL" --label "$CI_LABEL_RUN" \
+                "$net" 2>&1); then
+            CI_NAT_CLAIMED_PREFIX="${CI_NAT_NET_BASE}.${i}"
+            info "[nat] Claimed $net on ${CI_NAT_CLAIMED_PREFIX}.0/24"
+            return 0
+        fi
+        case "$err" in
+            *"Pool overlaps"*|*"pool overlaps"*) continue ;;
+            *) fail "[nat] docker network create: $err"; return 1 ;;
+        esac
+    done
+    fail "[nat] no free /24 in ${CI_NAT_NET_BASE}.0.0/16 after ${CI_NAT_NET_CANDIDATES} attempts"
+    return 1
+}
+
+# Claim both lab networks and export the prefixes every lab address derives
+# from. A partial claim is rolled back here, because nothing downstream will
+# run to release it.
+ci_claim_nat_networks() {
+    unset NAT_WAN_PREFIX NAT_LAN_PREFIX
+    export FIPS_NAT_WAN_NET="fips-nat-wan${FIPS_CI_NAME_SUFFIX:-}"
+    export FIPS_NAT_LAN_NET="fips-nat-shared-lan${FIPS_CI_NAME_SUFFIX:-}"
+
+    ci_claim_nat_net "$FIPS_NAT_WAN_NET" || return 1
+    local wan="$CI_NAT_CLAIMED_PREFIX"
+    if ! ci_claim_nat_net "$FIPS_NAT_LAN_NET"; then
+        docker network rm "$FIPS_NAT_WAN_NET" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    export NAT_WAN_PREFIX="$wan"
+    export NAT_LAN_PREFIX="$CI_NAT_CLAIMED_PREFIX"
+}
+
+# Release both claimed networks. A complete claim left behind would not merely
+# leak: the next nat-family suite in this run would hit `network with name ...
+# already exists`, which is not a pool overlap, so the allocator correctly
+# refuses to advance and fails. One suite failure would cascade into four.
+#
+# Both halves of run_gateway's shape are needed, and the second alone is a trap.
+# `docker network rm` refuses a network that still has endpoints attached, and
+# the nat suites deliberately leave their containers UP on a failure path so the
+# diagnostics they just dumped can be inspected — which is precisely the path
+# this release exists for. Without the `down` the removal silently no-ops
+# exactly when it matters and reports success. Nothing is lost by tearing down
+# here: the diagnostics are already in the run log, and ci_teardown reaps the
+# containers at the end of the run regardless.
+ci_release_nat_networks() {
+    docker compose \
+        -f testing/nat/docker-compose.yml \
+        -f testing/nat/docker-compose.external-net.yml \
+        --profile cone --profile symmetric --profile lan \
+        --profile nostr-publish-consume --profile stun-faults \
+        down --volumes --remove-orphans >/dev/null 2>&1 || true
+    [[ -n "${FIPS_NAT_WAN_NET:-}" ]] && \
+        { docker network rm "$FIPS_NAT_WAN_NET" >/dev/null 2>&1 || true; }
+    [[ -n "${FIPS_NAT_LAN_NET:-}" ]] && \
+        { docker network rm "$FIPS_NAT_LAN_NET" >/dev/null 2>&1 || true; }
+    return 0
+}
+
+# The overlay pointing compose at the claimed networks. APPENDED to any
+# caller-supplied chain rather than replacing it: mesh-lab/run-loop.sh sets
+# FIPS_NAT_EXTRA_COMPOSE for its trace overlay, and overwriting would silently
+# drop that.
+ci_nat_extra_compose() {
+    printf '%s' \
+        "${FIPS_NAT_EXTRA_COMPOSE:+${FIPS_NAT_EXTRA_COMPOSE}:}testing/nat/docker-compose.external-net.yml"
+}
+
 # Run a NAT scenario (cone, symmetric, lan)
 run_nat() {
     local scenario="$1"
+    local rc=0
     export COMPOSE_PROJECT_NAME="$(ci_project nat)"
-    info "[nat-$scenario] Running NAT lab"
-    if bash testing/nat/scripts/nat-test.sh "$scenario" 2>&1; then
-        record "nat-$scenario" 0
-    else
+
+    # Early return only BEFORE the claim succeeds, so nothing can leak. Every
+    # path after it falls through to the single release below — run_gateway's
+    # shape. Not a trap: bash traps are not function-scoped, so a `trap ... EXIT`
+    # here would replace the script-level on_exit handler for the rest of the
+    # run and disable ci_teardown entirely.
+    info "[nat-$scenario] Claiming lab networks"
+    if ! ci_claim_nat_networks; then
         record "nat-$scenario" 1
+        return
     fi
+
+    local _extra
+    _extra="$(ci_nat_extra_compose)"
+    local -x FIPS_NAT_EXTRA_COMPOSE="$_extra"
+
+    info "[nat-$scenario] Running NAT lab"
+    bash testing/nat/scripts/nat-test.sh "$scenario" 2>&1 || rc=1
+
+    ci_release_nat_networks
+    record "nat-$scenario" $rc
 }
 
 # Run the Nostr overlay advert publish/consume integration test.
@@ -741,13 +914,24 @@ run_nat() {
 # (A→B publish/consume), Phase 2 (B→A reverse), and Phase 3 (malformed
 # advert injected directly to the relay; consumer-liveness assertion).
 run_nostr_publish_consume() {
+    local rc=0
     export COMPOSE_PROJECT_NAME="$(ci_project nat)"
-    info "[nostr-publish-consume] Running Nostr publish/consume test"
-    if bash testing/nat/scripts/nostr-relay-test.sh 2>&1; then
-        record "nostr-publish-consume" 0
-    else
+
+    info "[nostr-publish-consume] Claiming lab networks"
+    if ! ci_claim_nat_networks; then
         record "nostr-publish-consume" 1
+        return
     fi
+
+    local _extra
+    _extra="$(ci_nat_extra_compose)"
+    local -x FIPS_NAT_EXTRA_COMPOSE="$_extra"
+
+    info "[nostr-publish-consume] Running Nostr publish/consume test"
+    bash testing/nat/scripts/nostr-relay-test.sh 2>&1 || rc=1
+
+    ci_release_nat_networks
+    record "nostr-publish-consume" $rc
 }
 
 # Run the STUN fault-injection integration test.
@@ -756,13 +940,24 @@ run_nostr_publish_consume() {
 # kill. Asserts the daemon detects each fault, recovers from delay, and
 # never panics.
 run_stun_faults() {
+    local rc=0
     export COMPOSE_PROJECT_NAME="$(ci_project nat)"
-    info "[stun-faults] Running STUN fault-injection test"
-    if bash testing/nat/scripts/stun-faults-test.sh 2>&1; then
-        record "stun-faults" 0
-    else
+
+    info "[stun-faults] Claiming lab networks"
+    if ! ci_claim_nat_networks; then
         record "stun-faults" 1
+        return
     fi
+
+    local _extra
+    _extra="$(ci_nat_extra_compose)"
+    local -x FIPS_NAT_EXTRA_COMPOSE="$_extra"
+
+    info "[stun-faults] Running STUN fault-injection test"
+    bash testing/nat/scripts/stun-faults-test.sh 2>&1 || rc=1
+
+    ci_release_nat_networks
+    record "stun-faults" $rc
 }
 
 # Run dns-resolver harness (multi-distro + e2e scenarios)
@@ -811,24 +1006,39 @@ run_tor_directory() {
 run_integration() {
     stage "Stage 3: Integration Tests"
 
-    # Install binaries to shared docker context
+    # Populate THIS run's build context, then install the binaries into it.
+    # Everything but the binaries is copied from the tracked context directory;
+    # the binaries are installed fresh, and a previous run's are deliberately
+    # not carried over, since inheriting them is the failure this scoping
+    # exists to prevent.
+    info "Preparing build context $CI_BUILD_CONTEXT"
+    rm -rf "$CI_BUILD_CONTEXT"
+    mkdir -p "$CI_BUILD_CONTEXT" || { record "docker-build" 1; return; }
+    local _f
+    for _f in "$SCRIPT_DIR"/docker/*; do
+        case "$(basename "$_f")" in
+            fips|fipsctl|fipstop|fips-gateway) continue ;;
+        esac
+        cp -a "$_f" "$CI_BUILD_CONTEXT/" || { record "docker-build" 1; return; }
+    done
+
     info "Installing release binaries"
-    install_binaries testing/docker
+    install_binaries "$CI_BUILD_CONTEXT"
 
     # Build unified test image once (used by all harnesses). Tag per-run
     # (fips-test:${run}) so a build killed mid-flight never wedges the next
     # run's rebuild, and concurrent runs never clobber each other's image.
-    # Then retag :latest for the compose files / harness scripts that still
-    # reference fips-test:latest directly; the retag happens only after BOTH
-    # builds succeed, so :latest never points at a half-built image.
     info "Building $CI_IMAGE_TEST Docker image"
-    docker build -t "$CI_IMAGE_TEST" --label "$CI_LABEL" --label "$CI_LABEL_RUN" testing/docker --quiet \
+    docker build -t "$CI_IMAGE_TEST" --label "$CI_LABEL" --label "$CI_LABEL_RUN" "$CI_BUILD_CONTEXT" --quiet \
         || { record "docker-build" 1; return; }
     docker build -t "$CI_IMAGE_APP" --label "$CI_LABEL" --label "$CI_LABEL_RUN" \
-        -f testing/docker/Dockerfile.app testing/docker --quiet \
+        -f "$CI_BUILD_CONTEXT/Dockerfile.app" "$CI_BUILD_CONTEXT" --quiet \
         || { record "docker-build-app" 1; return; }
-    docker tag "$CI_IMAGE_TEST" fips-test:latest
-    docker tag "$CI_IMAGE_APP" fips-test-app:latest
+    # Deliberately NOT retagged to fips-test:latest. Every consumer reads
+    # FIPS_TEST_IMAGE, and a bridge back to the shared mutable name would let a
+    # consumer that does not keep working silently — resolving whichever
+    # concurrent run wrote the tag last, and recording that run's binaries under
+    # this run's commit. Without the bridge a missed consumer fails loudly.
 
     # Single suite mode
     if [[ -n "$ONLY_SUITE" ]]; then
@@ -842,21 +1052,8 @@ run_integration() {
         run_static "$topology"
     done
 
-    # Rekey + rekey-accept-off + rekey-outbound-only variants
-    run_rekey
-    run_rekey_accept_off
-    run_rekey_outbound_only
-
-    # Admission cap (mesh profile, max_peers=1 on one node)
-    for _suite in "${ADMISSION_SUITES[@]}"; do
-        run_admission_cap
-    done
-
     # Gateway
     run_gateway
-
-    # ACL allowlist
-    run_acl_allowlist
 
     # Firewall baseline
     run_firewall
@@ -882,7 +1079,6 @@ run_integration() {
         local pids=()
         local suite_names=()
         local running=0
-        local chaos_idx=0
 
         for entry in "${CHAOS_SUITES[@]}"; do
             # Parse: "display-name scenario [flags...]"
@@ -890,14 +1086,15 @@ run_integration() {
             local name="${parts[0]}"
             local args=("${parts[@]:1}")
 
-            # Give each chaos child a unique, non-overlapping /24 in 10.30.x so
-            # parallel children never collide with each other, and so a chaos
-            # net can never swallow a fixed-subnet suite (sidecar/static/nat in
-            # 172.x). 10.30.x sits outside docker's default-address-pool range
-            # (172.17-31 / 192.168), so auto-assigned nets can't land on it
-            # either. Node IPs derive from this subnet inside the sim.
-            args+=("--subnet" "10.30.${chaos_idx}.0/24")
-            chaos_idx=$((chaos_idx + 1))
+            # No --subnet: the sim claims a free /24 itself (sim/netclaim.py).
+            # This used to pass 10.30.${chaos_idx}.0/24, which uniquified the
+            # children of ONE run against each other and was byte-identical
+            # between runs -- so two concurrent ci-local runs both walked
+            # 10.30.0 through 10.30.12 and collided on every one. A claim makes
+            # the daemon the arbiter, so an overlap is impossible rather than
+            # merely unlikely. The range still sits in 10.30.0.0/16, clear of
+            # docker's default pool (172.17-31 / 192.168) and of the
+            # fixed-subnet suites in 172.x.
 
             # Throttle: wait for a slot
             while [[ $running -ge $PARALLEL_JOBS ]]; do
@@ -962,18 +1159,8 @@ run_suite() {
     case "$suite" in
         static-mesh|static-chain)
             run_static "${suite#static-}" ;;
-        rekey)
-            run_rekey ;;
-        rekey-accept-off)
-            run_rekey_accept_off ;;
-        rekey-outbound-only)
-            run_rekey_outbound_only ;;
-        admission-cap)
-            run_admission_cap ;;
         gateway)
             run_gateway ;;
-        acl-allowlist)
-            run_acl_allowlist ;;
         firewall)
             run_firewall ;;
         nat-cone|nat-symmetric|nat-lan)
@@ -1059,6 +1246,17 @@ run_ci_parity() {
     record "ci-parity" $rc
 }
 
+# Nothing may resolve the shared mutable test image. This run does not write
+# fips-test:latest, so a consumer naming it fails loudly here and now — but only
+# on a host with no hand-built copy lying around, which is not a property to
+# rely on. This is the static half of that.
+run_image_scoping() {
+    local rc=0
+    info "[image-scoping] Checking that nothing names the shared test image"
+    "$SCRIPT_DIR/check-image-scoping.sh" || rc=$?
+    record "image-scoping" $rc
+}
+
 # Every daemon log string a test matches on must still be emitted by src/.
 # A stale one does not fail — it stops observing, and an expect-zero assertion
 # built on it then passes for the wrong reason.
@@ -1067,6 +1265,35 @@ run_log_strings() {
     info "[log-strings] Checking test log matchers against the strings src/ emits"
     python3 "$SCRIPT_DIR/check-log-strings.py" || rc=$?
     record "log-strings" $rc
+}
+
+# A shell function's exit status is its last command's. One ending in a log
+# call returns 0 whatever it did, so a caller testing that status has a dead
+# gate — the run_chaos and build_fips_for_e2e defects, one of which certified
+# unbuilt code as green. This enforces an explicit terminal return wherever a
+# caller consumes the status, which makes the class unreachable rather than
+# repairing instances of it.
+run_trailing_log() {
+    local rc=0
+    info "[trailing-log] Checking for functions whose status is a log call's"
+    python3 "$SCRIPT_DIR/check-trailing-log.py" || rc=$?
+    record "trailing-log" $rc
+}
+
+# Unit tests for the convergence gate every static suite waits on. Hermetic —
+# synthetic ping functions against the same SECONDS clock, no containers — but
+# it drives real timeouts, so it costs about 45 seconds rather than the "few
+# seconds" its own header used to claim.
+#
+# It is here with the other two rather than in the integration stage because it
+# needs nothing built. Note what that buys: wait_until_connected decides whether
+# every static suite proceeds or gives up, so a regression in it turns those
+# suites' verdicts into noise, and until now nothing ran this at all.
+run_wait_converge() {
+    local rc=0
+    info "[wait-converge] Running convergence-gate unit tests"
+    bash "$SCRIPT_DIR/lib/wait-converge-test.sh" || rc=$?
+    record "wait-converge" $rc
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -1082,6 +1309,9 @@ main() {
     # local run means what a GitHub run means, whichever subset was asked for.
     run_ci_parity
     run_log_strings
+    run_trailing_log
+    run_image_scoping
+    run_wait_converge
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

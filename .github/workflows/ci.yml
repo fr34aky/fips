@@ -63,6 +63,17 @@ jobs:
         run: bash testing/check-ci-parity.sh
       - name: Check test log matchers against the strings src/ emits
         run: python3 testing/check-log-strings.py
+      - name: Check no tested function's exit status is a log call's
+        run: python3 testing/check-trailing-log.py
+      - name: Check nothing resolves the shared mutable test image
+        run: bash testing/check-image-scoping.sh
+      # Hermetic: synthetic ping functions, no containers, ~45s. Lives beside
+      # the other two so both runners gate on it identically — putting it in
+      # only one would create exactly the drift check-ci-parity.sh exists to
+      # catch, and it is invisible to that checker either way since it is not
+      # a matrix suite.
+      - name: Run convergence-gate unit tests
+        run: bash testing/lib/wait-converge-test.sh
 
   fmt:
     name: Format check
@@ -99,6 +110,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # An optional feature means two source trees, and --all-features lints
+      # only one of them. The default build is what ships, so lint it
+      # explicitly: without this stage, code that compiles only with
+      # `profiling` enabled would pass CI while breaking every release build.
+      # Mirrored in testing/ci-local.sh — check-ci-parity.sh compares
+      # integration suites only and will not catch a stage added to one runner
+      # and not the other.
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build with the tick-body profiler enabled
+        run: cargo build --workspace --features profiling
 
   # ───────────────────────────────────────────────────────────────────────────
   # Android cross-check
@@ -282,6 +304,12 @@ jobs:
           check_name: Unit Tests Summary
           fail_on_failure: false
 
+      # The `profiling` feature adds a module, a recorder and a writer thread
+      # that the default-feature run above never compiles, so its own tests do
+      # not execute there. Mirrored in testing/ci-local.sh.
+      - name: Run library tests with the tick-body profiler enabled
+        run: cargo test --lib --features profiling
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2b – Unit tests (macOS)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,22 +433,6 @@ jobs:
           - suite: static-chain
             type: static
             topology: chain
-          # ── Rekey integration test ──────────────────────────────────────────
-          - suite: rekey
-            type: rekey
-            topology: rekey
-          - suite: rekey-accept-off
-            type: rekey-accept-off
-            topology: rekey-accept-off
-          - suite: rekey-outbound-only
-            type: rekey-outbound-only
-            topology: rekey-outbound-only
-          # ── Inbound max_peers admission-cap test ───────────────────────
-          - suite: admission-cap
-            type: admission-cap
-            topology: mesh
-          - suite: acl-allowlist
-            type: acl-allowlist
           # ── Firewall baseline (fips0 nftables default-deny) ────────────
           - suite: firewall
             type: firewall
@@ -429,9 +441,6 @@ jobs:
             type: gateway
             topology: gateway
           # ── Chaos / stochastic scenarios ───────────────────────────────────
-          - suite: chaos-smoke-10
-            type: chaos
-            scenario: smoke-10
           - suite: churn-mixed-10
             type: chaos
             scenario: churn-mixed
@@ -445,30 +454,9 @@ jobs:
           - suite: tcp-mesh
             type: chaos
             scenario: tcp-mesh
-          - suite: bottleneck-parent
-            type: chaos
-            scenario: bottleneck-parent
-          - suite: cost-avoidance
-            type: chaos
-            scenario: cost-avoidance
-          - suite: cost-reeval
-            type: chaos
-            scenario: cost-reeval
-          - suite: cost-stability
-            type: chaos
-            scenario: cost-stability
-          - suite: depth-vs-cost
-            type: chaos
-            scenario: depth-vs-cost
-          - suite: mixed-technology
-            type: chaos
-            scenario: mixed-technology
           - suite: congestion-stress
             type: chaos
             scenario: congestion-stress
-          - suite: bloom-storm
-            type: chaos
-            scenario: bloom-storm
           # ── Sidecar deployment ──────────────────────────────────────────
           - suite: sidecar
             type: sidecar
@@ -580,120 +568,6 @@ jobs:
         run: |
           docker compose -f testing/static/docker-compose.yml \
             --profile ${{ matrix.topology }} down --volumes --remove-orphans
-
-      # ── Rekey integration test ──────────────────────────────────────────────
-      - name: Generate and inject configs (rekey)
-        if: matrix.type == 'rekey'
-        run: |
-          bash testing/static/scripts/generate-configs.sh rekey
-          bash testing/static/scripts/rekey-test.sh inject-config
-
-      - name: Start containers (rekey)
-        if: matrix.type == 'rekey'
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey up -d
-
-      - name: Run rekey test
-        if: matrix.type == 'rekey'
-        run: bash testing/static/scripts/rekey-test.sh
-
-      - name: Collect logs on failure (rekey)
-        if: matrix.type == 'rekey' && failure()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey logs --no-color
-
-      - name: Stop containers (rekey)
-        if: matrix.type == 'rekey' && always()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey down --volumes --remove-orphans
-
-      # ── Rekey + accept_connections=false variant ──────────────────────────
-      - name: Generate and inject configs (rekey-accept-off)
-        if: matrix.type == 'rekey-accept-off'
-        env:
-          REKEY_TOPOLOGY: rekey-accept-off
-          REKEY_ACCEPT_OFF_NODES: b
-        run: |
-          bash testing/static/scripts/generate-configs.sh rekey-accept-off
-          bash testing/static/scripts/rekey-test.sh inject-config
-
-      - name: Start containers (rekey-accept-off)
-        if: matrix.type == 'rekey-accept-off'
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-accept-off up -d
-
-      - name: Run rekey test (accept-off variant)
-        if: matrix.type == 'rekey-accept-off'
-        env:
-          REKEY_TOPOLOGY: rekey-accept-off
-          REKEY_ACCEPT_OFF_NODES: b
-        run: bash testing/static/scripts/rekey-test.sh
-
-      - name: Collect logs on failure (rekey-accept-off)
-        if: matrix.type == 'rekey-accept-off' && failure()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-accept-off logs --no-color | tail -300
-
-      - name: Stop containers (rekey-accept-off)
-        if: matrix.type == 'rekey-accept-off' && always()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-accept-off down --volumes --remove-orphans
-
-      # ── Rekey + udp.outbound_only=true variant ─────────────────────────────
-      - name: Generate and inject configs (rekey-outbound-only)
-        if: matrix.type == 'rekey-outbound-only'
-        env:
-          REKEY_TOPOLOGY: rekey-outbound-only
-          REKEY_OUTBOUND_ONLY_NODES: b
-        run: |
-          bash testing/static/scripts/generate-configs.sh rekey-outbound-only
-          bash testing/static/scripts/rekey-test.sh inject-config
-
-      - name: Start containers (rekey-outbound-only)
-        if: matrix.type == 'rekey-outbound-only'
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-outbound-only up -d
-
-      - name: Run rekey test (outbound-only variant)
-        if: matrix.type == 'rekey-outbound-only'
-        env:
-          REKEY_TOPOLOGY: rekey-outbound-only
-          REKEY_OUTBOUND_ONLY_NODES: b
-        run: bash testing/static/scripts/rekey-test.sh
-
-      - name: Collect logs on failure (rekey-outbound-only)
-        if: matrix.type == 'rekey-outbound-only' && failure()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-outbound-only logs --no-color | tail -300
-
-      - name: Stop containers (rekey-outbound-only)
-        if: matrix.type == 'rekey-outbound-only' && always()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile rekey-outbound-only down --volumes --remove-orphans
-
-      # ── ACL allowlist integration test ─────────────────────────────────────
-      - name: Run ACL allowlist integration test
-        if: matrix.type == 'acl-allowlist'
-        run: bash testing/acl-allowlist/test.sh --skip-build --keep-up
-
-      - name: Collect logs on failure (acl-allowlist)
-        if: matrix.type == 'acl-allowlist' && failure()
-        run: |
-          docker compose -f testing/acl-allowlist/docker-compose.yml logs --no-color
-
-      - name: Stop containers (acl-allowlist)
-        if: matrix.type == 'acl-allowlist' && always()
-        run: |
-          docker compose -f testing/acl-allowlist/docker-compose.yml down --volumes --remove-orphans
 
       # ── Firewall baseline integration test ─────────────────────────────────
       - name: Run firewall baseline integration test
@@ -824,42 +698,6 @@ jobs:
         run: |
           docker compose -f testing/static/docker-compose.yml \
             --profile gateway down --volumes --remove-orphans
-
-      # ── Inbound max_peers admission-cap integration test ────────────────
-      # Lowers node.max_peers on one mesh node and asserts the inbound cap
-      # holds under sustained retry pressure: denied peers keep retrying but
-      # are never promoted to an active session. The admission-cap-test.sh
-      # assertions are tailored per link-layer handshake variant; the leg
-      # itself is uniform. Static-style harness on the shared mesh profile.
-      - name: Generate configs (admission-cap)
-        if: matrix.type == 'admission-cap'
-        run: bash testing/static/scripts/generate-configs.sh mesh
-
-      - name: Inject admission-cap config (admission-cap)
-        if: matrix.type == 'admission-cap'
-        run: bash testing/static/scripts/admission-cap-test.sh inject-config
-
-      - name: Start containers (admission-cap)
-        if: matrix.type == 'admission-cap'
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile mesh up -d
-
-      - name: Run admission-cap test
-        if: matrix.type == 'admission-cap'
-        run: bash testing/static/scripts/admission-cap-test.sh
-
-      - name: Collect logs on failure (admission-cap)
-        if: matrix.type == 'admission-cap' && failure()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile mesh logs --no-color | tail -300
-
-      - name: Stop containers (admission-cap)
-        if: matrix.type == 'admission-cap' && always()
-        run: |
-          docker compose -f testing/static/docker-compose.yml \
-            --profile mesh down --volumes --remove-orphans
 
       # ── Real-deb install integration ────────────────────────────────────
       # The deb-install harness builds its own .deb from source in a

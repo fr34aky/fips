@@ -33,11 +33,28 @@ GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 PROFILE="stun-faults"
 SCENARIO="$PROFILE"
 COMPOSE=(docker compose -f "$NAT_DIR/docker-compose.yml")
+
+# Optional extra compose-file overlay chain (colon-separated paths), matching
+# nat-test.sh. ci-local.sh appends testing/nat/docker-compose.external-net.yml
+# here so this suite attaches to the networks the run already claimed; without
+# the hook compose would create its own from the base file's subnet and collide
+# with the run's own claim. Paths are relative to ROOT_DIR unless absolute.
+if [ -n "${FIPS_NAT_EXTRA_COMPOSE:-}" ]; then
+    IFS=':' read -ra _NAT_EXTRA <<< "${FIPS_NAT_EXTRA_COMPOSE}"
+    for _f in "${_NAT_EXTRA[@]}"; do
+        case "$_f" in
+            /*) COMPOSE+=(-f "$_f") ;;
+            *)  COMPOSE+=(-f "$ROOT_DIR/$_f") ;;
+        esac
+    done
+fi
+
 NODE="fips-nat-stun-fault-node${FIPS_CI_NAME_SUFFIX:-}"
 PEER="fips-nat-stun-fault-peer${FIPS_CI_NAME_SUFFIX:-}"
 SHIM="fips-nat-stun-fault-shim${FIPS_CI_NAME_SUFFIX:-}"
 STUN_CONTAINER="fips-nat-stun${FIPS_CI_NAME_SUFFIX:-}"
-STUN_HOST="172.31.10.40"
+# Claimed per run by ci-local.sh; unset renders the lab's historical address.
+STUN_HOST="${NAT_LAN_PREFIX:-172.31.10}.40"
 STUN_PORT=3478
 DEV="eth0"
 
@@ -60,10 +77,21 @@ require_docker_daemon() {
 }
 
 require_test_image() {
-    if ! docker image inspect fips-test:latest >/dev/null 2>&1; then
-        echo "fips-test:latest not found; building test image"
-        "$BUILD_SCRIPT"
+    local img="${FIPS_TEST_IMAGE:-fips-test:latest}"
+    if docker image inspect "$img" >/dev/null 2>&1; then
+        return 0
     fi
+    # Building here is right for a hand run and wrong under a harness. When
+    # FIPS_TEST_IMAGE is set the caller has already built the image it named, so
+    # a miss means something upstream is broken; building a substitute would
+    # hide that and run binaries nobody asked for.
+    if [ -n "${FIPS_TEST_IMAGE:-}" ]; then
+        echo "ERROR: $img not present, and FIPS_TEST_IMAGE names the caller's own image" >&2
+        echo "The harness that set it is expected to have built it." >&2
+        exit 1
+    fi
+    echo "$img not found; building test image"
+    "$BUILD_SCRIPT"
 }
 
 dump_diagnostics() {
@@ -126,6 +154,7 @@ apply_delay() {
     docker exec "$SHIM" tc qdisc add dev "$DEV" root netem delay 5000ms 2>/dev/null \
         || { echo "  delay: tc netem unavailable, skipping" >&2; return 1; }
     echo "  delay: tc netem 5000ms applied"
+    return 0
 }
 
 clear_delay() {
@@ -139,15 +168,24 @@ assert_process_alive() {
         return 1
     fi
     echo "  $NODE: fips daemon alive"
+    return 0
 }
 
+# A container whose logs cannot be read has not been shown to be panic-free.
+# The previous form read `docker logs … || true`, so an unreadable container
+# yielded empty output, matched no panic pattern, and returned success — the
+# assertion's failure mode was indistinguishable from its success condition.
 assert_no_panic() {
     local logs
-    logs="$(docker logs "$NODE" 2>&1 || true)"
+    if ! logs="$(docker logs "$NODE" 2>&1)"; then
+        echo "could not read logs from $NODE; absence of panics is not established" >&2
+        return 1
+    fi
     if grep -Eq "panicked at|RUST_BACKTRACE|fatal runtime error" <<<"$logs"; then
         echo "panic detected in $NODE logs" >&2
         return 1
     fi
+    return 0
 }
 
 # Look for STUN-related fault evidence in the daemon's logs. The
@@ -211,6 +249,11 @@ preflight_assert_stun_active() {
     docker logs "$PEER" 2>&1 | tail -40 >&2 || true
     return 1
 }
+
+# Phases that did not run, with the reason. Surfaced in the final verdict:
+# the suite reports a pass per phase-level assertion, so a phase that never
+# ran otherwise leaves a clean "passed" standing for work not done.
+SKIPPED_PHASES=()
 
 run_test() {
     echo "=== stun-faults-test: setup ==="
@@ -293,6 +336,7 @@ run_test() {
         sleep 10
     else
         echo "  Phase 2 skipped (no tc netem available); proceeding to Phase 3"
+        SKIPPED_PHASES+=("2 (delay): tc netem unavailable")
     fi
 
     assert_process_alive || { dump_diagnostics; return 1; }
@@ -321,7 +365,23 @@ run_test() {
     }
 
     cleanup
-    echo "stun-faults-test passed"
+    if [ ${#SKIPPED_PHASES[@]} -eq 0 ]; then
+        echo "stun-faults-test passed (3/3 phases ran)"
+        return 0
+    fi
+    # A phase that did not run is not a phase that passed. Say so in the line
+    # a reader takes the verdict from, rather than leaving it in scrollback
+    # several hundred lines up where the skip was announced.
+    local ran=$(( 3 - ${#SKIPPED_PHASES[@]} ))
+    echo "stun-faults-test passed ($ran/3 phases ran, ${#SKIPPED_PHASES[@]} skipped)"
+    local phase
+    for phase in "${SKIPPED_PHASES[@]}"; do
+        echo "  SKIPPED phase $phase"
+    done
+    if [ "$ran" -eq 0 ]; then
+        echo "stun-faults-test: every phase was skipped, so nothing was tested" >&2
+        return 1
+    fi
 }
 
 main() {

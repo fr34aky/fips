@@ -12,7 +12,16 @@ import sys
 import time
 from datetime import datetime
 
-from .assertions import AssertionOutcome, BloomSendRateMonitor, evaluate_min_parent_switches
+from .assertions import (
+    AssertionOutcome,
+    BloomSendRateMonitor,
+    evaluate_baseline,
+    evaluate_congestion_signals,
+    evaluate_max_errors,
+    evaluate_max_parent_switches,
+    evaluate_min_parent_switches,
+    evaluate_tree_parents,
+)
 from .compose import generate_compose
 from .config_gen import write_configs
 from .control import snapshot_all_congestion, snapshot_all_mmp, snapshot_all_trees
@@ -21,6 +30,7 @@ from .link_swap import LinkSwapManager
 from .links import LinkManager
 from .logs import AnalysisResult, analyze_logs, collect_logs, write_sim_metadata
 from .naming import name_suffix
+from .netclaim import claim_network, remove_network
 from .netem import NetemManager
 from .nodes import NodeManager
 from .peer_churn import PeerChurnManager
@@ -38,6 +48,9 @@ class SimRunner:
         self.rng = random.Random(scenario.seed)
         self.topology: SimTopology | None = None
         self.compose_file: str | None = None
+        # Claimed in _setup; the compose file refers to it as external, so
+        # `compose down` does not remove it and teardown must.
+        self.network_name: str | None = None
         self.output_dir: str = self._resolve_output_dir(scenario)
         self._interrupted = False
 
@@ -69,6 +82,51 @@ class SimRunner:
         # Post-run assertion monitors (sampled near end of run).
         self.bloom_rate_monitor: BloomSendRateMonitor | None = None
         self.assertion_outcomes: list[AssertionOutcome] = []
+        # Set by the final snapshot. None means the snapshot never ran,
+        # which the congestion assertion must treat as a failure rather
+        # than as an absence of congestion.
+        self.final_congestion: dict | None = None
+        self.final_tree: dict | None = None
+
+    def _evaluate_max_parent_switches(
+        self, cfg, parent_switches: list[tuple[str, str]]
+    ) -> AssertionOutcome:
+        """Count parent switches in the configured scope and apply the ceiling.
+
+        A per-node scope is resolved through the topology and fails
+        explicitly if the node id is not in it. That is the whole reason
+        this lives here rather than in assertions.py: filtering log lines
+        by an unknown container name yields zero matches, and zero
+        trivially satisfies a ceiling, so a typo in ``node:`` would turn
+        the assertion into an unconditional pass.
+
+        Note the limit of that guard. It covers an unresolvable node id
+        and nothing else. A node that is in the topology but whose log is
+        empty, or whose log level suppressed the event, still counts zero
+        and still passes. Only the misspelling is caught here; the log
+        level is guarded at load time, and an empty log for a live node
+        is not guarded at all.
+        """
+        if cfg.node is None:
+            return evaluate_max_parent_switches(
+                cfg, len(parent_switches), "mesh-wide"
+            )
+
+        if cfg.node not in self.topology.nodes:
+            known = ", ".join(sorted(self.topology.nodes))
+            return AssertionOutcome(
+                name="max_parent_switches",
+                passed=False,
+                detail=(
+                    f"FAIL max_parent_switches: node '{cfg.node}' is not in "
+                    f"this topology (nodes: {known}). Nothing was counted, so "
+                    f"the ceiling was never actually tested."
+                ),
+            )
+
+        source = self.topology.container_name(cfg.node)
+        count = sum(1 for src, _ in parent_switches if src == source)
+        return evaluate_max_parent_switches(cfg, count, f"node {cfg.node}")
 
     @staticmethod
     def _resolve_output_dir(scenario: Scenario) -> str:
@@ -131,6 +189,28 @@ class SimRunner:
         logging.getLogger().addHandler(fh)
         log.info("Runner log: %s", runner_log_path)
 
+        # 0. Claim this run's network range, before anything derives from it.
+        #
+        # The ordering is not obvious and it matters: node IPs are computed
+        # from the subnet inside generate_topology, and traffic shaping keys
+        # its filters on those addresses. Claiming after the topology exists
+        # would give a network on one range and `tc` filters on another, which
+        # does not fail at bring-up — it silently leaves the shaping matching
+        # nothing.
+        self.network_name = f"fips-sim{name_suffix()}-net"
+        s.topology.subnet = claim_network(
+            self.network_name,
+            labels={
+                "com.corganlabs.fips-ci": "1",
+                "com.corganlabs.fips-ci.run": os.environ.get(
+                    "FIPS_CI_RUN_ID", "manual"
+                ),
+            },
+            candidates=(
+                [s.topology.pinned_subnet] if s.topology.pinned_subnet else None
+            ),
+        )
+
         # 1. Generate topology
         log.info(
             "Generating %d-node %s topology (seed=%d)...",
@@ -183,17 +263,39 @@ class SimRunner:
         log.info("Wrote node configs to %s", config_dir)
 
         # 3. Generate docker-compose.yml
-        self.compose_file = generate_compose(self.topology, self.scenario, config_dir)
+        self.compose_file = generate_compose(
+            self.topology, self.scenario, config_dir, self.network_name
+        )
         log.info("Wrote %s", self.compose_file)
 
-        # 4. Build the test image once (avoids per-service build at scale)
-        log.info("Building Docker image...")
+        # 4. Obtain the test image (once, rather than per-service at scale).
+        #
+        # Building it is right for a bare run and wrong under a harness. When
+        # FIPS_TEST_IMAGE is set the image belongs to the caller, and every
+        # scenario of a parallel run would otherwise rebuild it into one shared
+        # name from one shared context — so assert it exists and fail loudly if
+        # it does not, rather than manufacture a substitute nobody asked for.
         from .compose import FIPS_SIM_IMAGE
-        docker_dir = os.path.join(os.path.dirname(__file__), "..", "..", "docker")
-        subprocess.run(
-            ["docker", "build", "-t", FIPS_SIM_IMAGE, docker_dir],
-            check=True,
-        )
+        if os.environ.get("FIPS_TEST_IMAGE"):
+            log.info("Using caller-supplied image %s", FIPS_SIM_IMAGE)
+            probe = subprocess.run(
+                ["docker", "image", "inspect", FIPS_SIM_IMAGE],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if probe.returncode != 0:
+                raise RuntimeError(
+                    f"FIPS_TEST_IMAGE names {FIPS_SIM_IMAGE}, which is not present. "
+                    "The harness that set it is expected to have built it."
+                )
+        else:
+            log.info("Building Docker image...")
+            docker_dir = os.environ.get("FIPS_BUILD_CONTEXT") or os.path.join(
+                os.path.dirname(__file__), "..", "..", "docker"
+            )
+            subprocess.run(
+                ["docker", "build", "-t", FIPS_SIM_IMAGE, docker_dir],
+                check=True,
+            )
 
         # 5. Start containers
         log.info("Starting %d containers...", len(self.topology.nodes))
@@ -467,6 +569,17 @@ class SimRunner:
         except Exception:
             log.exception("Could not write status file")
 
+    def _release_network(self) -> None:
+        """Give this run's claimed /24 back.
+
+        The compose file declares the network `external:`, so `compose down`
+        leaves it alone and nothing else reclaims the range. Called from both
+        teardown paths, including the setup-failed one, because a run that
+        fell over after claiming still holds a range.
+        """
+        if self.network_name:
+            remove_network(self.network_name)
+
     def _teardown(self) -> AnalysisResult | None:
         """Stop dynamic elements, collect logs, analyze, stop containers."""
         if not self._containers_started:
@@ -482,6 +595,7 @@ class SimRunner:
                 # containers or a network even with no mesh to speak of.
                 log.info("Stopping containers...")
                 docker_compose(self.compose_file, ["down"], check=False)
+            self._release_network()
             return None
 
         result = None
@@ -533,11 +647,68 @@ class SimRunner:
             print(result.summary())
 
             # Log-derived assertions (evaluated after analyze_logs so
-            # parent_switches and similar are populated).
+            # parent_switches and similar are populated). See
+            # _evaluate_max_parent_switches for why the per-node variant
+            # resolves its node against the topology rather than filtering
+            # optimistically.
             mps_cfg = self.scenario.assertions.min_parent_switches
             if mps_cfg is not None:
                 outcome = evaluate_min_parent_switches(
                     mps_cfg, len(result.parent_switches)
+                )
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            xps_cfg = self.scenario.assertions.max_parent_switches
+            if xps_cfg is not None:
+                outcome = self._evaluate_max_parent_switches(
+                    xps_cfg, result.parent_switches
+                )
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            # Applied to every scenario by default, so this is the one
+            # assertion that is present even when the YAML declares no
+            # assertions block at all.
+            err_cfg = self.scenario.assertions.max_errors
+            if err_cfg is not None:
+                outcome = evaluate_max_errors(err_cfg, result.errors)
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            bl_cfg = self.scenario.assertions.baseline
+            if bl_cfg is not None:
+                outcome = evaluate_baseline(
+                    bl_cfg, self.final_tree, len(result.sessions_established)
+                )
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            tp_cfg = self.scenario.assertions.tree_parents
+            if tp_cfg is not None:
+                outcome = evaluate_tree_parents(tp_cfg, self.final_tree)
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            cong_cfg = self.scenario.assertions.congestion_signals
+            if cong_cfg is not None:
+                outcome = evaluate_congestion_signals(
+                    cong_cfg, self.final_congestion
                 )
                 self.assertion_outcomes.append(outcome)
                 if outcome.passed:
@@ -590,6 +761,7 @@ class SimRunner:
                 ["down"],
                 check=False,
             )
+            self._release_network()
 
         return result
 
@@ -605,6 +777,12 @@ class SimRunner:
         tree_path = os.path.join(self.output_dir, f"tree-snapshot-{label}.json")
         mmp_path = os.path.join(self.output_dir, f"mmp-snapshot-{label}.json")
         congestion_path = os.path.join(self.output_dir, f"congestion-snapshot-{label}.json")
+        # Retained for the congestion assertion, which needs the same
+        # responses the file gets. Reading the file back would let a write
+        # failure present as an assertion that saw nothing.
+        if label == "final":
+            self.final_congestion = congestion_snap
+            self.final_tree = tree_snap
         os.makedirs(self.output_dir, exist_ok=True)
         with open(tree_path, "w") as f:
             json.dump(tree_snap, f, indent=2)

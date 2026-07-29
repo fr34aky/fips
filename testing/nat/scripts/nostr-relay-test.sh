@@ -21,13 +21,32 @@ ROOT_DIR="$(cd "$NAT_DIR/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
+# Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts.
+CONFIG_DIR="$NAT_DIR/generated-configs${FIPS_CI_NAME_SUFFIX:-}"
 
 PROFILE="nostr-publish-consume"
 SCENARIO="$PROFILE"
 COMPOSE=(docker compose -f "$NAT_DIR/docker-compose.yml")
+
+# Optional extra compose-file overlay chain (colon-separated paths), matching
+# nat-test.sh. ci-local.sh appends testing/nat/docker-compose.external-net.yml
+# here so this suite attaches to the networks the run already claimed; without
+# the hook compose would create its own from the base file's subnet and collide
+# with the run's own claim. Paths are relative to ROOT_DIR unless absolute.
+if [ -n "${FIPS_NAT_EXTRA_COMPOSE:-}" ]; then
+    IFS=':' read -ra _NAT_EXTRA <<< "${FIPS_NAT_EXTRA_COMPOSE}"
+    for _f in "${_NAT_EXTRA[@]}"; do
+        case "$_f" in
+            /*) COMPOSE+=(-f "$_f") ;;
+            *)  COMPOSE+=(-f "$ROOT_DIR/$_f") ;;
+        esac
+    done
+fi
+
 NODE_A="fips-nat-nostr-pub-a${FIPS_CI_NAME_SUFFIX:-}"
 NODE_B="fips-nat-nostr-pub-b${FIPS_CI_NAME_SUFFIX:-}"
-RELAY_HOST="172.31.10.30"
+# Claimed per run by ci-local.sh; unset renders the lab's historical address.
+RELAY_HOST="${NAT_LAN_PREFIX:-172.31.10}.30"
 RELAY_PORT=7777
 RELAY_CONTAINER="fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}"
 
@@ -49,10 +68,21 @@ require_docker_daemon() {
 }
 
 require_test_image() {
-    if ! docker image inspect fips-test:latest >/dev/null 2>&1; then
-        echo "fips-test:latest not found; building test image"
-        "$BUILD_SCRIPT"
+    local img="${FIPS_TEST_IMAGE:-fips-test:latest}"
+    if docker image inspect "$img" >/dev/null 2>&1; then
+        return 0
     fi
+    # Building here is right for a hand run and wrong under a harness. When
+    # FIPS_TEST_IMAGE is set the caller has already built the image it named, so
+    # a miss means something upstream is broken; building a substitute would
+    # hide that and run binaries nobody asked for.
+    if [ -n "${FIPS_TEST_IMAGE:-}" ]; then
+        echo "ERROR: $img not present, and FIPS_TEST_IMAGE names the caller's own image" >&2
+        echo "The harness that set it is expected to have built it." >&2
+        exit 1
+    fi
+    echo "$img not found; building test image"
+    "$BUILD_SCRIPT"
 }
 
 dump_diagnostics() {
@@ -288,16 +318,24 @@ assert_process_alive() {
         return 1
     fi
     echo "  $container: fips daemon still alive after malformed advert"
+    return 0
 }
 
+# A container whose logs cannot be read has not been shown to be panic-free.
+# See the companion note in stun-faults-test.sh: the previous `|| true` made
+# this assertion's failure mode indistinguishable from its success condition.
 assert_no_panic() {
     local container="$1"
     local logs
-    logs="$(docker logs "$container" 2>&1 || true)"
+    if ! logs="$(docker logs "$container" 2>&1)"; then
+        echo "could not read logs from $container; absence of panics is not established" >&2
+        return 1
+    fi
     if grep -Eq "panicked at|RUST_BACKTRACE|fatal runtime error" <<<"$logs"; then
         echo "panic detected in $container logs" >&2
         return 1
     fi
+    return 0
 }
 
 run_test() {
@@ -323,7 +361,7 @@ run_test() {
     fi
 
     # shellcheck disable=SC1090
-    source "$NAT_DIR/generated-configs/$SCENARIO/npubs.env"
+    source "$CONFIG_DIR/$SCENARIO/npubs.env"
     echo "  NPUB_A=$NPUB_A"
     echo "  NPUB_B=$NPUB_B"
 

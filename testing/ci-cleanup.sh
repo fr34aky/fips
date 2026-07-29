@@ -15,9 +15,15 @@
 #      with that prefix).
 #
 # The generic CI label is shared by every run on the host, so an unscoped label
-# sweep would tear down a CONCURRENT run's resources. Pass --run-id to narrow
-# the label sweep to one run; a run's own teardown always does. Without it the
-# label sweep stays broad, which is what a manual "reap everything" wants.
+# sweep would tear down a CONCURRENT run's resources. So would an unscoped
+# compose-project sweep, and reap_containers runs BOTH. Neither flag alone is
+# therefore enough to spare a concurrent run: --run-id narrows only the label
+# sweep, --project-prefix only the project sweep, and whichever is left broad
+# reaps everything by itself. This cost three concurrent runs on 2026-07-29,
+# via a caller that passed --run-id alone and reasonably believed that scoped
+# it. --run-id now implies the matching project prefix, and --project-prefix
+# without --run-id is refused, so the dangerous half-scoped states are no
+# longer reachable. Passing neither is still the broad "reap everything" form.
 #
 # Host-namespace veth interfaces are the one non-docker resource reaped here.
 # The chaos simulation creates each pair in the host namespace and then moves
@@ -37,12 +43,17 @@
 #
 # Usage:
 #   ci-cleanup.sh                       Reap ALL fips-ci resources (any run)
+#   ci-cleanup.sh --run-id ID           Scope the reap to one run: narrows the
+#                                       label sweep to ID and, unless
+#                                       --project-prefix says otherwise,
+#                                       narrows the project sweep to that run
+#                                       too. Does NOT scope the host veth
+#                                       sweep — see --veth-suffixes
 #   ci-cleanup.sh --project-prefix P    Restrict the compose-project sweep to
-#                                       names starting with P (scopes the reap
-#                                       to a single run). Does NOT scope the
-#                                       host veth sweep — see --veth-suffixes
-#   ci-cleanup.sh --run-id ID           Restrict the label sweep to the run
-#                                       labelled ID (leaves other runs alone)
+#                                       names starting with P. Requires
+#                                       --run-id: on its own it leaves the
+#                                       label sweep broad, which reaps every
+#                                       concurrent run regardless of P
 #   ci-cleanup.sh --label L             Override the CI label (default above)
 #   ci-cleanup.sh --images "a b,c"      Also `docker rmi -f` these image tags
 #                                       (space- or comma-separated)
@@ -66,21 +77,59 @@ RUN_ID=""                  # broad default: every CI run
 IMAGES=""
 VETH_SUFFIXES=""           # empty AND no --run-id: every simulation veth name
 # ip(8) runs inside this image, the same way the simulation creates the
-# interfaces, so the reap works wherever the simulation does. The chaos
-# simulation builds it, and it carries iproute2.
-VETH_IMAGE="fips-test:latest"
+# interfaces, so the reap works wherever the simulation does. Any fips test
+# image will do; it is wanted only for its iproute2.
+#
+# Empty here and resolved after the argument loop, because the resolution has
+# to consider --veth-image. The old default of fips-test:latest is no longer
+# safe on its own: ci-local.sh does not write that tag, so on a host that has
+# only ever run the harness it need not exist at all, and the reap this script
+# advertises as the remedy for orphaned interfaces would be a permanent no-op.
+VETH_IMAGE=""
+PROJECT_PREFIX_GIVEN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --label)          LABEL="$2"; shift 2 ;;
-        --project-prefix) PROJECT_PREFIX="$2"; shift 2 ;;
+        --project-prefix) PROJECT_PREFIX="$2"; PROJECT_PREFIX_GIVEN=1; shift 2 ;;
         --run-id)         RUN_ID="$2"; shift 2 ;;
         --images)         IMAGES="$2"; shift 2 ;;
         --veth-suffixes)  VETH_SUFFIXES="$2"; shift 2 ;;
+        --veth-image)     VETH_IMAGE="$2"; shift 2 ;;
         -h|--help)        sed -n '2,/^set /{ /^set /d; s/^# \?//; p }' "$0"; exit 0 ;;
         *)                echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+# A reap scoped on one axis and broad on the other still destroys every
+# concurrent run, because both selectors run. Close both half-scoped states
+# here rather than trusting each caller to pass the pair.
+if [[ -n "$RUN_ID" && "$PROJECT_PREFIX_GIVEN" -eq 0 ]]; then
+    # Every run's projects are named "<base prefix><run id>_<suite>", so the
+    # run id is all that is needed. Derived from the base rather than a second
+    # copy of the literal, so the two cannot drift.
+    PROJECT_PREFIX="${PROJECT_PREFIX}${RUN_ID}"
+fi
+if [[ -z "$RUN_ID" && "$PROJECT_PREFIX_GIVEN" -eq 1 ]]; then
+    echo "ci-cleanup.sh: --project-prefix requires --run-id." >&2
+    echo "  Without it the label sweep stays broad and reaps every concurrent" >&2
+    echo "  run regardless of the prefix. Pass both, or neither for a full reap." >&2
+    exit 2
+fi
+
+# Resolve the image to run ip(8) in: the caller's choice, then the run's own
+# image, then any surviving fips test image. That last fallback is what keeps
+# an unscoped `ci-local.sh --reap` working — it execs this script from inside
+# its own argument loop, before the run identity is exported, so it can pass
+# neither. The empty case is handled at the point of use, which already warns
+# and skips rather than failing the sweep.
+if [[ -z "$VETH_IMAGE" ]]; then
+    VETH_IMAGE="${FIPS_TEST_IMAGE:-}"
+fi
+if [[ -z "$VETH_IMAGE" ]] && command -v docker >/dev/null 2>&1; then
+    VETH_IMAGE="$(timeout 10 docker image ls --format '{{.Repository}}:{{.Tag}}' fips-test 2>/dev/null | head -n1)"
+fi
+[[ -z "$VETH_IMAGE" ]] && VETH_IMAGE="fips-test:latest"
 
 if ! command -v docker >/dev/null 2>&1; then
     # No docker, nothing to reap.
@@ -95,8 +144,9 @@ fi
 # never wedge a caller (ci-local's signal trap relies on this being bounded).
 TMO=30
 
-# Selector for the label sweep. With --run-id it matches only the named run, so
-# a concurrent run's resources are left alone; without it, every CI run.
+# Selector for the label sweep. With --run-id it matches only the named run;
+# without it, every CI run. Note this is only half of what scopes a reap — the
+# compose-project sweep below is the other half, and both must be narrow.
 if [[ -n "$RUN_ID" ]]; then
     SWEEP_LABEL="${RUN_LABEL_KEY}=${RUN_ID}"
 else
@@ -153,6 +203,14 @@ VETH_NODE_ID='(0[0-9]|[1-9][0-9]+)'
 # which carry a different token — cannot match. The token derivation is read
 # from the simulation itself rather than repeated here, so widening it cannot
 # leave this matching the old width. Empty output means "reap nothing".
+#
+# Two producers, two shapes. The chaos simulation makes vh{token}{NN}{MM}{a,b};
+# the NAT lab (nat/scripts/setup-topology.sh) makes vn{a,b}{token}{0,1}, using
+# the RUN-wide suffix rather than any chaos scenario's. Widening this regex is
+# only half the fix: the token set is derived separately below, so a suffix
+# list carrying no NAT suffix leaves the NAT half matching nothing while
+# looking correct. ci-local.sh's ci_teardown therefore appends the run-wide
+# suffix to --veth-suffixes.
 veth_pattern() {
     # vh{token}{NN}{MM}{a,b}: the token is 4 hex or wholly absent — never a
     # part of one — and the two node ids follow. Anchored and shaped this
@@ -161,7 +219,8 @@ veth_pattern() {
     # single run, no missing or empty suffix list may widen this back out to
     # every run.
     if [[ -z "$RUN_ID" && -z "$VETH_SUFFIXES" ]]; then
-        printf '^vh([0-9a-f]{4})?%s%s[ab]$' "$VETH_NODE_ID" "$VETH_NODE_ID"
+        printf '^vh([0-9a-f]{4})?%s%s[ab]$|^vn[ab]([0-9a-f]{4})?[01]$' \
+            "$VETH_NODE_ID" "$VETH_NODE_ID"
         return 0
     fi
     if [[ -z "$VETH_SUFFIXES" ]]; then
@@ -194,7 +253,8 @@ veth_pattern() {
         veth_warn "no interface tokens derived from: ${sfx[*]}"
         return 0
     fi
-    printf '^vh(%s)%s%s[ab]$' "$alt" "$VETH_NODE_ID" "$VETH_NODE_ID"
+    printf '^vh(%s)%s%s[ab]$|^vn[ab](%s)[01]$' \
+        "$alt" "$VETH_NODE_ID" "$VETH_NODE_ID" "$alt"
 }
 
 # ip(8) in a privileged --net=host container, matching how the simulation
@@ -217,8 +277,8 @@ reap_veths() {
     [[ -z "$pattern" ]] && return 0
     # Without the image there is no way to run ip(8). Orphans can outlive it —
     # `docker image prune -a`, a build host that prunes between runs, or a run
-    # aborted before ci-local.sh retags :latest all remove it while interfaces
-    # are still up — so this is a real skip, not "nothing was ever run here".
+    # whose per-run image was already reaped all remove it while interfaces are
+    # still up — so this is a real skip, not "nothing was ever run here".
     if ! docker image inspect "$VETH_IMAGE" >/dev/null 2>&1; then
         veth_warn "image $VETH_IMAGE not present, cannot run ip(8)"
         return 0
@@ -247,6 +307,27 @@ reap_images() {
     timeout "$TMO" docker rmi -f "${imgs[@]}" >/dev/null 2>&1 || true
 }
 
+# Per-run build contexts left in the working tree. ci-local.sh removes its own
+# from the EXIT trap, but the CI worker sends SIGKILL after SIGTERM and a
+# SIGKILL runs no trap, so a preempted run can leave an 18 MB directory behind
+# with nothing else that would ever notice it.
+#
+# Scoped mode takes only the named run's. Broad mode cannot tell a live run's
+# context from an abandoned one by name, so it goes by age instead: a run lasts
+# well under an hour, and a day is far outside that.
+reap_build_contexts() {
+    local dir
+    if [[ -n "$RUN_ID" ]]; then
+        dir="$SCRIPT_DIR/docker-$RUN_ID"
+        [[ -d "$dir" ]] && rm -rf "$dir"
+        return 0
+    fi
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] && rm -rf "$dir"
+    done < <(find "$SCRIPT_DIR" -maxdepth 1 -type d -name 'docker-*' -mtime +0 2>/dev/null)
+    return 0
+}
+
 # Order matters: containers reference networks/volumes, so drop them first, and
 # the veth sweep needs an image to run ip(8) in, so it precedes the image reap.
 reap_containers
@@ -254,5 +335,6 @@ reap_networks
 reap_volumes
 reap_veths
 reap_images
+reap_build_contexts
 
 exit 0

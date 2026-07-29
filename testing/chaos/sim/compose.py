@@ -10,8 +10,13 @@ from .scenario import Scenario
 from .topology import SimTopology
 
 # Image name for the pre-built FIPS test image.
-# The runner builds this once before starting containers.
-FIPS_SIM_IMAGE = "fips-test:latest"
+#
+# A harness that has already built an image passes it in FIPS_TEST_IMAGE, and
+# it is then the caller's image: the runner uses it and must not rebuild it.
+# Unset means a bare run, where the shared tag is the right name and the runner
+# still builds it. Read at import, which is safe because the simulation always
+# starts as a child process with the environment already set.
+FIPS_SIM_IMAGE = os.environ.get("FIPS_TEST_IMAGE", "fips-test:latest")
 
 # Jinja2 template for the compose file.
 # Uses a pre-built image instead of per-service build to support large topologies.
@@ -19,12 +24,12 @@ _COMPOSE_TEMPLATE = Template(
     """\
 networks:
   fips-net:
-    driver: bridge
-    labels:
-      - "com.corganlabs.fips-ci=1"
-    ipam:
-      config:
-        - subnet: {{ subnet }}
+    # External, and created by the sim rather than by compose. The range has to
+    # be *claimed* -- attempt-create, advance on docker's own overlap error --
+    # so that two concurrent runs cannot select the same one, and only the
+    # process that creates the network can do that. See sim/netclaim.py.
+    external: true
+    name: {{ network_name }}
 
 x-fips-common: &fips-common
   image: {{ image }}
@@ -64,8 +69,14 @@ def generate_compose(
     topology: SimTopology,
     scenario: Scenario,
     output_dir: str,
+    network_name: str,
 ) -> str:
-    """Render docker-compose.yml and write to output_dir. Returns the file path."""
+    """Render docker-compose.yml and write to output_dir. Returns the file path.
+
+    ``network_name`` is the docker network the sim has already claimed; the
+    compose file refers to it as external rather than declaring a subnet, so
+    that the claim and the creation are the same operation.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     nodes = [topology.nodes[nid] for nid in sorted(topology.nodes)]
@@ -77,7 +88,7 @@ def generate_compose(
     )
 
     content = _COMPOSE_TEMPLATE.render(
-        subnet=scenario.topology.subnet,
+        network_name=network_name,
         rust_log=scenario.logging.rust_log,
         image=FIPS_SIM_IMAGE,
         nodes=nodes,

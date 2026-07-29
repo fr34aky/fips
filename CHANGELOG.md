@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mdns-sd` 0.20 (`socket-pktinfo` 0.4.1, the first release that builds
   on FreeBSD). Daemon logs now disable ANSI color when stdout is not a
   terminal (all platforms).
+- An optional tick-body profiler behind the new `profiling` Cargo feature,
+  **off by default**. When enabled, `fipsctl profile tick on [--dir PATH]` /
+  `off` / `status` starts and stops a capture at runtime with no restart. Each
+  capture writes one tab-separated file (default `/var/log/fips`, capped at
+  32 MB) carrying, per ten-second interval, the exact count, max and total for
+  every step of the rx-loop tick arm, the whole-tick span, and gauges for ticks,
+  peer count, the gap between successive tick-arm entries and the resulting
+  arm-starvation delay. With the feature off the instrumentation macro is a pure
+  pass-through, so a default build contains no timing code on the tick path.
+  `LogsDirectory=fips` was added to the packaged systemd units so the capture
+  directory is created and cleaned up declaratively.
+
+- `packaging/debian/build-deb.sh --features <list>` builds the `.deb` with a
+  Cargo feature list, which is how an instrumented package is produced for a
+  measurement run. The auto-derived dev Version gains a matching `+<features>`
+  marker, so a feature build and a default build of the same commit are no
+  longer indistinguishable: without it the two carry byte-identical versions,
+  an install of one over the other is an apt no-op, and the running node offers
+  no way to tell which one it has. The marker sorts above the unmarked build, so
+  installing a feature build is an upgrade and reverting to the default build is
+  a downgrade — revert with `dpkg -i` rather than `apt install`. `--features` is
+  refused together with `--no-build`, which would stamp the marker onto binaries
+  the features never reached.
 
 ### Changed
 
@@ -41,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nostr.*`, `lan.*`). A deployed `node.discovery:` block still loads and is
   folded into the new tables with a one-time deprecation warning; migrate your
   `fips.yaml` to the new keys.
+
+- `SessionDatagram::decrement_ttl` and `SessionDatagram::can_forward` now match
+  the forwarder's IP hop-limit semantics: `decrement_ttl` decrements first and
+  reports false when the result is zero, and `can_forward` is true only at a
+  TTL of 2 or more.
 
 ### Deprecated
 

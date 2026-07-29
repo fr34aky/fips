@@ -1,6 +1,8 @@
-use nostr::prelude::{EventBuilder, Kind, Tag, Timestamp};
+use std::collections::HashSet;
 
-use super::runtime::NostrRendezvous;
+use nostr::prelude::{EventBuilder, Kind, RelayUrl, Tag, Timestamp};
+
+use super::runtime::{NostrRendezvous, signal_relays};
 use super::signal::{
     FreshnessOutcome, build_signal_event, create_traversal_answer, create_traversal_offer,
     estimate_clock_skew, validate_offer_freshness, validate_traversal_answer_for_offer,
@@ -706,5 +708,255 @@ fn now_ms_tracks_the_wall_clock() {
     assert!(
         sampled <= after,
         "now_ms() is ahead of the wall clock: {sampled} > {after}"
+    );
+}
+
+fn pool(urls: &[&str]) -> HashSet<RelayUrl> {
+    urls.iter()
+        .map(|url| RelayUrl::parse(url).expect("test pool url parses"))
+        .collect()
+}
+
+fn candidates(urls: &[&str]) -> Vec<String> {
+    urls.iter().map(|url| url.to_string()).collect()
+}
+
+#[test]
+fn out_of_pool_relay_does_not_suppress_the_shared_ones() {
+    let usable = signal_relays(
+        &candidates(&[
+            "wss://relay.damus.io",
+            "wss://temp.iris.to",
+            "wss://nos.lol",
+        ]),
+        None,
+        &[],
+        &pool(&[
+            "wss://relay.damus.io",
+            "wss://nos.lol",
+            "wss://offchain.pub",
+        ]),
+    );
+    assert_eq!(
+        usable,
+        vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://nos.lol".to_string()
+        ],
+        "the unknown relay must be dropped without taking the shared ones with it"
+    );
+}
+
+#[test]
+fn trailing_slash_and_host_case_variants_are_retained() {
+    let usable = signal_relays(
+        &candidates(&["wss://Relay.Damus.io/", "wss://nos.lol"]),
+        None,
+        &[],
+        &pool(&["wss://relay.damus.io", "wss://nos.lol"]),
+    );
+    assert_eq!(
+        usable.len(),
+        2,
+        "normalized spellings of a configured relay are the same relay: {usable:?}"
+    );
+}
+
+#[test]
+fn duplicates_that_normalize_alike_are_collapsed() {
+    let usable = signal_relays(
+        &candidates(&["wss://nos.lol", "wss://nos.lol/", "wss://NOS.LOL"]),
+        None,
+        &[],
+        &pool(&["wss://nos.lol"]),
+    );
+    assert_eq!(usable, vec!["wss://nos.lol".to_string()]);
+}
+
+#[test]
+fn unparseable_candidates_are_dropped_rather_than_failing_the_set() {
+    let usable = signal_relays(
+        &candidates(&["not a url", "wss://nos.lol"]),
+        None,
+        &[],
+        &pool(&["wss://nos.lol"]),
+    );
+    assert_eq!(usable, vec!["wss://nos.lol".to_string()]);
+}
+
+#[test]
+fn no_shared_relay_yields_an_empty_set_for_the_caller_to_reject() {
+    let usable = signal_relays(
+        &candidates(&["wss://temp.iris.to"]),
+        None,
+        &[],
+        &pool(&["wss://nos.lol"]),
+    );
+    assert!(
+        usable.is_empty(),
+        "with no overlap the caller must see nothing to send to, not a doomed send"
+    );
+}
+
+#[test]
+fn signal_relays_merges_all_three_sources_then_filters() {
+    let usable = signal_relays(
+        &candidates(&["wss://temp.iris.to", "wss://nos.lol"]),
+        Some(&candidates(&[
+            "wss://relay.damus.io",
+            "wss://unknown.example",
+        ])),
+        &candidates(&["wss://offchain.pub"]),
+        &pool(&[
+            "wss://nos.lol",
+            "wss://relay.damus.io",
+            "wss://offchain.pub",
+        ]),
+    );
+    assert_eq!(
+        usable,
+        vec![
+            "wss://nos.lol".to_string(),
+            "wss://relay.damus.io".to_string(),
+            "wss://offchain.pub".to_string(),
+        ],
+        "every source must contribute, and only the out-of-pool entries drop out"
+    );
+}
+
+#[test]
+fn signal_relays_keeps_our_dm_relays_when_the_peer_shares_nothing() {
+    let usable = signal_relays(
+        &candidates(&["wss://temp.iris.to"]),
+        Some(&candidates(&["wss://also.unknown"])),
+        &candidates(&["wss://nos.lol"]),
+        &pool(&["wss://nos.lol"]),
+    );
+    assert_eq!(
+        usable,
+        vec!["wss://nos.lol".to_string()],
+        "our own DM relays are always in the pool, so the result is never empty \
+         while any are configured"
+    );
+}
+
+#[test]
+fn signal_relays_without_an_advert_still_resolves() {
+    let usable = signal_relays(
+        &candidates(&["wss://nos.lol", "wss://temp.iris.to"]),
+        None,
+        &candidates(&["wss://offchain.pub"]),
+        &pool(&["wss://nos.lol", "wss://offchain.pub"]),
+    );
+    assert_eq!(
+        usable,
+        vec![
+            "wss://nos.lol".to_string(),
+            "wss://offchain.pub".to_string()
+        ],
+        "the responder path passes no advert and must still produce a target set"
+    );
+}
+
+/// A `JoinHandle` for a task that has definitely completed. Yields until the
+/// runtime has polled the no-op task to completion, so `is_finished()` is
+/// deterministically `true` on return.
+async fn finished_handle() -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async {});
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    handle
+}
+
+/// A `JoinHandle` for a task that never completes.
+fn live_handle() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(std::future::pending::<()>())
+}
+
+/// The regression case: `connect_task` and `relay_startup_task` both return by
+/// design (`Client::connect()` only kicks off per-relay connection tasks;
+/// the startup loop breaks on the first successful subscribe), so a healthy
+/// node has two finished handles and must still report live.
+#[tokio::test]
+async fn nostr_liveness_ignores_the_tasks_that_return_by_design() {
+    let runtime = NostrRendezvous::new_for_test();
+    runtime
+        .install_tasks_for_test(
+            finished_handle().await,
+            finished_handle().await,
+            live_handle(),
+            live_handle(),
+            live_handle(),
+        )
+        .await;
+    assert!(
+        !runtime.is_finished(),
+        "a node whose connect/relay-startup tasks have returned normally is healthy"
+    );
+}
+
+#[tokio::test]
+async fn nostr_liveness_fires_when_the_notify_loop_dies() {
+    let runtime = NostrRendezvous::new_for_test();
+    runtime
+        .install_tasks_for_test(
+            live_handle(),
+            live_handle(),
+            finished_handle().await,
+            live_handle(),
+            live_handle(),
+        )
+        .await;
+    assert!(
+        runtime.is_finished(),
+        "a dead inbound notify loop means no advert or signal is ever received again"
+    );
+}
+
+#[tokio::test]
+async fn nostr_liveness_fires_when_the_publish_loop_dies() {
+    let runtime = NostrRendezvous::new_for_test();
+    runtime
+        .install_tasks_for_test(
+            live_handle(),
+            live_handle(),
+            live_handle(),
+            finished_handle().await,
+            live_handle(),
+        )
+        .await;
+    assert!(
+        runtime.is_finished(),
+        "a dead publish loop means this node stops being discoverable"
+    );
+}
+
+#[tokio::test]
+async fn nostr_liveness_fires_when_the_advertise_loop_dies() {
+    let runtime = NostrRendezvous::new_for_test();
+    runtime
+        .install_tasks_for_test(
+            live_handle(),
+            live_handle(),
+            live_handle(),
+            live_handle(),
+            finished_handle().await,
+        )
+        .await;
+    assert!(
+        runtime.is_finished(),
+        "a dead advertise ticker means the advert is never refreshed"
+    );
+}
+
+/// `shutdown` takes every handle, leaving `None`. That must read as finished so
+/// the 2s liveness poll monitor terminates instead of spinning after a stop.
+#[tokio::test]
+async fn nostr_liveness_reports_finished_once_the_handles_are_taken() {
+    let runtime = NostrRendezvous::new_for_test();
+    assert!(
+        runtime.is_finished(),
+        "no installed handles (post-shutdown) reads as finished"
     );
 }

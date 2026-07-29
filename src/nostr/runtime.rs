@@ -176,21 +176,51 @@ pub struct NostrRendezvous {
 }
 
 impl NostrRendezvous {
-    /// Whether the primary Nostr connection task has exited (runtime liveness).
+    /// Whether the Nostr subsystem has stopped being able to do its job
+    /// (runtime liveness).
     ///
-    /// "Nostr exited" is defined as the primary `connect_task` having finished.
-    /// It is `Some` for the engine's whole running life (installed in `start`);
-    /// `shutdown` takes it, leaving `None` — a taken handle means the engine has
-    /// been shut down, which counts as finished, so a `None` inner maps to
-    /// `true` (this lets the liveness poll monitor terminate after a stop rather
-    /// than spinning forever). `connect_task` is a `tokio::sync::Mutex`, so this
-    /// sync accessor uses the non-blocking `try_lock`: a momentarily-contended
-    /// lock (only start/stop hold it, briefly) reports "not finished", the safe
-    /// direction — the 2s liveness poll re-checks next tick and never spuriously
-    /// degrades a healthy node.
+    /// "Nostr exited" is defined as *any* of the three service loops that never
+    /// return by design having finished:
+    ///
+    /// - `notify_task` — the inbound receive loop. Without it no advert and no
+    ///   traversal signal is ever observed again.
+    /// - `publish_task` — the advert publisher. Without it this node stops being
+    ///   discoverable.
+    /// - `advertise_task` — the refresh ticker that drives the publisher.
+    ///
+    /// Each of these is an unconditional `loop` (the notify loop's only `break`
+    /// is the relay-pool broadcast channel closing, i.e. the pool itself is
+    /// gone), so a finished handle means the task panicked or was aborted:
+    /// unrecoverable, which matches the one-way `ChildExited` → `Degraded`
+    /// latch in the supervisor FSM.
+    ///
+    /// Deliberately *not* watched: `connect_task` and `relay_startup_task`.
+    /// `Client::connect()` only spawns a per-relay background connection task
+    /// and returns, so `connect_task` finishes moments after start on a
+    /// perfectly healthy node; `relay_startup_task` breaks out of its retry loop
+    /// on the first successful subscribe. Watching either reports Degraded on
+    /// every node forever.
+    ///
+    /// Each handle is `Some` for the engine's whole running life (installed in
+    /// `start`); `shutdown` takes them all, leaving `None` — a taken handle
+    /// means the engine has been shut down, which counts as finished, so a
+    /// `None` inner maps to `true` (this lets the liveness poll monitor
+    /// terminate after a stop rather than spinning forever). The slots are
+    /// `tokio::sync::Mutex`es, so this sync accessor uses the non-blocking
+    /// `try_lock`: a momentarily-contended lock (only start/stop hold it,
+    /// briefly) reports "not finished", the safe direction — the 2s liveness
+    /// poll re-checks next tick and never spuriously degrades a healthy node.
     pub fn is_finished(&self) -> bool {
-        self.connect_task
-            .try_lock()
+        Self::task_finished(&self.notify_task)
+            || Self::task_finished(&self.publish_task)
+            || Self::task_finished(&self.advertise_task)
+    }
+
+    /// Liveness of one task slot: finished if the handle is gone (shut down) or
+    /// the task has completed; "not finished" when the slot is momentarily
+    /// locked by start/stop.
+    fn task_finished(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
+        slot.try_lock()
             .map(|g| g.as_ref().is_none_or(|h| h.is_finished()))
             .unwrap_or(false)
     }
@@ -1223,6 +1253,16 @@ impl NostrRendezvous {
             }
         }
 
+        // Resolve the answer's relays before binding a socket and running STUN.
+        // Nothing in the relay choice depends on what STUN observes, and an offer
+        // from a peer we share no relay with cannot be answered at all — doing it
+        // in this order spends a STUN round trip, and holds an offer slot for its
+        // duration, only to discard the result.
+        let relays = self.preferred_signal_relays(sender, None).await?;
+        if relays.is_empty() {
+            return Err(BootstrapError::MissingRelays(offer.sender_npub.clone()));
+        }
+
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
         base_socket.set_nonblocking(true)?;
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
@@ -1257,7 +1297,6 @@ impl NostrRendezvous {
             (!accepted).then_some("no-usable-addresses".to_string()),
             Some(offer_received_at),
         );
-        let relays = self.preferred_signal_relays(sender, None).await?;
         let answer_event = self.send_signal(&relays, sender, &answer).await?;
         debug!(
             peer = %peer_short,
@@ -1384,22 +1423,21 @@ impl NostrRendezvous {
         target_pubkey: PublicKey,
         advert: Option<&OverlayAdvert>,
     ) -> Result<Vec<String>, BootstrapError> {
-        let mut merged = self.find_recipient_inbox_relays(target_pubkey).await?;
-        if let Some(advert) = advert
-            && let Some(relays) = advert.signal_relays.as_ref()
-        {
-            for relay in relays {
-                if !merged.contains(relay) {
-                    merged.push(relay.clone());
-                }
-            }
-        }
-        for relay in &self.config.dm_relays {
-            if !merged.contains(relay) {
-                merged.push(relay.clone());
-            }
-        }
-        Ok(merged)
+        let inbox = self.find_recipient_inbox_relays(target_pubkey).await?;
+        let pool: HashSet<RelayUrl> = self.client.pool().all_relays().await.into_keys().collect();
+        let usable = signal_relays(
+            &inbox,
+            advert.and_then(|advert| advert.signal_relays.as_deref()),
+            &self.config.dm_relays,
+            &pool,
+        );
+        debug!(
+            peer = %target_pubkey.to_bech32().map(|npub| short_npub(&npub)).unwrap_or_default(),
+            inbox = inbox.len(),
+            usable = usable.len(),
+            "traversal: signal relays resolved against the client pool"
+        );
+        Ok(usable)
     }
 
     async fn find_recipient_inbox_relays(
@@ -1599,6 +1637,56 @@ impl NostrRendezvous {
     }
 }
 
+/// Retain only the candidates the client pool actually holds.
+///
+/// `send_event_to` rejects the whole send with `RelayNotFound` if any single URL
+/// is outside the pool, so a signal addressed to a peer's advertised relays fails
+/// entirely on one relay we are not configured with. Filtering first turns that
+/// into a send to the relays we share.
+///
+/// Comparison is on the normalized `RelayUrl` rather than the raw string, because
+/// the pool is keyed that way: a candidate spelled `wss://relay.example/` matches
+/// a configured `wss://relay.example`. Order is preserved, candidates that fail
+/// to parse are dropped, and duplicates that normalize alike are collapsed.
+fn retain_pooled_relays(candidates: &[String], pool: &HashSet<RelayUrl>) -> Vec<String> {
+    let mut seen: HashSet<RelayUrl> = HashSet::new();
+    let mut usable = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Ok(url) = RelayUrl::parse(candidate) else {
+            continue;
+        };
+        if pool.contains(&url) && seen.insert(url.clone()) {
+            usable.push(url.to_string());
+        }
+    }
+    usable
+}
+
+/// Choose the relays a traversal signal for one peer should be sent to.
+///
+/// The candidates are the peer's NIP-17 inbox relays, then the relays its advert
+/// nominates for signaling, then our own DM relays — remote-supplied first, ours
+/// last, so a peer's preference is honored where we can act on it. The result is
+/// whatever survives [`retain_pooled_relays`].
+///
+/// This is the whole decision, kept synchronous so it can be exercised without a
+/// relay client: the caller's only job is to supply the fetched inbox list and
+/// the pool.
+pub(super) fn signal_relays(
+    inbox: &[String],
+    advert_signal: Option<&[String]>,
+    dm_relays: &[String],
+    pool: &HashSet<RelayUrl>,
+) -> Vec<String> {
+    let mut merged: Vec<String> = inbox.to_vec();
+    for relay in advert_signal.unwrap_or_default().iter().chain(dm_relays) {
+        if !merged.contains(relay) {
+            merged.push(relay.clone());
+        }
+    }
+    retain_pooled_relays(&merged, pool)
+}
+
 #[cfg(test)]
 impl NostrRendezvous {
     /// Build a minimal `NostrRendezvous` for unit tests. No relay client is
@@ -1656,6 +1744,24 @@ impl NostrRendezvous {
         }
     }
 
+    /// Install the five background-task handles that `start` would install, so
+    /// liveness tests can drive `is_finished()` without live relays. Each
+    /// argument is the handle to place in the matching slot.
+    pub(crate) async fn install_tasks_for_test(
+        &self,
+        connect: JoinHandle<()>,
+        relay_startup: JoinHandle<()>,
+        notify: JoinHandle<()>,
+        publish: JoinHandle<()>,
+        advertise: JoinHandle<()>,
+    ) {
+        *self.connect_task.lock().await = Some(connect);
+        *self.relay_startup_task.lock().await = Some(relay_startup);
+        *self.notify_task.lock().await = Some(notify);
+        *self.publish_task.lock().await = Some(publish);
+        *self.advertise_task.lock().await = Some(advertise);
+    }
+
     /// Build a `CachedOverlayAdvert` for tests with a single endpoint and
     /// a generous validity window (one hour from `now_ms()`).
     pub(crate) fn cached_advert_for_test(
@@ -1675,6 +1781,18 @@ impl NostrRendezvous {
             created_at: created_at_secs,
             valid_until_ms: now_ms().saturating_add(3_600_000),
         }
+    }
+
+    /// Point the test instance's advert relays at explicit URLs. Unit tests
+    /// that exercise `refetch_advert_for_stale_check` use this to replace the
+    /// default public relay list with a local blackhole, so the refetch runs
+    /// its full 2s timeout without touching the network.
+    pub(crate) async fn set_advert_relays_for_test(&mut self, relays: Vec<String>) {
+        for url in &relays {
+            let _ = self.client.add_relay(url.as_str()).await;
+        }
+        self.client.connect().await;
+        self.config.advert_relays = relays;
     }
 
     /// Insert a cached advert directly into the in-memory cache. Used by

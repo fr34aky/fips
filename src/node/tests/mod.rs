@@ -15,8 +15,6 @@ mod decrypt_failure;
 mod disconnect;
 mod discovery;
 mod establish_chartests;
-#[cfg(target_os = "linux")]
-mod ethernet;
 mod forwarding;
 mod handshake;
 mod heartbeat;
