@@ -63,7 +63,9 @@ install -m 0755 "${PROJECT_ROOT}/target/release/fips" \
 
 # Config ships sample-style: copied into place on install if absent,
 # removed on deinstall only if unmodified (see the manifest scripts).
-install -m 0644 "${PROJECT_ROOT}/packaging/common/fips.yaml" \
+# fips.yaml may hold a node private key (nsec:), so it is never
+# world-readable — 0600 like the Debian and macOS packages.
+install -m 0600 "${PROJECT_ROOT}/packaging/common/fips.yaml" \
                 "${STAGE}/usr/local/etc/fips/fips.yaml.sample"
 install -m 0644 "${PROJECT_ROOT}/packaging/common/hosts" \
                 "${STAGE}/usr/local/etc/fips/hosts.sample"
@@ -99,19 +101,43 @@ licenses: ["MIT"]
 categories: ["net"]
 scripts: {
   post-install: <<EOD
-for f in fips.yaml hosts; do
-    s="/usr/local/etc/fips/\${f}.sample"
-    t="/usr/local/etc/fips/\${f}"
-    [ -f "\$t" ] || cp -p "\$s" "\$t"
-done
+# Control-socket access group: the rc script creates /var/run/fips as
+# root:fips 0750, so members can use fipsctl/fipstop without root.
+pw groupshow fips >/dev/null 2>&1 || pw groupadd fips
+# Install-if-absent config. fips.yaml may hold a node private key
+# (nsec:), so it is 0600; FreeBSD has no "root" group, wheel is gid 0.
+[ -f /usr/local/etc/fips/fips.yaml ] || install -m 0600 -o root -g wheel \\
+    /usr/local/etc/fips/fips.yaml.sample /usr/local/etc/fips/fips.yaml
+[ -f /usr/local/etc/fips/hosts ] || install -m 0644 -o root -g wheel \\
+    /usr/local/etc/fips/hosts.sample /usr/local/etc/fips/hosts
+# pkg upgrade runs the old package's pre-deinstall (which stops the
+# services); bring them back up on the new binaries if enabled.
+if [ "\${PKG_UPGRADE:-}" = "true" ]; then
+    if service fips enabled >/dev/null 2>&1; then
+        service fips start >/dev/null 2>&1 || true
+    fi
+    if service fips_dns enabled >/dev/null 2>&1; then
+        service fips_dns start >/dev/null 2>&1 || true
+    fi
+fi
 EOD
   pre-deinstall: <<EOD
-/usr/local/libexec/fips/fips-dns-teardown 2>/dev/null || true
-for f in fips.yaml hosts; do
-    s="/usr/local/etc/fips/\${f}.sample"
-    t="/usr/local/etc/fips/\${f}"
-    if [ -f "\$t" ] && cmp -s "\$t" "\$s"; then rm -f "\$t"; fi
-done
+# Stop the services so the daemon binary is never replaced (upgrade) or
+# removed (deinstall) under a running process. fips_dns stop also tears
+# down the .fips resolver drop-in; on upgrade the new package's
+# post-install re-establishes it.
+service fips_dns onestop >/dev/null 2>&1 || true
+service fips onestop >/dev/null 2>&1 || true
+if [ "\${PKG_UPGRADE:-}" != "true" ]; then
+    # Removal: clear the resolver drop-in even if the service was never
+    # started through rc.
+    /usr/local/libexec/fips/fips-dns-teardown 2>/dev/null || true
+    for f in fips.yaml hosts; do
+        s="/usr/local/etc/fips/\${f}.sample"
+        t="/usr/local/etc/fips/\${f}"
+        if [ -f "\$t" ] && cmp -s "\$t" "\$s"; then rm -f "\$t"; fi
+    done
+fi
 EOD
 }
 EOF

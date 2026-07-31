@@ -31,8 +31,16 @@ start_precmd="fips_precmd"
 
 # The daemon resolves its control socket to /var/run/fips when the
 # directory exists, so it must be there before the daemon starts.
+# root:fips 0750 (matching the Debian tmpfiles entry) lets members of
+# the fips group use fipsctl/fipstop without root; the group is created
+# by the package post-install. Fall back to 0755 for source builds
+# where the group does not exist.
 fips_precmd() {
-    install -d -m 0755 "$runtime_dir"
+    if pw groupshow fips >/dev/null 2>&1; then
+        install -d -m 0750 -o root -g fips "$runtime_dir"
+    else
+        install -d -m 0755 "$runtime_dir"
+    fi
 }
 
 run_rc_command "$1"

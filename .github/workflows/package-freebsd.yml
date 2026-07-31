@@ -34,7 +34,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            BRANCH=$(echo "$GITHUB_REF_NAME" | sed 's|[^A-Za-z0-9]|.|g; s/\.\.+/./g; s/^\.//; s/\.$//')
+            BRANCH=$(echo "$GITHUB_REF_NAME" | sed 's|[^A-Za-z0-9]|.|g; s/\.\{2,\}/./g; s/^\.//; s/\.$//')
             HEIGHT=$(git rev-list --count HEAD)
             HASH=$(git rev-parse --short HEAD)
             if [[ -z "$BRANCH" ]]; then
@@ -91,6 +91,12 @@ jobs:
 
             cargo build --release
 
+            # The only place the FreeBSD cfg arms' unit tests ever run in
+            # CI — the main CI matrix is Linux-only, and a release build
+            # compiles no #[cfg(test)] code (AF-prefix strip round-trips,
+            # platform module, config path gates).
+            cargo test
+
             packaging/freebsd/build-pkg.sh \
               --version "$FREEBSD_PACKAGE_VERSION" \
               --no-build
@@ -114,6 +120,16 @@ jobs:
             # samples into place (install-if-absent semantics).
             test -f /usr/local/etc/fips/fips.yaml
             test -f /usr/local/etc/fips/hosts
+            # fips.yaml may hold a node private key (nsec:); it must not
+            # be world-readable — Debian and macOS both install it 0600.
+            for f in /usr/local/etc/fips/fips.yaml /usr/local/etc/fips/fips.yaml.sample; do
+              mode=$(stat -f %Lp "$f")
+              if [ "$mode" != "600" ]; then
+                echo "FAIL: $f mode is $mode, expected 600"; exit 1
+              fi
+            done
+            # post-install must create the control-socket access group.
+            pw groupshow fips >/dev/null || { echo "FAIL: fips group missing"; exit 1; }
             test -x /usr/local/libexec/fips/fips-dns-setup
             pkg info fips
             echo "==> pkg smoke-install PASSED"

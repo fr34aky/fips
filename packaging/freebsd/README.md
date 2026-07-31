@@ -4,6 +4,13 @@ Builds a native FreeBSD `.pkg` shipping `fips`, `fipsctl`, `fipstop`,
 rc.d services, and `.fips` DNS integration. `fips-gateway` is excluded
 (its NAT backend is nftables, Linux-only).
 
+Platform notes: the Ethernet and BLE transports are not available on
+FreeBSD (UDP, TCP, Tor, and Nym are). The UDP datapath deliberately
+uses the portable single-packet receive loop — FreeBSD's `recvmmsg(2)`
+is a libc loop over `recvmsg`, not a kernel batch, so the Linux/macOS
+batched arm would gain nothing — and the connected-UDP fast path is
+not compiled pending FreeBSD-specific `SO_REUSEPORT` validation.
+
 ## Build
 
 ```sh
@@ -26,9 +33,17 @@ fipsctl show status
 ```
 
 Config installs sample-style (`@sample` semantics via manifest
-scripts), so an edited `fips.yaml` survives upgrade/removal. The daemon runs under daemon(8) with pidfile
+scripts), so an edited `fips.yaml` survives upgrade/removal.
+`fips.yaml` is installed `0600` — it may hold the node's private key
+(`nsec:`). The daemon runs under daemon(8) with pidfile
 `/var/run/fips/fips.pid` and logs to `/var/log/fips.log` (rc.conf
 knobs: `fips_config`, `fips_flags`, `fips_logfile`).
+
+The package creates a `fips` group; members can run `fipsctl` and
+`fipstop` without root (`pw groupmod fips -m <user>`, then re-login).
+On `pkg upgrade` the services are stopped before the binaries are
+replaced and started again afterwards if enabled; on `pkg delete` they
+are stopped and the `.fips` resolver drop-in is removed.
 
 ## .fips DNS integration
 
