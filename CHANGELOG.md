@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/usr/local/etc/fips` config search path, and `/var/run/fips`
   control-socket default (both shared with macOS). `fips-gateway`
   remains Linux-only. Native `.pkg` packaging under `packaging/freebsd/`
-  (`make freebsd`) with rc.d services and `.fips` DNS integration for
-  `local_unbound`/`unbound`/`dnsmasq`. mDNS LAN discovery works via
+  (`make freebsd`) with rc.d services, a `fips` control-socket group,
+  service stop/restart across `pkg upgrade`, and `.fips` DNS integration
+  for `local_unbound`/`unbound`/`dnsmasq`. mDNS LAN discovery works via
   `mdns-sd` 0.20 (`socket-pktinfo` 0.4.1, the first release that builds
   on FreeBSD). Daemon logs now disable ANSI color when stdout is not a
   terminal (all platforms).
@@ -45,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the features never reached.
 
 ### Changed
+
+- On macOS the default paths for the `hosts` file, the `peers.allow` /
+  `peers.deny` ACL files, and `fipsctl keygen` output moved from
+  `/etc/fips` to `/usr/local/etc/fips` — the directory the macOS `.pkg`
+  actually installs into (now shared with FreeBSD). `/etc/fips` is no
+  longer read for these files; the daemon warns at startup, and
+  `fipsctl keygen` prints a note, when a file exists at the old path
+  but not the new one. Move any hand-created files across.
 
 - The Ethernet transport's per-interface `discovery` flag was renamed to
   `listen` (`transports.ethernet.*`) to match the symmetric `announce`

@@ -327,13 +327,30 @@ impl TunDevice {
     /// The buffer should be at least MTU + header size (typically 1500+ bytes).
     ///
     /// The tun crate's `Read` impl transparently strips the macOS utun
-    /// packet information header, so this returns a raw IP packet on all
-    /// platforms.
+    /// packet information header, and on FreeBSD (TUNSIFHEAD) the
+    /// equivalent 4-byte address-family prefix is stripped here, so this
+    /// returns a raw IP packet on all platforms. `Ok(0)` means the frame
+    /// carried no payload; callers should skip it.
     ///
     /// The raw `io::Error` is returned so callers can inspect `ErrorKind`
     /// (e.g. `WouldBlock`) or `raw_os_error()` without string matching.
     pub fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        self.device.read(buf)
+        let n = self.device.read(buf)?;
+        // FreeBSD tun in TUNSIFHEAD mode prefixes every frame with its
+        // address family. Strip it here so callers see the same raw-IP
+        // contract as on Linux and macOS. Non-IPv6 families pass through
+        // stripped — matching macOS, where the tun crate does the same —
+        // and are dropped by the IPv6 version check in handle_tun_packet.
+        #[cfg(target_os = "freebsd")]
+        let n = match parse_utun_af_prefix(&buf[..n]) {
+            Some(_) if n > 4 => {
+                buf.copy_within(4..n, 0);
+                n - 4
+            }
+            // Header-only or truncated frame: no payload.
+            _ => 0,
+        };
+        Ok(n)
     }
 
     /// Shutdown and delete the TUN device.
@@ -387,39 +404,34 @@ impl TunDevice {
     }
 }
 
-/// macOS utun protocol family value for IPv6 (matches `<sys/socket.h>`
-/// `AF_INET6` on Darwin). Used as the 4-byte big-endian packet-info
-/// header prepended to every utun frame.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-const UTUN_AF_INET6: u32 = 30;
+/// Address-family value for IPv6 in the 4-byte packet-info header used
+/// by macOS `utun` and FreeBSD `tun` (TUNSIFHEAD) devices: the target's
+/// `AF_INET6` — 30 on Darwin, 28 on FreeBSD.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const UTUN_AF_INET6: u32 = libc::AF_INET6 as u32;
 
-/// Build the 4-byte big-endian utun packet-info header for an IPv6 frame.
+/// Build the 4-byte big-endian packet-info header for an IPv6 frame.
 ///
-/// utun devices on macOS require a 4-byte address-family prefix on every
-/// frame: a single big-endian `u32` carrying the protocol family. For
-/// IPv6 traffic (the only family FIPS sends) this is `AF_INET6 = 30`,
-/// which serializes as `[0x00, 0x00, 0x00, 0x1e]`. The writer builds the
-/// header from `libc::AF_INET6` directly (shared with FreeBSD); this
-/// helper pins the wire format for the round-trip tests below.
-#[cfg(target_os = "macos")]
+/// macOS utun and FreeBSD tun (TUNSIFHEAD) devices require a 4-byte
+/// address-family prefix on every frame: a single big-endian `u32`
+/// carrying the protocol family. For IPv6 traffic (the only family FIPS
+/// sends) this is the target's `AF_INET6`.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 #[inline]
-#[allow(dead_code)]
 fn utun_af_inet6_header() -> [u8; 4] {
     UTUN_AF_INET6.to_be_bytes()
 }
 
-/// Parse the 4-byte big-endian utun packet-info header.
+/// Parse the 4-byte big-endian packet-info header.
 ///
-/// Returns the address-family value (`AF_INET6 = 30` for IPv6 frames),
-/// or `None` if the buffer is shorter than the 4-byte header. The `tun`
-/// crate's `Read` impl strips this transparently for us in the read
-/// path; this helper exists for round-trip testability with
-/// [`utun_af_inet6_header`] and for any future code path that reads
-/// from the dup'd fd directly.
-#[cfg(target_os = "macos")]
+/// Returns the address-family value, or `None` if the buffer is shorter
+/// than the 4-byte header. On FreeBSD [`TunDevice::read_packet`] strips
+/// the prefix with this; on macOS the `tun` crate's `Read` impl strips
+/// it before we see the frame, so there the helper is exercised only by
+/// the round-trip tests below.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[inline]
-#[allow(dead_code)]
 fn parse_utun_af_prefix(buf: &[u8]) -> Option<u32> {
     if buf.len() < 4 {
         return None;
@@ -474,15 +486,13 @@ impl TunWriter {
 
             // On macOS (utun) and FreeBSD (tun with TUNSIFHEAD), the device
             // requires a 4-byte network-order address-family header prepended
-            // to each packet; the AF value differs per OS (macOS 30, FreeBSD
-            // 28) but both are the target's `libc::AF_INET6`. The tun crate
-            // handles this for its own Read/Write impl, but we use a dup'd fd
-            // directly. We use writev to avoid allocating a buffer on every
-            // packet.
+            // to each packet. The tun crate handles this for its own
+            // Read/Write impl, but we use a dup'd fd directly. We use writev
+            // to avoid allocating a buffer on every packet.
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             let write_result = {
                 use std::os::unix::io::AsRawFd;
-                let af_header = (libc::AF_INET6 as u32).to_be_bytes();
+                let af_header = utun_af_inet6_header();
                 let iov = [
                     libc::iovec {
                         iov_base: af_header.as_ptr() as *mut libc::c_void,
@@ -662,26 +672,8 @@ pub fn run_tun_reader(
         loop {
             match device.read_packet(&mut buf) {
                 Ok(n) if n > 0 => {
-                    // FreeBSD (TUNSIFHEAD): every frame starts with a 4-byte
-                    // network-order address-family prefix. Strip it and skip
-                    // non-IPv6 frames. (On macOS the tun crate's Read impl
-                    // strips the utun prefix itself.)
-                    #[cfg(target_os = "freebsd")]
-                    let start = {
-                        if n <= 4 {
-                            continue;
-                        }
-                        let af = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        if af != libc::AF_INET6 as u32 {
-                            continue;
-                        }
-                        4
-                    };
-                    #[cfg(not(target_os = "freebsd"))]
-                    let start = 0;
-
                     if !handle_tun_packet(
-                        &mut buf[start..n],
+                        &mut buf[..n],
                         max_mss,
                         &name,
                         our_addr,
@@ -692,7 +684,9 @@ pub fn run_tun_reader(
                         return; // _shutdown_fd closes on drop
                     }
                 }
-                Ok(_) => break, // No more data
+                // No more data, or an empty/skipped frame — either way
+                // fall back to select for the next readable event.
+                Ok(_) => break,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         break; // Done for this select round
@@ -1753,34 +1747,41 @@ mod tests {
     }
 
     // ========================================================================
-    // macOS utun packet-info header (AF_INET6 4-byte big-endian prefix)
+    // macOS utun / FreeBSD TUNSIFHEAD packet-info header (4-byte big-endian
+    // AF prefix)
     //
     // These tests are pure-data byte-buffer manipulation and require no
     // privilege, no actual TUN device, no system calls. They pin the wire
     // format that `TunWriter::run` emits ahead of every IPv6 frame on the
-    // dup'd utun fd, and the inverse parse used for round-trip checking.
+    // dup'd fd, and the inverse parse `read_packet` uses on FreeBSD.
     // ========================================================================
 
-    #[cfg(target_os = "macos")]
-    mod macos_utun_header {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    mod utun_header {
         use super::super::{UTUN_AF_INET6, parse_utun_af_prefix, utun_af_inet6_header};
 
         #[test]
-        fn af_inet6_constant_matches_darwin() {
-            // Darwin's <sys/socket.h> defines AF_INET6 = 30. If this ever
-            // diverges, every utun write FIPS issues will be misclassified
-            // by the kernel and dropped. The writer builds the header from
-            // libc::AF_INET6, so pin that to the same value.
+        fn af_inet6_constant_matches_platform() {
+            // <sys/socket.h> defines AF_INET6 = 30 on Darwin and 28 on
+            // FreeBSD. If this ever diverges, every TUN write FIPS issues
+            // will be misclassified by the kernel and dropped, and every
+            // inbound frame will be skipped as non-IPv6.
+            #[cfg(target_os = "macos")]
             assert_eq!(UTUN_AF_INET6, 30);
+            #[cfg(target_os = "freebsd")]
+            assert_eq!(UTUN_AF_INET6, 28);
             assert_eq!(libc::AF_INET6 as u32, UTUN_AF_INET6);
         }
 
         #[test]
         fn encode_produces_big_endian_af_inet6() {
-            // The kernel reads the 4-byte prefix as a big-endian u32.
-            // 30 == 0x0000001e, so the wire bytes are [0, 0, 0, 0x1e].
+            // The kernel reads the 4-byte prefix as a big-endian u32:
+            // 30 == 0x0000001e (Darwin), 28 == 0x0000001c (FreeBSD).
             let header = utun_af_inet6_header();
+            #[cfg(target_os = "macos")]
             assert_eq!(header, [0x00, 0x00, 0x00, 0x1e]);
+            #[cfg(target_os = "freebsd")]
+            assert_eq!(header, [0x00, 0x00, 0x00, 0x1c]);
         }
 
         #[test]

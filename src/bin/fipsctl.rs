@@ -426,6 +426,17 @@ fn main() {
         let key_path = dir.join("fips.key");
         let pub_path = dir.join("fips.pub");
 
+        // The default key directory on macOS/FreeBSD moved from /etc/fips
+        // to /usr/local/etc/fips; point at keys stranded at the old path.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        if std::path::Path::new("/etc/fips/fips.key").exists() && !key_path.exists() {
+            eprintln!("note: /etc/fips/fips.key exists but the default key directory");
+            eprintln!(
+                "      is now {}; that key is no longer used by default.",
+                dir.display()
+            );
+        }
+
         if key_path.exists() && !force {
             eprintln!("error: key file already exists: {}", key_path.display());
             eprintln!("Use --force to overwrite.");
