@@ -71,6 +71,10 @@ pub(crate) use stats_common::PoolCounters;
 
 pub use fips_core::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 
+mod protect;
+pub(crate) use protect::apply_socket_protect;
+pub use protect::{RawSocketHandle, SocketProtect};
+
 // ============================================================================
 // Packet Channel Types
 // ============================================================================

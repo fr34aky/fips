@@ -99,6 +99,10 @@ pub struct TcpTransport {
     draining: DrainingWriters,
     /// Transport statistics.
     stats: Arc<TcpStats>,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), applied
+    /// to the listener, every accepted socket, and every dialed socket
+    /// (before the SYN leaves).
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 impl TcpTransport {
@@ -124,6 +128,7 @@ impl TcpTransport {
             idle_timeout: INBOUND_IDLE_TIMEOUT,
             draining: DrainingWriters::default(),
             stats: Arc::new(TcpStats::new()),
+            socket_protect: None,
         }
     }
 
@@ -152,6 +157,14 @@ impl TcpTransport {
     #[cfg(test)]
     pub(crate) fn inbound_idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    /// Install the embedder socket-protect hook (Android
+    /// `VpnService.protect`). Must be called before `start_async`; the hook
+    /// runs with each socket's raw handle before any traffic is sent on it —
+    /// for outbound dials, before the connect is initiated.
+    pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
+        self.socket_protect = Some(hook);
     }
 
     /// Set the node-wide `node.limits.max_connections` value.
@@ -230,6 +243,8 @@ impl TcpTransport {
                     .map_err(|e| TransportError::StartFailed(format!("get local addr: {}", e)))?,
             );
 
+            crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &listener);
+
             // Spawn accept loop
             let transport_id = self.transport_id;
             let packet_tx = self.packet_tx.clone();
@@ -247,6 +262,7 @@ impl TcpTransport {
                     first_frame: self.first_frame_timeout,
                     idle: self.idle_timeout,
                 },
+                socket_protect: self.socket_protect.clone(),
             };
 
             let accept_task = tokio::spawn(async move {
@@ -510,8 +526,14 @@ impl TcpTransport {
         let socket_addrs: Vec<_> = resolve_socket_addrs(addr).await?.collect();
         let timeout_ms = self.config.connect_timeout_ms();
 
-        let connected =
-            connect_to_any_addr(self.transport_id, addr, &socket_addrs, timeout_ms).await;
+        let connected = connect_to_any_addr(
+            self.transport_id,
+            addr,
+            &socket_addrs,
+            timeout_ms,
+            self.socket_protect.as_ref(),
+        )
+        .await;
         let stream = match connected {
             Ok(stream) => stream,
             Err(error @ TransportError::ConnectionRefused) => {
@@ -687,6 +709,7 @@ impl TcpTransport {
         let transport_id = self.transport_id;
         let remote_addr = addr.clone();
         let stats = self.stats.clone();
+        let socket_protect = self.socket_protect.clone();
 
         debug!(
             transport_id = %transport_id,
@@ -702,8 +725,14 @@ impl TcpTransport {
             // A refusal is logged with its OS error by connect_to_any_addr.
             // Failures are counted here, where they happen, as connect()
             // counts them; whoever later takes the result does not.
-            let connected =
-                connect_to_any_addr(transport_id, &remote_addr, &socket_addrs, timeout_ms).await;
+            let connected = connect_to_any_addr(
+                transport_id,
+                &remote_addr,
+                &socket_addrs,
+                timeout_ms,
+                socket_protect.as_ref(),
+            )
+            .await;
             let stream = match connected {
                 Ok(stream) => stream,
                 Err(error @ TransportError::ConnectionRefused) => {
@@ -1027,6 +1056,7 @@ struct AcceptConfig {
     recv_buf: usize,
     send_buf: usize,
     deadline: InboundDeadline,
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 /// TCP accept loop — runs as a spawned task when bind_addr is configured.
@@ -1048,6 +1078,7 @@ async fn accept_loop(
         recv_buf,
         send_buf,
         deadline,
+        socket_protect,
     } = cfg;
     debug!(transport_id = %transport_id, "TCP accept loop starting");
 
@@ -1119,6 +1150,8 @@ async fn accept_loop(
                         continue;
                     }
                 };
+
+                crate::transport::apply_socket_protect(socket_protect.as_ref(), &std_stream);
 
                 if let Err(e) = configure_accepted_socket(
                     &std_stream,
@@ -1590,6 +1623,7 @@ async fn connect_to_any_addr(
     remote_addr: &TransportAddr,
     socket_addrs: &[SocketAddr],
     timeout_ms: u64,
+    socket_protect: Option<&crate::transport::SocketProtect>,
 ) -> Result<TcpStream, TransportError> {
     if socket_addrs.is_empty() {
         return Err(TransportError::InvalidAddress(format!(
@@ -1601,7 +1635,7 @@ async fn connect_to_any_addr(
     // Try candidates in resolver order within one overall connection timeout.
     match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        TcpStream::connect(socket_addrs),
+        connect_in_order(socket_addrs, socket_protect),
     )
     .await
     {
@@ -1619,6 +1653,46 @@ async fn connect_to_any_addr(
         }
         Err(_) => Err(TransportError::Timeout),
     }
+}
+
+/// Try each candidate in order and return the first stream, or the last
+/// candidate's error — what `TcpStream::connect(&[SocketAddr])` does, but
+/// dialling through [`dial`] so the protect hook covers every attempt.
+async fn connect_in_order(
+    socket_addrs: &[SocketAddr],
+    socket_protect: Option<&crate::transport::SocketProtect>,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for &socket_addr in socket_addrs {
+        match dial(socket_addr, socket_protect).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no addresses to connect to",
+        )
+    }))
+}
+
+/// Create the outbound socket, apply the protect hook, then connect.
+///
+/// Split from `TcpStream::connect` (which creates and connects in one
+/// call) so the hook runs before the SYN leaves the host — required for
+/// `VpnService.protect` to keep the handshake itself out of the tunnel.
+async fn dial(
+    socket_addr: SocketAddr,
+    socket_protect: Option<&crate::transport::SocketProtect>,
+) -> std::io::Result<TcpStream> {
+    let socket = if socket_addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    crate::transport::apply_socket_protect(socket_protect, &socket);
+    socket.connect(socket_addr).await
 }
 
 /// Configure a TCP socket with the transport's settings.
@@ -1741,6 +1815,7 @@ mod tests {
     use crate::transport::framing::{build_established_frame, build_msg1_frame};
     use crate::transport::packet_channel;
     use crate::transport::stream::park_writer;
+    use std::sync::Mutex as StdMutex;
     use tokio::time::{Duration, timeout};
 
     /// The pooled connection for `remote`, whatever key it sits under.
@@ -1778,10 +1853,15 @@ mod tests {
         let bad_addr = "127.0.0.1:0".parse().unwrap();
 
         let remote = TransportAddr::from_string(&format!("localhost:{}", good_addr.port()));
-        let stream =
-            connect_to_any_addr(TransportId::new(1), &remote, &[bad_addr, good_addr], 1_000)
-                .await
-                .expect("second TCP candidate should connect");
+        let stream = connect_to_any_addr(
+            TransportId::new(1),
+            &remote,
+            &[bad_addr, good_addr],
+            1_000,
+            None,
+        )
+        .await
+        .expect("second TCP candidate should connect");
         let (accepted, _) = timeout(Duration::from_secs(1), listener.accept())
             .await
             .unwrap()
@@ -1795,11 +1875,11 @@ mod tests {
         let id = TransportId::new(1);
         let remote = TransportAddr::from_string("localhost:0");
         assert!(matches!(
-            connect_to_any_addr(id, &remote, &[], 1_000).await,
+            connect_to_any_addr(id, &remote, &[], 1_000, None).await,
             Err(TransportError::InvalidAddress(ref message)) if message.ends_with("localhost:0")
         ));
         assert!(matches!(
-            connect_to_any_addr(id, &remote, &["127.0.0.1:0".parse().unwrap()], 1_000).await,
+            connect_to_any_addr(id, &remote, &["127.0.0.1:0".parse().unwrap()], 1_000, None).await,
             Err(TransportError::ConnectionRefused)
         ));
     }
@@ -1813,9 +1893,9 @@ mod tests {
         // this capture is the only subscriber caches its own thread's "never"
         // interest; installing the capture rebuilds already-registered
         // callsites, so registering first makes the capture see the event.
-        let _ = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000).await;
+        let _ = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, None).await;
         let (logs, guard) = crate::testutil::capture_logs_scoped();
-        let result = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000).await;
+        let result = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, None).await;
         drop(guard);
 
         assert!(matches!(result, Err(TransportError::ConnectionRefused)));
@@ -2030,6 +2110,73 @@ mod tests {
 
         t1.stop_async().await.unwrap();
         t2.stop_async().await.unwrap();
+    }
+
+    /// The embedder socket-protect hook (Android `VpnService.protect`) must
+    /// cover all three TCP socket origins: the listener (on start), the
+    /// dialed socket (before the connect is initiated), and the accepted
+    /// socket (before its read task runs).
+    #[tokio::test]
+    async fn test_socket_protect_covers_listener_dialed_and_accepted() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+
+        let mut dialer = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut listener = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+
+        let dialer_seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = dialer_seen.clone();
+        dialer.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+        let listener_seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = listener_seen.clone();
+        listener.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+
+        dialer.start_async().await.unwrap();
+        listener.start_async().await.unwrap();
+        assert_eq!(
+            dialer_seen.lock().unwrap().len(),
+            0,
+            "outbound-only transport binds nothing on start"
+        );
+        assert_eq!(
+            listener_seen.lock().unwrap().len(),
+            1,
+            "listener protected on start"
+        );
+
+        // Dial by sending a frame; wait until it arrives so the accept path
+        // (which protects before spawning the connection's read task) has run.
+        let addr2 = listener.local_addr().unwrap();
+        let payload_len = 4u16;
+        let total = 4 + 12 + payload_len as usize + 16;
+        let mut frame = vec![0u8; total];
+        frame[2..4].copy_from_slice(&payload_len.to_le_bytes());
+        dialer
+            .send_async(&TransportAddr::from_string(&addr2.to_string()), &frame)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(
+            dialer_seen.lock().unwrap().len(),
+            1,
+            "dialed socket protected"
+        );
+        assert_eq!(
+            listener_seen.lock().unwrap().len(),
+            2,
+            "accepted socket protected in addition to the listener"
+        );
+
+        dialer.stop_async().await.unwrap();
+        listener.stop_async().await.unwrap();
     }
 
     #[tokio::test]

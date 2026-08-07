@@ -159,6 +159,7 @@ impl Node {
             interface.as_deref(),
         )
         .map_err(|e| format!("open_connected_fd: {e}"))?;
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &owned);
         let socket = std::sync::Arc::new(crate::transport::udp::ConnectedPeerSocket::from_fd(
             owned,
             peer_socket_addr,

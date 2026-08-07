@@ -360,10 +360,32 @@ system TUN's reader and writer. Nor does FIPS refuse an off-mesh destination up
 front: `handle_tun_outbound` looks up bytes 1 to 15 of any destination in the
 identity cache, and on a miss answers with ICMPv6
 Destination Unreachable on `app_inbound_rx`, sourced from the node's own mesh
-address. An oversize packet gets Packet Too Big on the same channel. The
-embedder is therefore responsible for routing only `fd00::/8` to its TUN, for
-expecting ICMPv6 errors on `app_inbound_rx`, and for clamping TCP MSS on
-SYN-flagged segments in both directions.
+address. An oversize packet gets Packet Too Big on the same channel.
+
+To restore the system TUN's outbound pipeline, the embedder calls
+`Node::tun_packet_processor()` after `start()` and runs
+`TunPacketProcessor::process()` on each packet read from its fd. The
+returned `TunPacketAction` says what the Reader Thread would have done:
+`Forward` (push into `app_outbound_tx`; TCP MSS already clamped in place, using
+the node's live per-destination path-MTU map), `Hairpin` / `Respond` (write back
+to the fd), or `Drop`. Alternatively the embedder may implement the filter and
+clamp itself — routing only `fd00::/8` to its TUN, expecting ICMPv6 errors on
+`app_inbound_rx`, and clamping TCP MSS on SYN-flagged segments in both
+directions — but the processor keeps the two paths byte-identical.
+
+Two more embedder hooks complete the Android picture:
+
+- `Node::set_socket_protect(hook)` (before `start()`) — the node calls the hook
+  with the raw fd of every underlay socket it creates (UDP listen/adopted,
+  per-peer connected-UDP, TCP listener/accepted/dialed — dials are announced
+  before the SYN leaves — and Nostr STUN/hole-punch sockets), so a `VpnService`
+  embedder can `protect()` them and keep FIPS's own traffic out of the tunnel.
+  Not covered, because their libraries expose no socket hook: `nostr-sdk` relay
+  websockets, `mdns-sd` sockets, and the Tor/Nym SOCKS5 dialer (its proxy is a
+  local process that protects its own sockets). Relay websockets escaping
+  protection is benign while the tunnel routes only `fd00::/8`; a
+  block-connections-without-VPN setup would need those flows addressed
+  upstream.
 
 ### App-Owned DNS Path (embedded hosts)
 

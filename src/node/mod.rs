@@ -599,6 +599,10 @@ pub struct Node {
     /// [`Node::netmon_trigger`] and into the detector at `start()`. Always
     /// allocated so the trigger works whenever it is fetched.
     netmon_trigger: netmon::NetmonTrigger,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), installed
+    /// via [`Node::set_socket_protect`] before `start()` and handed to every
+    /// transport / runtime-created underlay socket.
+    socket_protect: Option<crate::transport::SocketProtect>,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -1172,6 +1176,7 @@ impl Node {
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
+            socket_protect: None,
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -1351,6 +1356,7 @@ impl Node {
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
+            socket_protect: None,
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -1386,7 +1392,10 @@ impl Node {
         // Create UDP transport instances
         for (name, udp_config) in udp_instances {
             let transport_id = self.allocate_transport_id();
-            let udp = UdpTransport::new(transport_id, name, udp_config, packet_tx.clone());
+            let mut udp = UdpTransport::new(transport_id, name, udp_config, packet_tx.clone());
+            if let Some(hook) = &self.socket_protect {
+                udp.set_socket_protect(hook.clone());
+            }
             transports.push(TransportHandle::Udp(udp));
         }
 
@@ -1448,6 +1457,9 @@ impl Node {
             let mut tcp = TcpTransport::new(transport_id, name, tcp_config, packet_tx.clone());
             tcp.set_node_max_connections(node_max_connections);
             tcp.set_inbound_idle_timeout(idle_timeout);
+            if let Some(hook) = &self.socket_protect {
+                tcp.set_socket_protect(hook.clone());
+            }
             transports.push(TransportHandle::Tcp(tcp));
         }
 
@@ -4050,6 +4062,12 @@ impl Node {
     /// same channel. The embedder should push only `fd00::/8`-destined IPv6
     /// packets, expect ICMPv6 errors on `app_inbound_rx`, and clamp TCP MSS on
     /// SYN-flagged segments in both directions.
+    ///
+    /// For the outbound direction, [`Self::tun_packet_processor`] does that
+    /// filtering and clamping exactly as the system-TUN reader would: run it
+    /// on each packet read from the fd before pushing into `app_outbound_tx`.
+    /// It does not cover the inbound direction; packets from `app_inbound_rx`
+    /// still reach the fd unclamped unless the embedder clamps them.
     pub fn enable_app_owned_tun(&mut self) -> (TunOutboundTx, std::sync::mpsc::Receiver<Vec<u8>>) {
         let tun_channel_size = self.config().node.buffers.tun_channel;
         // app → mesh: the app pushes; `run_rx_loop` drains `tun_outbound_rx`.
@@ -4248,6 +4266,46 @@ impl Node {
     /// that rebuilds the node must fetch it again.
     pub fn netmon_trigger(&self) -> NetmonTrigger {
         self.netmon_trigger.clone()
+    }
+
+    /// Install a socket-protect hook, called with the raw handle of every
+    /// underlay socket the node creates, after creation and before any
+    /// traffic is sent on it. Android embedders forward it to
+    /// `VpnService.protect(fd)` so the daemon's own traffic bypasses the
+    /// tunnel. Must be called before [`Self::start`].
+    ///
+    /// Covered: UDP listen/adopted sockets, per-peer connected-UDP sockets,
+    /// TCP listener/accepted/dialed sockets (dials are protected before the
+    /// SYN leaves), and Nostr STUN / hole-punch sockets. Not covered (their
+    /// libraries expose no fd): Nostr relay websockets (`nostr-sdk`), mDNS
+    /// (`mdns-sd`), and the Tor/Nym SOCKS5 dialer (on Android that proxy is
+    /// a local process which protects its own sockets). The hook may fire
+    /// from async tasks and dedicated OS threads, and can see the same
+    /// underlying socket more than once (adopted fds are re-announced).
+    pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
+        self.socket_protect = Some(hook);
+    }
+
+    /// Build the per-packet outbound processor an app-owned TUN pump
+    /// ([`Self::enable_app_owned_tun`]) should run on each packet read from
+    /// its TUN fd before pushing mesh-destined ones into the app-outbound
+    /// sender — this restores the system-TUN reader's destination filter,
+    /// self-hairpin, per-flow TCP MSS clamp, and ICMPv6 unreachable
+    /// generation on the app-owned path.
+    ///
+    /// Call after [`Self::start`]. The processor shares the node's live MSS
+    /// ceiling, which tracks the bound transports' MTU floor exactly as the
+    /// system-TUN reader's does, so one processor stays correct for the
+    /// node's whole run.
+    pub fn tun_packet_processor(&self) -> crate::ipv6tun::tun::TunPacketProcessor {
+        // The same live ceiling the system-TUN reader clamps to, so the
+        // app-owned path follows transports binding and unbinding after
+        // start exactly as that reader does.
+        crate::ipv6tun::tun::TunPacketProcessor::new(
+            self.tun_mss_ceiling.clone(),
+            *self.identity().address(),
+            self.path_mtu_lookup.clone(),
+        )
     }
 
     // === Sending ===

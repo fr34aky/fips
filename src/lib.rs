@@ -65,11 +65,12 @@ pub use proto::stp::{
 pub use proto::bloom::{BloomError, BloomFilter, BloomState};
 
 // Re-export transport types
+pub use ipv6tun::tun::{TunPacketAction, TunPacketProcessor};
 pub use transport::udp::UdpTransport;
 pub use transport::{
     DiscoveredPeer, Link, LinkDirection, LinkId, LinkState, LinkStats, PacketRx, PacketTx,
-    ReceivedPacket, Transport, TransportAddr, TransportError, TransportHandle, TransportId,
-    TransportState, TransportType, packet_channel,
+    RawSocketHandle, ReceivedPacket, SocketProtect, Transport, TransportAddr, TransportError,
+    TransportHandle, TransportId, TransportState, TransportType, packet_channel,
 };
 
 // Re-export link-layer types (relocated from protocol:: to proto::link)

@@ -23,6 +23,12 @@ pub struct UdpRawSocket {
     local_addr: SocketAddr,
 }
 
+impl std::os::windows::io::AsRawSocket for UdpRawSocket {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(&self.inner)
+    }
+}
+
 impl UdpRawSocket {
     /// [`open`](Self::open); naming an interface is not supported here.
     pub fn open_on_interface(
