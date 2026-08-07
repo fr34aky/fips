@@ -1390,8 +1390,13 @@ impl Node {
     /// over this node's already-shared `NodeContext` and `MetricsRegistry`.
     ///
     /// Used at control-socket spawn time so pure-snapshot `show_*` queries
-    /// render off the rx_loop. Cloneable; cheap (all `Arc` clones).
-    pub(crate) fn control_read_handle(&self) -> crate::control::read_handle::ControlReadHandle {
+    /// render off the rx_loop. Cloneable; cheap (all `Arc` clones). Public
+    /// for embedders (Android): grab a handle before moving the node into its
+    /// runtime task and serve status via [`ControlReadHandle::query`]
+    /// without a control socket.
+    ///
+    /// [`ControlReadHandle::query`]: crate::control::read_handle::ControlReadHandle::query
+    pub fn control_read_handle(&self) -> crate::control::read_handle::ControlReadHandle {
         crate::control::read_handle::ControlReadHandle::new(
             self.context.clone(),
             self.metrics.clone(),

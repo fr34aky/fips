@@ -41,7 +41,7 @@ use super::snapshot::{EntitySnapshot, RoutingSnapshot, StatsSnapshot};
 /// starting R1 as `show_*` queries cut over to off-loop rendering; until then
 /// they are wired but unread.
 #[derive(Clone)]
-pub(crate) struct ControlReadHandle {
+pub struct ControlReadHandle {
     /// Effectively-immutable node context (config, identity, limits).
     context: Arc<NodeContext>,
     /// Metrics registry (counters / gauges) for `show_stats_*`.
@@ -59,6 +59,27 @@ pub(crate) struct ControlReadHandle {
 }
 
 impl ControlReadHandle {
+    /// Embedder-facing read-only query: run any snapshot-served `show_*`
+    /// command (the same surface `fipsctl`'s read-only commands use off the
+    /// rx_loop) and return its `Response` as JSON. `None` for commands not
+    /// served from snapshots (mutations and not-yet-cut-over queries need the
+    /// control socket's rx_loop path). Snapshots are published from the tick,
+    /// so this works with the control socket disabled — the intended use is
+    /// embedders (Android) that surface status without a Unix socket, via
+    /// [`crate::Node::control_read_handle`].
+    pub fn query(
+        &self,
+        command: &str,
+        params: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        let request = crate::control::protocol::Request {
+            command: command.to_string(),
+            params,
+        };
+        snapshot_dispatch(&request, self)
+            .map(|response| serde_json::to_value(response).unwrap_or_default())
+    }
+
     /// Build the handle from the node's already-shared state. Called once at
     /// control-socket spawn time; the result is cloned per connection. The
     /// `stats` cell is the same `Arc` the tick publishes into, so every clone
