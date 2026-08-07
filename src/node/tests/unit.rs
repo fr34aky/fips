@@ -2347,6 +2347,52 @@ async fn start_skips_system_tun_when_app_owned() {
     node.stop().await.unwrap();
 }
 
+/// Embedder seam: a socket-protect hook installed before `start()` must fire
+/// for every underlay socket the node creates (here: the one loopback UDP
+/// listen socket), and `tun_packet_processor()` must hand the app-owned TUN
+/// pump a working outbound pipeline after start.
+#[tokio::test]
+async fn socket_protect_hook_covers_node_transports() {
+    let mut config = crate::Config::new();
+    config.transports.udp = crate::config::TransportInstances::Single(crate::config::UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    });
+    config.dns.enabled = false;
+    config.tun.enabled = true;
+    let mut node = make_node_with(config);
+
+    let (_outbound_tx, _tun_rx) = node.enable_app_owned_tun();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    node.set_socket_protect(std::sync::Arc::new(move |handle| {
+        sink.lock().unwrap().push(handle);
+    }));
+
+    node.start().await.unwrap();
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the UDP listen socket was announced to the protect hook"
+    );
+
+    // The app-owned pump's outbound pipeline: mesh-destined forwards, and the
+    // MSS ceiling was derived from the started transports (nonzero).
+    let processor = node.tun_packet_processor();
+    let our = *node.identity().address();
+    let mut dst = *our.as_bytes();
+    dst[15] ^= 1; // some other mesh node
+    let mut pkt = vec![0x60u8, 0, 0, 0, 0, 0, 59, 64];
+    pkt.extend_from_slice(our.as_bytes());
+    pkt.extend_from_slice(&dst);
+    assert_eq!(
+        processor.process(&mut pkt),
+        crate::upper::tun::TunPacketAction::Forward
+    );
+
+    node.stop().await.unwrap();
+}
+
 /// A connection whose handshake failed is retained with BOTH Noise handles
 /// empty, and the stale-connection sweep depends on that: presence of the
 /// pending connection — not presence of a handle — is what marks a machine as

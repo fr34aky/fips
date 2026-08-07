@@ -55,9 +55,10 @@ pub use proto::bloom::{BloomError, BloomFilter, BloomState};
 pub use transport::udp::UdpTransport;
 pub use transport::{
     DiscoveredPeer, Link, LinkDirection, LinkId, LinkState, LinkStats, PacketRx, PacketTx,
-    ReceivedPacket, Transport, TransportAddr, TransportError, TransportHandle, TransportId,
-    TransportState, TransportType, packet_channel,
+    RawSocketHandle, ReceivedPacket, SocketProtect, Transport, TransportAddr, TransportError,
+    TransportHandle, TransportId, TransportState, TransportType, packet_channel,
 };
+pub use upper::tun::{TunPacketAction, TunPacketProcessor};
 
 // Re-export link-layer types (relocated from protocol:: to proto::link)
 pub use proto::link::{LinkMessageType, SessionDatagram};

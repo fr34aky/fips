@@ -53,6 +53,9 @@ pub struct UdpTransport {
     stats: Arc<UdpStats>,
     /// DNS resolution cache for hostname addresses.
     dns_cache: StdMutex<HashMap<TransportAddr, (SocketAddr, Instant)>>,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), applied
+    /// to the socket on start/adopt before any traffic is sent.
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 impl UdpTransport {
@@ -74,7 +77,16 @@ impl UdpTransport {
             local_addr: None,
             stats: Arc::new(UdpStats::new()),
             dns_cache: StdMutex::new(HashMap::new()),
+            socket_protect: None,
         }
+    }
+
+    /// Install the embedder socket-protect hook (Android
+    /// `VpnService.protect`). Must be called before `start_async` /
+    /// `adopt_socket_async`; the hook runs with the socket's raw handle
+    /// before any traffic is sent on it.
+    pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
+        self.socket_protect = Some(hook);
     }
 
     /// Get the instance name (if configured as a named instance).
@@ -204,6 +216,9 @@ impl UdpTransport {
             self.config.send_buf_size(),
         )?;
 
+        // Protect before the recv loop spawns / any send happens.
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &raw_socket);
+
         let actual_recv = raw_socket.recv_buffer_size()?;
         let actual_send = raw_socket.send_buffer_size()?;
         self.local_addr = Some(raw_socket.local_addr());
@@ -258,6 +273,12 @@ impl UdpTransport {
         }
 
         self.state = TransportState::Starting;
+
+        // Re-announce the adopted fd to the protect hook. Bootstrap code
+        // that created the socket already protected it (same underlying
+        // socket), but the hook is documented idempotent and this keeps
+        // every socket the transport owns covered regardless of origin.
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &socket);
 
         let raw_socket = UdpRawSocket::adopt(
             socket,
@@ -630,6 +651,58 @@ mod tests {
 
         transport.stop_async().await.unwrap();
         assert_eq!(transport.state(), TransportState::Down);
+    }
+
+    /// The embedder socket-protect hook (Android `VpnService.protect`) must
+    /// fire exactly once — with the listen socket's handle — on `start_async`.
+    #[tokio::test]
+    async fn test_socket_protect_fires_on_start() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = UdpTransport::new(TransportId::new(1), None, make_config(0), tx);
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        transport.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+
+        transport.start_async().await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "listen socket protected exactly once"
+        );
+
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The hook must also fire for adopted sockets (NAT-traversal handoff),
+    /// with the adopted socket's own handle.
+    #[tokio::test]
+    async fn test_socket_protect_fires_on_adopt() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        #[cfg(unix)]
+        let expected = {
+            use std::os::unix::io::AsRawFd;
+            socket.as_raw_fd()
+        };
+
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = UdpTransport::new(TransportId::new(1), None, make_config(0), tx);
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        transport.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+
+        transport.adopt_socket_async(socket).await.unwrap();
+        let handles = seen.lock().unwrap().clone();
+        assert_eq!(handles.len(), 1, "adopted socket protected exactly once");
+        #[cfg(unix)]
+        assert_eq!(handles[0], expected, "hook saw the adopted socket's fd");
+
+        transport.stop_async().await.unwrap();
     }
 
     #[tokio::test]

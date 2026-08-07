@@ -634,6 +634,12 @@ mod platform {
         local_addr: SocketAddr,
     }
 
+    impl std::os::windows::io::AsRawSocket for UdpRawSocket {
+        fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+            std::os::windows::io::AsRawSocket::as_raw_socket(&self.inner)
+        }
+    }
+
     impl UdpRawSocket {
         /// Create, bind, and configure a UDP socket.
         ///

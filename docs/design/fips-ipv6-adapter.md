@@ -326,9 +326,28 @@ With the channels installed, `start()` skips system-TUN creation (it gates on
 Because packets enter via `app_outbound_tx` rather than the Reader Thread, they
 **bypass `handle_tun_packet`** — the `fd00::/8` destination filter, the ICMPv6
 Destination Unreachable for off-mesh dests (see [Reader Thread](#reader-thread)),
-and the [TUN-Side TCP MSS Clamping](#tun-side-tcp-mss-clamping). The embedder is
-therefore responsible for routing only `fd00::/8` to its TUN (so only mesh-bound
-packets arrive) and for clamping TCP MSS on outbound SYNs.
+and the [TUN-Side TCP MSS Clamping](#tun-side-tcp-mss-clamping). To restore that
+pipeline, the embedder calls `Node::tun_packet_processor()` after `start()` and
+runs `TunPacketProcessor::process()` on each packet read from its fd. The
+returned `TunPacketAction` says what the Reader Thread would have done:
+`Forward` (push into `app_outbound_tx`; TCP MSS already clamped in place, using
+the node's live per-destination path-MTU map), `Hairpin` / `Respond` (write back
+to the fd), or `Drop`. Alternatively the embedder may implement the filter and
+clamp itself, but the processor keeps the two paths byte-identical.
+
+Two more embedder hooks complete the Android picture:
+
+- `Node::set_socket_protect(hook)` (before `start()`) — the node calls the hook
+  with the raw fd of every underlay socket it creates (UDP listen/adopted,
+  per-peer connected-UDP, TCP listener/accepted/dialed — dials are announced
+  before the SYN leaves — and Nostr STUN/hole-punch sockets), so a `VpnService`
+  embedder can `protect()` them and keep FIPS's own traffic out of the tunnel.
+  Not covered, because their libraries expose no socket hook: `nostr-sdk` relay
+  websockets, `mdns-sd` sockets, and the Tor/Nym SOCKS5 dialer (its proxy is a
+  local process that protects its own sockets). Relay websockets escaping
+  protection is benign while the tunnel routes only `fd00::/8`; a
+  block-connections-without-VPN setup would need those flows addressed
+  upstream.
 
 ## Implementation Status
 

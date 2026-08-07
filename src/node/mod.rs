@@ -322,6 +322,10 @@ pub struct Node {
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
     path_mtu_lookup: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, u16>>>,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), installed
+    /// via [`Node::set_socket_protect`] before `start()` and handed to every
+    /// transport / runtime-created underlay socket.
+    socket_protect: Option<crate::transport::SocketProtect>,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -688,6 +692,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            socket_protect: None,
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -833,6 +838,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            socket_protect: None,
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -868,7 +874,10 @@ impl Node {
         // Create UDP transport instances
         for (name, udp_config) in udp_instances {
             let transport_id = self.allocate_transport_id();
-            let udp = UdpTransport::new(transport_id, name, udp_config, packet_tx.clone());
+            let mut udp = UdpTransport::new(transport_id, name, udp_config, packet_tx.clone());
+            if let Some(hook) = &self.socket_protect {
+                udp.set_socket_protect(hook.clone());
+            }
             transports.push(TransportHandle::Udp(udp));
         }
 
@@ -910,6 +919,9 @@ impl Node {
             let transport_id = self.allocate_transport_id();
             let mut tcp = TcpTransport::new(transport_id, name, tcp_config, packet_tx.clone());
             tcp.set_node_max_connections(node_max_connections);
+            if let Some(hook) = &self.socket_protect {
+                tcp.set_socket_protect(hook.clone());
+            }
             transports.push(TransportHandle::Tcp(tcp));
         }
 
@@ -2829,6 +2841,47 @@ impl Node {
         self.supervisor.tun_outbound_rx = Some(outbound_rx);
         self.tun_state = TunState::Active;
         (outbound_tx, tun_rx)
+    }
+
+    /// Install a socket-protect hook, called with the raw handle of every
+    /// underlay socket the node creates, after creation and before any
+    /// traffic is sent on it. Android embedders forward it to
+    /// `VpnService.protect(fd)` so the daemon's own traffic bypasses the
+    /// tunnel. Must be called before [`Self::start`].
+    ///
+    /// Covered: UDP listen/adopted sockets, per-peer connected-UDP sockets,
+    /// TCP listener/accepted/dialed sockets (dials are protected before the
+    /// SYN leaves), and Nostr STUN / hole-punch sockets. Not covered (their
+    /// libraries expose no fd): Nostr relay websockets (`nostr-sdk`), mDNS
+    /// (`mdns-sd`), and the Tor/Nym SOCKS5 dialer (on Android that proxy is
+    /// a local process which protects its own sockets). The hook may fire
+    /// from async tasks and dedicated OS threads, and can see the same
+    /// underlying socket more than once (adopted fds are re-announced).
+    pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
+        self.socket_protect = Some(hook);
+    }
+
+    /// Build the per-packet outbound processor an app-owned TUN pump
+    /// ([`Self::enable_app_owned_tun`]) should run on each packet read from
+    /// its TUN fd before pushing mesh-destined ones into the app-outbound
+    /// sender — this restores the system-TUN reader's destination filter,
+    /// self-hairpin, per-flow TCP MSS clamp, and ICMPv6 unreachable
+    /// generation on the app-owned path.
+    ///
+    /// Call after [`Self::start`]: the MSS ceiling derives from the started
+    /// transports' MTU floor, exactly like the system-TUN reader's.
+    pub fn tun_packet_processor(&self) -> crate::upper::tun::TunPacketProcessor {
+        // Same derivation as `tun_reader_setup`: effective FIPS-encapsulated
+        // payload of the transport-MTU floor, minus IPv6 + TCP headers.
+        let max_mss = self
+            .effective_ipv6_mtu()
+            .saturating_sub(40)
+            .saturating_sub(20);
+        crate::upper::tun::TunPacketProcessor::new(
+            max_mss,
+            *self.identity().address(),
+            self.path_mtu_lookup.clone(),
+        )
     }
 
     // === Sending ===

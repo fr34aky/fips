@@ -83,6 +83,10 @@ pub struct TcpTransport {
     node_max_connections: Option<usize>,
     /// Transport statistics.
     stats: Arc<TcpStats>,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), applied
+    /// to the listener, every accepted socket, and every dialed socket
+    /// (before the SYN leaves).
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 impl TcpTransport {
@@ -105,7 +109,34 @@ impl TcpTransport {
             local_addr: None,
             node_max_connections: None,
             stats: Arc::new(TcpStats::new()),
+            socket_protect: None,
         }
+    }
+
+    /// Install the embedder socket-protect hook (Android
+    /// `VpnService.protect`). Must be called before `start_async`; the hook
+    /// runs with each socket's raw handle before any traffic is sent on it —
+    /// for outbound dials, before the connect is initiated.
+    pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
+        self.socket_protect = Some(hook);
+    }
+
+    /// Create the outbound socket, apply the protect hook, then connect.
+    ///
+    /// Split from `TcpStream::connect` (which creates and connects in one
+    /// call) so the hook runs before the SYN leaves the host — required for
+    /// `VpnService.protect` to keep the handshake itself out of the tunnel.
+    async fn dial(
+        socket_addr: SocketAddr,
+        socket_protect: Option<crate::transport::SocketProtect>,
+    ) -> std::io::Result<TcpStream> {
+        let socket = if socket_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        crate::transport::apply_socket_protect(socket_protect.as_ref(), &socket);
+        socket.connect(socket_addr).await
     }
 
     /// Set the node-wide `node.limits.max_connections` value.
@@ -184,6 +215,8 @@ impl TcpTransport {
                     .map_err(|e| TransportError::StartFailed(format!("get local addr: {}", e)))?,
             );
 
+            crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &listener);
+
             // Spawn accept loop
             let transport_id = self.transport_id;
             let packet_tx = self.packet_tx.clone();
@@ -196,6 +229,7 @@ impl TcpTransport {
                 keepalive_secs: self.config.keepalive_secs(),
                 recv_buf: self.config.recv_buf_size(),
                 send_buf: self.config.send_buf_size(),
+                socket_protect: self.socket_protect.clone(),
             };
 
             let accept_task = tokio::spawn(async move {
@@ -365,7 +399,7 @@ impl TcpTransport {
         // Connect with timeout
         let stream = match tokio::time::timeout(
             Duration::from_millis(timeout_ms),
-            TcpStream::connect(socket_addr),
+            Self::dial(socket_addr, self.socket_protect.clone()),
         )
         .await
         {
@@ -500,6 +534,7 @@ impl TcpTransport {
         let config = self.config.clone();
         let transport_id = self.transport_id;
         let remote_addr = addr.clone();
+        let socket_protect = self.socket_protect.clone();
 
         debug!(
             transport_id = %transport_id,
@@ -533,7 +568,7 @@ impl TcpTransport {
             // Connect with timeout
             let stream = match tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
-                TcpStream::connect(socket_addr),
+                Self::dial(socket_addr, socket_protect),
             )
             .await
             {
@@ -764,6 +799,7 @@ struct AcceptConfig {
     keepalive_secs: u64,
     recv_buf: usize,
     send_buf: usize,
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 /// TCP accept loop — runs as a spawned task when bind_addr is configured.
@@ -783,6 +819,7 @@ async fn accept_loop(
         keepalive_secs,
         recv_buf,
         send_buf,
+        socket_protect,
     } = cfg;
     debug!(transport_id = %transport_id, "TCP accept loop starting");
 
@@ -816,6 +853,8 @@ async fn accept_loop(
                         continue;
                     }
                 };
+
+                crate::transport::apply_socket_protect(socket_protect.as_ref(), &std_stream);
 
                 if let Err(e) = configure_accepted_socket(
                     &std_stream,
@@ -1103,6 +1142,7 @@ fn read_mss_mtu(stream: &std::net::TcpStream, default_mtu: u16) -> u16 {
 mod tests {
     use super::*;
     use crate::transport::packet_channel;
+    use std::sync::Mutex as StdMutex;
     use tokio::time::{Duration, timeout};
 
     fn make_config() -> TcpConfig {
@@ -1250,6 +1290,73 @@ mod tests {
 
         t1.stop_async().await.unwrap();
         t2.stop_async().await.unwrap();
+    }
+
+    /// The embedder socket-protect hook (Android `VpnService.protect`) must
+    /// cover all three TCP socket origins: the listener (on start), the
+    /// dialed socket (before the connect is initiated), and the accepted
+    /// socket (before its read task runs).
+    #[tokio::test]
+    async fn test_socket_protect_covers_listener_dialed_and_accepted() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+
+        let mut dialer = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut listener = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+
+        let dialer_seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = dialer_seen.clone();
+        dialer.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+        let listener_seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = listener_seen.clone();
+        listener.set_socket_protect(Arc::new(move |handle| {
+            sink.lock().unwrap().push(handle);
+        }));
+
+        dialer.start_async().await.unwrap();
+        listener.start_async().await.unwrap();
+        assert_eq!(
+            dialer_seen.lock().unwrap().len(),
+            0,
+            "outbound-only transport binds nothing on start"
+        );
+        assert_eq!(
+            listener_seen.lock().unwrap().len(),
+            1,
+            "listener protected on start"
+        );
+
+        // Dial by sending a frame; wait until it arrives so the accept path
+        // (which protects before spawning the connection's read task) has run.
+        let addr2 = listener.local_addr().unwrap();
+        let payload_len = 4u16;
+        let total = 4 + 12 + payload_len as usize + 16;
+        let mut frame = vec![0u8; total];
+        frame[2..4].copy_from_slice(&payload_len.to_le_bytes());
+        dialer
+            .send_async(&TransportAddr::from_string(&addr2.to_string()), &frame)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(
+            dialer_seen.lock().unwrap().len(),
+            1,
+            "dialed socket protected"
+        );
+        assert_eq!(
+            listener_seen.lock().unwrap().len(),
+            2,
+            "accepted socket protected in addition to the listener"
+        );
+
+        dialer.stop_async().await.unwrap();
+        listener.stop_async().await.unwrap();
     }
 
     #[tokio::test]

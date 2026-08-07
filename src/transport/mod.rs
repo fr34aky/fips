@@ -40,6 +40,10 @@ pub(crate) mod framing;
 mod stats_common;
 pub(crate) use stats_common::PoolCounters;
 
+mod protect;
+pub(crate) use protect::apply_socket_protect;
+pub use protect::{RawSocketHandle, SocketProtect};
+
 mod types;
 pub use types::*;
 

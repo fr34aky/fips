@@ -685,24 +685,39 @@ fn tun_reader_setup(device_name: &str, mtu: u16, transport_mtu: u16) -> (String,
     (name, buf, max_mss)
 }
 
-/// Process a single TUN packet. Returns `false` if the reader should exit.
-fn handle_tun_packet(
+/// Decision for a single outbound (app/kernel → mesh) TUN packet, produced
+/// by [`process_outbound_packet`] and surfaced to embedders through
+/// [`TunPacketProcessor::process`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum TunPacketAction {
+    /// Mesh-destined: forward the packet (modified in place — TCP MSS
+    /// clamped on SYNs) to the mesh.
+    Forward,
+    /// Self-addressed: write the packet (modified in place — L4 checksum
+    /// recalculated) back to the TUN for local delivery.
+    Hairpin,
+    /// Off-mesh destination: drop the packet and write `response` (an
+    /// ICMPv6 Destination Unreachable) back to the TUN.
+    Respond(Vec<u8>),
+    /// Drop silently (not IPv6, or off-mesh with no ICMP error warranted).
+    Drop,
+}
+
+/// The per-packet outbound pipeline shared by the system-TUN reader and
+/// app-owned TUN embedders: destination filter, self-hairpin, per-flow TCP
+/// MSS clamp, ICMPv6 errors. Pure decision logic — the caller owns delivery.
+fn process_outbound_packet(
     packet: &mut [u8],
     max_mss: u16,
-    name: &str,
     our_addr: FipsAddress,
-    tun_tx: &TunTx,
-    outbound_tx: &TunOutboundTx,
     path_mtu_lookup: &PathMtuLookup,
-) -> bool {
+) -> TunPacketAction {
     use super::icmp::{DestUnreachableCode, build_dest_unreachable, should_send_icmp_error};
     use super::tcp_mss::{clamp_tcp_mss, recalculate_l4_checksum};
 
-    log_ipv6_packet(packet);
-
     // Must be a valid IPv6 packet
     if packet.len() < 40 || packet[0] >> 4 != 6 {
-        return true;
+        return TunPacketAction::Drop;
     }
 
     // Check if destination is a FIPS address (fd::/8 prefix)
@@ -721,38 +736,92 @@ fn handle_tun_packet(
         // platform-independent self-delivery invariant and so the path stays
         // exercised by the Linux-only CI unit tests.
         if packet[24..40] == *our_addr.as_bytes() {
-            trace!(name = %name, "Hairpinning self-addressed packet back to TUN (loopback)");
             // Finish the checksum macOS leaves offloaded on self-traffic, else the
             // local stack drops every non-SYN segment. See recalculate_l4_checksum.
             recalculate_l4_checksum(packet);
-            if tun_tx.send(packet.to_vec()).is_err() {
-                return false; // Channel closed, shutdown
-            }
-            return true;
+            return TunPacketAction::Hairpin;
         }
 
         // Per-destination clamp: if discovery has learned a smaller path
         // MTU for this destination, tighten the ceiling for this flow.
         let effective_max_mss = per_flow_max_mss(path_mtu_lookup, &packet[24..40], max_mss);
         if clamp_tcp_mss(packet, effective_max_mss) {
-            trace!(name = %name, max_mss = effective_max_mss, "Clamped TCP MSS in SYN packet");
+            trace!(max_mss = effective_max_mss, "Clamped TCP MSS in SYN packet");
         }
-        if outbound_tx.blocking_send(packet.to_vec()).is_err() {
-            return false; // Channel closed, shutdown
-        }
+        TunPacketAction::Forward
     } else {
         // Non-FIPS destination: send ICMPv6 Destination Unreachable
         if should_send_icmp_error(packet)
             && let Some(response) =
                 build_dest_unreachable(packet, DestUnreachableCode::NoRoute, our_addr.to_ipv6())
         {
-            trace!(name = %name, len = response.len(), "Sending ICMPv6 Destination Unreachable (non-FIPS destination)");
-            if tun_tx.send(response).is_err() {
-                return false;
-            }
+            TunPacketAction::Respond(response)
+        } else {
+            TunPacketAction::Drop
         }
     }
-    true
+}
+
+/// Embedder-facing handle on the outbound per-packet pipeline, for
+/// app-owned TUN integrations ([`crate::Node::enable_app_owned_tun`], e.g.
+/// an Android `VpnService`): run [`Self::process`] on each IPv6 packet read
+/// from the app's TUN fd and act on the returned [`TunPacketAction`] —
+/// `Forward` into the app-outbound sender, `Hairpin`/`Respond` back to the
+/// fd, `Drop` nothing. This gives the app-owned path exact parity with the
+/// system-TUN reader (destination filter, self-hairpin, per-flow TCP MSS
+/// clamp, ICMPv6 unreachable). Cheap to clone; reads the node's live
+/// per-destination path-MTU map. Obtain from
+/// [`crate::Node::tun_packet_processor`] after `start()`.
+#[derive(Clone)]
+pub struct TunPacketProcessor {
+    max_mss: u16,
+    our_addr: FipsAddress,
+    path_mtu_lookup: PathMtuLookup,
+}
+
+impl TunPacketProcessor {
+    pub(crate) fn new(max_mss: u16, our_addr: FipsAddress, path_mtu_lookup: PathMtuLookup) -> Self {
+        Self {
+            max_mss,
+            our_addr,
+            path_mtu_lookup,
+        }
+    }
+
+    /// Decide what to do with one outbound IPv6 packet (may modify it in
+    /// place: MSS clamp or checksum fix — see [`TunPacketAction`]).
+    pub fn process(&self, packet: &mut [u8]) -> TunPacketAction {
+        process_outbound_packet(packet, self.max_mss, self.our_addr, &self.path_mtu_lookup)
+    }
+}
+
+/// Process a single TUN packet. Returns `false` if the reader should exit.
+fn handle_tun_packet(
+    packet: &mut [u8],
+    max_mss: u16,
+    name: &str,
+    our_addr: FipsAddress,
+    tun_tx: &TunTx,
+    outbound_tx: &TunOutboundTx,
+    path_mtu_lookup: &PathMtuLookup,
+) -> bool {
+    log_ipv6_packet(packet);
+
+    match process_outbound_packet(packet, max_mss, our_addr, path_mtu_lookup) {
+        TunPacketAction::Forward => {
+            // Channel closed means shutdown
+            outbound_tx.blocking_send(packet.to_vec()).is_ok()
+        }
+        TunPacketAction::Hairpin => {
+            trace!(name = %name, "Hairpinning self-addressed packet back to TUN (loopback)");
+            tun_tx.send(packet.to_vec()).is_ok()
+        }
+        TunPacketAction::Respond(response) => {
+            trace!(name = %name, len = response.len(), "Sending ICMPv6 Destination Unreachable (non-FIPS destination)");
+            tun_tx.send(response).is_ok()
+        }
+        TunPacketAction::Drop => true,
+    }
 }
 
 #[cfg(unix)]
@@ -1465,6 +1534,96 @@ mod tests {
 
     // Note: TUN device creation tests require elevated privileges
     // and are better suited for integration tests.
+
+    // ========================================================================
+    // process_outbound_packet / TunPacketProcessor — the outbound pipeline
+    // app-owned TUN embedders (Android VpnService) run for system-TUN parity
+    // ========================================================================
+
+    fn ipv6_packet(next_header: u8, src: [u8; 16], dst: [u8; 16], l4: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0x60, 0, 0, 0];
+        pkt.extend_from_slice(&(l4.len() as u16).to_be_bytes());
+        pkt.push(next_header);
+        pkt.push(64);
+        pkt.extend_from_slice(&src);
+        pkt.extend_from_slice(&dst);
+        pkt.extend_from_slice(l4);
+        pkt
+    }
+
+    /// 20-byte TCP header + 4-byte MSS option carrying `mss`.
+    fn tcp_syn_with_mss(mss: u16) -> Vec<u8> {
+        let mut tcp = vec![0u8; 24];
+        tcp[12] = 6 << 4; // data offset: 6 words = 20 header + 4 option bytes
+        tcp[13] = 0x02; // SYN
+        tcp[20] = 2; // option kind: MSS
+        tcp[21] = 4; // option length
+        tcp[22..24].copy_from_slice(&mss.to_be_bytes());
+        tcp
+    }
+
+    fn make_processor(max_mss: u16, our_addr: FipsAddress) -> TunPacketProcessor {
+        TunPacketProcessor::new(
+            max_mss,
+            our_addr,
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        )
+    }
+
+    #[test]
+    fn processor_drops_non_ipv6() {
+        let processor = make_processor(1000, fips_addr_with_node_byte(1));
+        let mut too_short = vec![0x60; 39];
+        assert_eq!(processor.process(&mut too_short), TunPacketAction::Drop);
+        let mut ipv4 = vec![0x45; 40];
+        assert_eq!(processor.process(&mut ipv4), TunPacketAction::Drop);
+    }
+
+    /// Mesh-destined packets forward, with the TCP MSS clamped in place the
+    /// same way the system-TUN reader clamps it.
+    #[test]
+    fn processor_forwards_mesh_destined_and_clamps_mss() {
+        let our = fips_addr_with_node_byte(1);
+        let dst = fips_addr_with_node_byte(2);
+        let processor = make_processor(900, our);
+
+        let mut pkt = ipv6_packet(6, *our.as_bytes(), *dst.as_bytes(), &tcp_syn_with_mss(1460));
+        assert_eq!(processor.process(&mut pkt), TunPacketAction::Forward);
+        assert_eq!(
+            u16::from_be_bytes([pkt[62], pkt[63]]),
+            900,
+            "MSS option clamped in place to the processor's ceiling"
+        );
+    }
+
+    /// Self-addressed packets must hairpin back to the TUN, not forward.
+    #[test]
+    fn processor_hairpins_self_addressed() {
+        let our = fips_addr_with_node_byte(1);
+        let processor = make_processor(1000, our);
+        let mut pkt = ipv6_packet(17, *our.as_bytes(), *our.as_bytes(), &[0u8; 12]);
+        assert_eq!(processor.process(&mut pkt), TunPacketAction::Hairpin);
+    }
+
+    /// Off-mesh destinations produce an ICMPv6 Destination Unreachable to
+    /// write back — the app-owned path must not forward them.
+    #[test]
+    fn processor_responds_unreachable_for_off_mesh() {
+        let our = fips_addr_with_node_byte(1);
+        let processor = make_processor(1000, our);
+        let mut off_mesh = [0u8; 16];
+        off_mesh[0] = 0x20;
+        off_mesh[1] = 0x01; // 2001::/16 — not fd::/8
+        let mut pkt = ipv6_packet(17, *our.as_bytes(), off_mesh, &[0u8; 12]);
+        match processor.process(&mut pkt) {
+            TunPacketAction::Respond(response) => {
+                assert!(response.len() >= 40, "full ICMPv6 packet");
+                assert_eq!(response[0] >> 4, 6, "response is IPv6");
+                assert_eq!(response[6], 58, "response is ICMPv6");
+            }
+            other => panic!("expected Respond, got {other:?}"),
+        }
+    }
 
     // ========================================================================
     // per_flow_max_mss — per-destination MSS clamp regression coverage

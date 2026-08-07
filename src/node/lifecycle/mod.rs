@@ -1527,6 +1527,7 @@ impl Node {
                     match NostrRendezvous::start(
                         self.identity(),
                         self.config().node.rendezvous.nostr.clone(),
+                        self.socket_protect.clone(),
                     )
                     .await
                     {
@@ -3264,6 +3265,9 @@ impl Node {
             inherited_config,
             packet_tx,
         );
+        if let Some(hook) = &self.socket_protect {
+            transport.set_socket_protect(hook.clone());
+        }
 
         transport
             .adopt_socket_async(traversal.socket)

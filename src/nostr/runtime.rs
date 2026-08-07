@@ -173,6 +173,9 @@ pub struct NostrRendezvous {
     /// design: the inbound msg1 gate in `handshake.rs` remains the
     /// authoritative cap.
     outbound_admission: AtomicBool,
+    /// Embedder socket-protect hook (Android `VpnService.protect`), applied
+    /// to the STUN observation and hole-punch sockets this runtime binds.
+    socket_protect: Option<crate::transport::SocketProtect>,
 }
 
 impl NostrRendezvous {
@@ -198,6 +201,7 @@ impl NostrRendezvous {
     pub async fn start(
         identity: &crate::Identity,
         config: NostrRendezvousConfig,
+        socket_protect: Option<crate::transport::SocketProtect>,
     ) -> Result<Arc<Self>, BootstrapError> {
         if !config.enabled {
             return Err(BootstrapError::Disabled);
@@ -262,6 +266,7 @@ impl NostrRendezvous {
             failure_state,
             public_udp_addr_cache: RwLock::new(HashMap::new()),
             outbound_admission: AtomicBool::new(true),
+            socket_protect,
         });
 
         // Subscribe to the relay-pool broadcast channel BEFORE issuing the
@@ -446,6 +451,7 @@ impl NostrRendezvous {
                 return None;
             }
         };
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &socket);
         if let Err(err) = socket.set_nonblocking(true) {
             debug!(error = %err, "public-udp-addr: set_nonblocking failed");
             return None;
@@ -968,6 +974,7 @@ impl NostrRendezvous {
         }
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &base_socket);
         base_socket.set_nonblocking(true)?;
 
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
@@ -1224,6 +1231,7 @@ impl NostrRendezvous {
         }
 
         let base_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))?;
+        crate::transport::apply_socket_protect(self.socket_protect.as_ref(), &base_socket);
         base_socket.set_nonblocking(true)?;
         let (reflexive_address, local_addresses, stun_server) = observe_traversal_addresses(
             &base_socket,
@@ -1653,6 +1661,7 @@ impl NostrRendezvous {
             failure_state,
             public_udp_addr_cache: RwLock::new(HashMap::new()),
             outbound_admission: AtomicBool::new(true),
+            socket_protect: None,
         }
     }
 
