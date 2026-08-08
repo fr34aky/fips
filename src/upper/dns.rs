@@ -274,7 +274,8 @@ fn recvmsg_with_pktinfo(
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut src_store as *mut _ as *mut _;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+    // `as _`: 32-bit bionic declares msg_namelen as i32, everywhere else u32.
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
@@ -286,7 +287,8 @@ fn recvmsg_with_pktinfo(
     }
     let n = n as usize;
 
-    let src = sockaddr_storage_to_socket_addr(&src_store, msg.msg_namelen)?;
+    #[allow(clippy::unnecessary_cast)] // identity everywhere but 32-bit bionic
+    let src = sockaddr_storage_to_socket_addr(&src_store, msg.msg_namelen as libc::socklen_t)?;
     let ifindex = extract_pktinfo_ifindex(&msg);
 
     Ok((n, src, ifindex))
