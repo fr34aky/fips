@@ -3177,6 +3177,15 @@ impl Node {
     /// Creates an ephemeral peer connection (not persisted to config, no
     /// auto-reconnect). Reuses the same connection path as auto-connect
     /// peers. Returns JSON data on success or an error message.
+    ///
+    /// For a peer the node is already connected to, the supplied address is
+    /// tried as an *alternate path* rather than ignored — the same treatment
+    /// [`Node::update_peers`] gives a refreshed runtime peer. The handshake
+    /// runs in parallel with the live link and promotion happens only once it
+    /// authenticates, so an address the caller got wrong cannot displace a
+    /// healthy path. The response's `refreshed` field reports whether such a
+    /// handshake was started; it is `false` when the peer is already on this
+    /// exact path and that path is fresh.
     pub(crate) async fn api_connect(
         &mut self,
         npub: &str,
@@ -3192,11 +3201,41 @@ impl Node {
             via_nostr: false,
         };
 
-        // Pre-seed identity cache (same as initiate_peer_connections does)
-        if let Ok(identity) = PeerIdentity::from_npub(npub) {
+        // Pre-seed identity cache (same as initiate_peer_connections does).
+        // An unparseable npub is left to `initiate_peer_connection` below,
+        // which reports it as `InvalidPeerNpub`.
+        let peer_identity = PeerIdentity::from_npub(npub).ok();
+        if let Some(identity) = peer_identity.as_ref() {
             self.peer_aliases
                 .insert(*identity.node_addr(), identity.short_npub());
             self.register_identity(*identity.node_addr(), identity.pubkey_full());
+        }
+
+        // A peer we already hold a session to must not fall through to
+        // `initiate_peer_connection`: that returns Ok(()) the moment the peer
+        // is in `self.peers`, so the command would report success without ever
+        // trying the address it was handed. Route it through the same
+        // alternate-path helper `update_peers` uses instead.
+        if let Some(identity) = peer_identity
+            && self.peers.contains_key(identity.node_addr())
+        {
+            let refreshed = self
+                .try_active_peer_alternative_addresses(&peer_config, identity)
+                .await
+                .map_err(|e| e.to_string())?;
+            info!(
+                npub = %npub,
+                address = %address,
+                transport = %transport,
+                refreshed = refreshed,
+                "API connect resolved against an already-connected peer"
+            );
+            return Ok(serde_json::json!({
+                "npub": npub,
+                "address": address,
+                "transport": transport,
+                "refreshed": refreshed,
+            }));
         }
 
         self.initiate_peer_connection(&peer_config)
@@ -3212,6 +3251,7 @@ impl Node {
                     "npub": npub,
                     "address": address,
                     "transport": transport,
+                    "refreshed": false,
                 })
             })
             .map_err(|e| e.to_string())
