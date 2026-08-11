@@ -339,6 +339,18 @@ pub struct Node {
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
     path_mtu_lookup: crate::upper::tun::PathMtuLookup,
+    /// Which transport last supplied a *link seed* into `path_mtu_lookup`,
+    /// per destination.
+    ///
+    /// A `PathMtuEntry` is released when the link that seeded it goes away,
+    /// but two links to one peer can be up at the same time — a phone on both
+    /// BLE and Wi-Fi Aware, say. Then nothing releases the first entry and a
+    /// wider seed from the second transport is refused by the never-loosen
+    /// rule forever. Recording the seeding transport is what distinguishes a
+    /// value that still describes the current path from one that describes a
+    /// path the peer has left. Absent for destinations reached over multiple
+    /// hops: those are never link-seeded, so never-loosen applies unchanged.
+    path_mtu_seeded_by: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, TransportId>>>,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -753,6 +765,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -896,6 +909,7 @@ impl Node {
             peer_acl,
             host_map,
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]

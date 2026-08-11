@@ -1942,6 +1942,142 @@ async fn test_seed_path_mtu_noop_for_unknown_transport() {
     );
 }
 
+/// The upgrade case, and the reason the seeding transport is tracked.
+///
+/// A peer first reachable only over a narrow link, then moving to a wider
+/// one, must not stay clamped to the narrow link's MTU. Every writer of
+/// `path_mtu_lookup` keeps the tighter value, so without recording which link
+/// a value described, the low MTU outlives the link it came from and pins the
+/// peer for the process lifetime.
+#[tokio::test]
+async fn test_seed_path_mtu_reseeds_when_peer_moves_to_wider_transport() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let narrow = make_udp_transport_with_mtu(1, 1280).await;
+    let wide = make_udp_transport_with_mtu(2, 1452).await;
+    node.transports.insert(TransportId::new(1), narrow);
+    node.transports.insert(TransportId::new(2), wide);
+
+    let peer_addr = make_node_addr(0xE1);
+    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let narrow_addr = TransportAddr::from_string("10.0.0.6:2121");
+    let wide_addr = TransportAddr::from_string("10.0.0.7:2121");
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &narrow_addr);
+    assert_eq!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .map(|e| e.mtu),
+        Some(1280),
+        "first seed takes the narrow link's MTU"
+    );
+
+    // The peer moves to the wider transport.
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(2), &wide_addr);
+    assert_eq!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .map(|e| e.mtu),
+        Some(1452),
+        "a seed from a different transport must replace a value describing \
+         the link the peer has left"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+/// A value learned *about the narrow link* is discarded on the move too — it
+/// measured a path the peer no longer uses.
+#[tokio::test]
+async fn test_seed_path_mtu_discards_learned_value_from_abandoned_link() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let narrow = make_udp_transport_with_mtu(1, 1280).await;
+    let wide = make_udp_transport_with_mtu(2, 1452).await;
+    node.transports.insert(TransportId::new(1), narrow);
+    node.transports.insert(TransportId::new(2), wide);
+
+    let peer_addr = make_node_addr(0xE2);
+    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let narrow_addr = TransportAddr::from_string("10.0.0.8:2121");
+    let wide_addr = TransportAddr::from_string("10.0.0.9:2121");
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &narrow_addr);
+    // Reactive MtuExceeded tightens further, still on the narrow link.
+    node.path_mtu_lookup
+        .write()
+        .unwrap()
+        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(900));
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(2), &wide_addr);
+    assert_eq!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .map(|e| e.mtu),
+        Some(1452),
+        "a tighter value measured on the abandoned link must not clamp the new one"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+/// The guard against over-loosening. Promotion re-seeds on every handshake,
+/// so discarding a tighter learned value on a *same-link* re-seed would reset
+/// genuine PMTU discovery repeatedly and the estimate would never converge.
+#[tokio::test]
+async fn test_seed_path_mtu_keeps_tighter_value_when_reseeding_same_transport() {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+
+    let udp = make_udp_transport_with_mtu(1, 1452).await;
+    node.transports.insert(TransportId::new(1), udp);
+
+    let peer_addr = make_node_addr(0xE3);
+    let fips_addr = crate::FipsAddress::from_node_addr(&peer_addr);
+    let transport_addr = TransportAddr::from_string("10.0.0.10:2121");
+
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
+    // Reactive learning tightens the same link.
+    node.path_mtu_lookup
+        .write()
+        .unwrap()
+        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(1200));
+
+    // Re-promotion on the same transport.
+    node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
+    assert_eq!(
+        node.path_mtu_lookup
+            .read()
+            .unwrap()
+            .get(&fips_addr)
+            .map(|e| e.mtu),
+        Some(1200),
+        "re-seeding the same link must not undo reactive learning"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
 // === Outbound admission gate tests ===
 
 /// Inject `count` synthetic active peers into `node.peers` so peer_count()
