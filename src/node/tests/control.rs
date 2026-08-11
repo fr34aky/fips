@@ -257,3 +257,57 @@ async fn test_api_connect_without_a_matching_transport_fails_cleanly() {
     );
     assert_eq!(outbound_leg_count(&node, &peer_addr), 0);
 }
+
+/// `disconnect` on a connectionless transport removes the peer and the
+/// transport close degrades to the no-op trait default — no error, no panic.
+///
+/// Disconnecting again reports `peer not found`, which is also the
+/// double-close path: the first call already closed the connection.
+#[tokio::test]
+async fn test_api_disconnect_on_a_connectionless_transport() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_npub = nodes[1].node.npub();
+
+    nodes[0]
+        .node
+        .api_disconnect(&node1_npub)
+        .await
+        .expect("api_disconnect should succeed");
+    assert!(
+        nodes[0].node.get_peer(&node1_addr).is_none(),
+        "the peer must be gone"
+    );
+
+    let err = nodes[0]
+        .node
+        .api_disconnect(&node1_npub)
+        .await
+        .expect_err("a second disconnect has no peer to remove");
+    assert!(err.contains("peer not found"), "unexpected error: {err}");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// `disconnect` for a peer the node does not hold is rejected without any
+/// partial teardown.
+#[tokio::test]
+async fn test_api_disconnect_unknown_peer_changes_nothing() {
+    let mut node = make_node();
+    let stranger = make_node();
+
+    let peers_before = node.peer_count();
+    let machines_before = node.peer_machines.len();
+    let links_before = node.links.len();
+
+    let err = node
+        .api_disconnect(&stranger.npub())
+        .await
+        .expect_err("an unknown peer cannot be disconnected");
+    assert!(err.contains("peer not found"), "unexpected error: {err}");
+
+    assert_eq!(node.peer_count(), peers_before);
+    assert_eq!(node.peer_machines.len(), machines_before);
+    assert_eq!(node.links.len(), links_before);
+}

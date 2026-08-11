@@ -3259,15 +3259,27 @@ impl Node {
 
     /// Disconnect a peer via the control API.
     ///
-    /// Notifies the peer, removes it locally, and suppresses auto-reconnect.
+    /// Notifies the peer, removes it locally, closes the transport connection
+    /// it was using, and suppresses auto-reconnect.
     pub(crate) async fn api_disconnect(&mut self, npub: &str) -> Result<serde_json::Value, String> {
         let peer_identity =
             PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub '{npub}': {e}"))?;
         let node_addr = *peer_identity.node_addr();
 
-        if !self.peers.contains_key(&node_addr) {
+        let Some(peer) = self.peers.get(&node_addr) else {
             return Err(format!("peer not found: {npub}"));
-        }
+        };
+
+        // Read the transport path the peer is actually sending over BEFORE the
+        // teardown below drops the peer and its link — afterwards there is
+        // nothing left to derive it from. `current_addr` rather than the
+        // link's remote address, because roaming updates the former and it is
+        // the address the pool entry (and its inbound-slot accounting) is
+        // keyed by.
+        let transport_path = match (peer.transport_id(), peer.current_addr()) {
+            (Some(transport_id), Some(addr)) => Some((transport_id, addr.clone())),
+            _ => None,
+        };
 
         // Notify the peer before we tear down the link, so it drops its own
         // session and re-handshakes symmetrically rather than holding a stale
@@ -3279,6 +3291,22 @@ impl Node {
 
         // Remove the peer (full cleanup: sessions, indices, links, tree, bloom)
         self.remove_active_peer(&node_addr);
+
+        // Tear down the transport connection, not just the node-side state.
+        // `remove_active_peer` frees every node-side structure but never
+        // touches the transport, so on a connection-oriented transport the
+        // pool entry, the socket and its inbound-slot accounting would
+        // otherwise survive the peer the node has just forgotten — an operator
+        // who disconnects a peer to free a slot would not free the slot. This
+        // mirrors `cleanup_stale_connection`, and the reasoning there applies
+        // verbatim: closing twice is harmless, because every
+        // `close_connection` implementation is `if let Some(conn) =
+        // pool.remove(addr)` and the connectionless default is a no-op.
+        if let Some((transport_id, addr)) = transport_path
+            && let Some(transport) = self.transports.get(&transport_id)
+        {
+            transport.close_connection(&addr).await;
+        }
 
         // Suppress any pending auto-reconnect
         self.peering.reconciler.retry_pending.remove(&node_addr);
