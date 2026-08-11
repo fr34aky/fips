@@ -3013,6 +3013,74 @@ impl Node {
         (outbound_tx, tun_rx)
     }
 
+    /// Set up an **app-owned UDP socket option**: FIPS keeps the socket, and
+    /// the embedder gets its raw fd so it can apply a host socket option FIPS
+    /// has no basis to choose. Call this after [`Node::new`] and **before**
+    /// [`Self::start`] — the fd does not exist until the transport binds.
+    ///
+    /// The UDP transport binds one socket and selects the egress path per
+    /// destination address, which assumes the host routes by destination
+    /// alone. Not every host does. Where each socket is instead associated
+    /// with exactly one network interface (or "network") and inbound traffic
+    /// is steered by that association, a peer reachable only over a secondary,
+    /// non-default network is unreachable in a way FIPS can neither see nor
+    /// correct: the address is well-formed, the send succeeds, the peer
+    /// receives our handshake and replies, and the host discards the reply
+    /// before it reaches our socket. Handshake msg1 then retries forever with
+    /// no error surfaced anywhere. Correcting it is a `setsockopt`-class call
+    /// against host-specific network state, on a descriptor the transport
+    /// otherwise keeps entirely private.
+    ///
+    /// ```no_run
+    /// # async fn f(node: &mut fips::Node) -> Result<(), Box<dyn std::error::Error>> {
+    /// let rx = node.enable_app_owned_udp_fd();          // after new(), before start()
+    /// node.start().await?;
+    /// let fd = rx.recv_timeout(std::time::Duration::from_secs(1))?;
+    /// # let _ = fd; Ok(())
+    /// # }
+    /// ```
+    ///
+    /// One message is sent per UDP transport that successfully binds — the
+    /// usual single-listener configuration therefore yields exactly one, while
+    /// a config with several named UDP listeners yields one per listener, all
+    /// of which an embedder pinning sockets to a network needs. A
+    /// [`Self::stop`] followed by another [`Self::start`] delivers the new
+    /// socket's fd on the same channel, since that is a genuinely different
+    /// descriptor. Nothing at all is sent when no UDP transport is configured
+    /// or a configured one fails to bind, so a receive that times out is how
+    /// an embedder tells "no socket" from "here is the socket". Calling this
+    /// twice replaces the first arming: the last receiver wins.
+    ///
+    /// Scope, stated precisely so it is not read as more than it is:
+    ///
+    /// - The fd is the transport's wildcard listen socket. On targets that
+    ///   also run the per-peer connected-UDP fast path (Linux and macOS), the
+    ///   additional `connect()`-ed sockets that path opens per established
+    ///   peer, after `start()` has returned, are not covered by this seam. On
+    ///   targets without that path the wildcard socket is the only UDP socket
+    ///   the transport opens.
+    /// - Transports that adopt a socket supplied from outside (the
+    ///   NAT-traversal bootstrap handoff) do not fire this, since whoever
+    ///   supplied the socket already held its fd and could bind it before
+    ///   handover.
+    /// - FIPS retains ownership. The fd is a borrow valid while the node is
+    ///   running; using it after the transport stops can touch an unrelated
+    ///   reused descriptor.
+    ///
+    /// Unix-only: `RawFd` is a unix concept and the Windows UDP backend has no
+    /// descriptor. The channel is a [`std::sync::mpsc`] one because the
+    /// embedder is not necessarily on a tokio runtime; the sending end lives on
+    /// the supervisor as `udp_fd_tx` and [`Self::start`] fires it from the
+    /// transport-spawn arm, right after the handle reports a successful start.
+    #[cfg(unix)]
+    pub fn enable_app_owned_udp_fd(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<std::os::unix::io::RawFd> {
+        let (udp_fd_tx, udp_fd_rx) = std::sync::mpsc::channel();
+        self.supervisor.udp_fd_tx = Some(udp_fd_tx);
+        udp_fd_rx
+    }
+
     /// Address the built-in `.fips` DNS responder is listening on, or `None`
     /// when it is not running (`dns.enabled = false`, the bind failed, or the
     /// node is stopped).

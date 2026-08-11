@@ -2981,6 +2981,209 @@ async fn start_skips_system_tun_when_app_owned() {
     node.stop().await.unwrap();
 }
 
+/// Config for the app-owned-UDP-fd tests: one loopback UDP transport on an
+/// ephemeral port and no DNS, mirroring `make_healthy_node`.
+#[cfg(unix)]
+fn udp_loopback_config() -> crate::Config {
+    let mut config = crate::Config::new();
+    config.transports.udp = crate::config::TransportInstances::Single(crate::config::UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    });
+    config.dns.enabled = false;
+    config
+}
+
+/// App-owned UDP fd seam: the embedder gets the descriptor of the socket the
+/// transport actually bound, and gets it only once the bind has happened —
+/// there is no fd to hand out before `start()`.
+#[cfg(unix)]
+#[tokio::test]
+async fn app_owned_udp_fd_seam_delivers_the_bound_socket() {
+    let mut node = make_node_with(udp_loopback_config());
+    let rx = node.enable_app_owned_udp_fd();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing is delivered at arm time — the socket is not bound until start()",
+    );
+
+    node.start().await.unwrap();
+
+    let fd = rx
+        .try_recv()
+        .expect("the seam fires once the UDP socket is bound");
+    let live_fd = node
+        .transports
+        .values()
+        .next()
+        .expect("the loopback UDP transport came up")
+        .raw_fd();
+    assert_eq!(
+        Some(fd),
+        live_fd,
+        "the delivered fd must be the live transport's socket, not some other descriptor",
+    );
+
+    assert!(
+        rx.try_recv().is_err(),
+        "one UDP transport bound means exactly one delivery",
+    );
+
+    node.stop().await.unwrap();
+}
+
+/// One message per UDP transport that binds: an embedder pinning sockets to a
+/// network needs every listener's fd, not just the first, so the seam does not
+/// latch after the first send.
+#[cfg(unix)]
+#[tokio::test]
+async fn app_owned_udp_fd_seam_delivers_every_udp_listener_that_binds() {
+    let mut listeners = std::collections::HashMap::new();
+    for name in ["main", "backup"] {
+        listeners.insert(
+            name.to_string(),
+            crate::config::UdpConfig {
+                bind_addr: Some("127.0.0.1:0".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut config = crate::Config::new();
+    config.transports.udp = crate::config::TransportInstances::Named(listeners);
+    config.dns.enabled = false;
+
+    let mut node = make_node_with(config);
+    let rx = node.enable_app_owned_udp_fd();
+    node.start().await.unwrap();
+
+    let mut delivered: Vec<_> = rx.try_iter().collect();
+    delivered.sort_unstable();
+    let mut live: Vec<_> = node
+        .transports
+        .values()
+        .filter_map(|handle| handle.raw_fd())
+        .collect();
+    live.sort_unstable();
+    assert_eq!(
+        delivered, live,
+        "every UDP listener that bound must be handed out, not just the first",
+    );
+    assert_eq!(delivered.len(), 2, "both named listeners bound");
+
+    node.stop().await.unwrap();
+}
+
+/// No UDP transport means no fd: the channel stays silent rather than
+/// delivering a sentinel, so a receive that times out is how an embedder tells
+/// "there is no socket" from "here is the socket".
+#[cfg(unix)]
+#[tokio::test]
+async fn app_owned_udp_fd_seam_stays_silent_without_a_udp_transport() {
+    let mut config = crate::Config::new();
+    config.dns.enabled = false;
+    let mut node = make_node_with(config);
+    let rx = node.enable_app_owned_udp_fd();
+
+    // A node with no transports configured fails bring-up with
+    // `NoOperationalTransports`; asserted so this test cannot silently stop
+    // exercising the no-UDP path if that outcome ever changes.
+    let started = node.start().await;
+    assert!(
+        started.is_err(),
+        "a transportless node has no operational transports",
+    );
+
+    assert!(
+        rx.try_recv().is_err(),
+        "no UDP transport means no fd is ever delivered",
+    );
+}
+
+/// A UDP transport that never bound has no fd to hand out. The bind address is
+/// deliberately unparseable — a busy port would not do it, since
+/// `UdpRawSocket::open` sets `SO_REUSEADDR`/`SO_REUSEPORT` before binding.
+#[cfg(unix)]
+#[tokio::test]
+async fn app_owned_udp_fd_seam_stays_silent_when_the_udp_transport_fails_to_start() {
+    let mut config = crate::Config::new();
+    config.transports.udp = crate::config::TransportInstances::Single(crate::config::UdpConfig {
+        bind_addr: Some("not-a-socket-addr".to_string()),
+        ..Default::default()
+    });
+    config.dns.enabled = false;
+    let mut node = make_node_with(config);
+    let rx = node.enable_app_owned_udp_fd();
+
+    // Transport-start failure is warn-and-continue; the node's overall start
+    // outcome is not what this test pins.
+    let _ = node.start().await;
+
+    assert!(
+        rx.try_recv().is_err(),
+        "a UDP transport that never bound has no fd to hand out",
+    );
+}
+
+/// The seam is per-`Node` state with a fresh channel per arming, so an embedder
+/// that tears the mesh down and rebuilds the node — a radio off→on cycle — gets
+/// the new socket on the new node's channel, with nothing shared between them.
+#[cfg(unix)]
+#[tokio::test]
+async fn app_owned_udp_fd_seam_rearms_on_a_rebuilt_node() {
+    let mut node_a = make_node_with(udp_loopback_config());
+    let rx_a = node_a.enable_app_owned_udp_fd();
+    node_a.start().await.unwrap();
+    rx_a.try_recv()
+        .expect("node A's socket reached node A's rx");
+    node_a.stop().await.unwrap();
+    drop(node_a);
+
+    let mut node_b = make_node_with(udp_loopback_config());
+    let rx_b = node_b.enable_app_owned_udp_fd();
+    node_b.start().await.unwrap();
+    rx_b.try_recv()
+        .expect("node B's socket reached node B's rx");
+
+    // Nothing from B reaches A's channel. (A is dropped, so this is
+    // `Disconnected` rather than `Empty`; the specific variant is not part of
+    // the contract, only that no fd arrives.)
+    assert!(
+        rx_a.try_recv().is_err(),
+        "the channels are per-node — no shared or global arming state",
+    );
+
+    node_b.stop().await.unwrap();
+}
+
+/// Arming twice on the same node replaces the first arming: the last receiver
+/// wins and the earlier one is disconnected. Asserted by firing through the
+/// installed sender directly, so the test needs no real bind.
+#[cfg(unix)]
+#[test]
+fn app_owned_udp_fd_seam_second_arm_replaces_the_first() {
+    let mut node = make_node_with(udp_loopback_config());
+    let rx1 = node.enable_app_owned_udp_fd();
+    let rx2 = node.enable_app_owned_udp_fd();
+
+    node.supervisor
+        .udp_fd_tx
+        .as_ref()
+        .expect("the second arming installed a sender")
+        .send(7)
+        .expect("the surviving receiver is live");
+
+    assert_eq!(
+        rx2.try_recv().ok(),
+        Some(7),
+        "the last receiver armed is the one the node feeds",
+    );
+    assert!(
+        rx1.try_recv().is_err(),
+        "the replaced receiver gets nothing",
+    );
+}
+
 /// The embedder-facing DNS contract, end to end.
 ///
 /// An embedder that owns the TUN fd (Android `VpnService`) has no system DNS
