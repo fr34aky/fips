@@ -20,7 +20,41 @@ fn config_for(service_type: String) -> LanRendezvousConfig {
         enabled: true,
         service_type,
         scope: None,
+        exclude_addrs: Vec::new(),
     }
+}
+
+/// `exclude_addrs` defaults to empty when absent from config files (upgrade
+/// compatibility) and roundtrips through serde.
+#[test]
+fn exclude_addrs_serde() {
+    let parsed: LanRendezvousConfig = serde_yaml::from_str("enabled: true").unwrap();
+    assert!(parsed.exclude_addrs.is_empty(), "defaults to empty");
+
+    let parsed: LanRendezvousConfig =
+        serde_yaml::from_str("enabled: true\nexclude_addrs: [\"fd56::1\", \"10.111.222.1\"]")
+            .unwrap();
+    assert_eq!(parsed.exclude_addrs.len(), 2);
+    assert!(parsed.exclude_addrs[0].is_ipv6());
+    assert!(parsed.exclude_addrs[1].is_ipv4());
+}
+
+/// Startup must accept exclusions, and an excluded address that matches no
+/// local interface is harmless (the common case on hosts without the tunnel
+/// up yet).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusion_is_harmless_when_addr_absent() {
+    let config = LanRendezvousConfig {
+        enabled: true,
+        service_type: isolated_service_type("excl"),
+        scope: None,
+        exclude_addrs: vec!["203.0.113.7".parse().unwrap(), "fd56::1".parse().unwrap()],
+    };
+    let identity = Identity::generate();
+    let lan = LanRendezvous::start(&identity, None, 51999, config)
+        .await
+        .expect("daemon starts with absent excluded addrs");
+    lan.shutdown().await;
 }
 
 #[test]
