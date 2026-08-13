@@ -111,6 +111,14 @@ pub struct LanRendezvousConfig {
     /// still isolating LAN discovery per private network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Local interface addresses to EXCLUDE from mDNS (advertising and
+    /// browsing). Embedders that own a tunnel interface set this to the
+    /// tunnel's own addresses so `enable_addr_auto` doesn't broadcast the
+    /// node's mesh address (an identity disclosure) — or a bogus tunnel
+    /// IPv4 — onto the LAN. Addresses that don't match any interface are
+    /// harmless.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_addrs: Vec<std::net::IpAddr>,
 }
 
 impl Default for LanRendezvousConfig {
@@ -119,6 +127,7 @@ impl Default for LanRendezvousConfig {
             enabled: Self::default_enabled(),
             service_type: Self::default_service_type(),
             scope: None,
+            exclude_addrs: Vec::new(),
         }
     }
 }
@@ -167,6 +176,13 @@ impl LanRendezvous {
         }
 
         let daemon = ServiceDaemon::new().map_err(|e| LanRendezvousError::Daemon(e.to_string()))?;
+        // Applied before registration and remembered by the daemon, so
+        // addresses appearing later on an excluded interface stay excluded.
+        for addr in &config.exclude_addrs {
+            daemon
+                .disable_interface(*addr)
+                .map_err(|e| LanRendezvousError::Daemon(e.to_string()))?;
+        }
 
         let npub = identity.npub();
         // mDNS DNS labels are capped at 63 bytes. 16 bech32 chars of npub
