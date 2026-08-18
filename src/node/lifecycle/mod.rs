@@ -1451,15 +1451,6 @@ impl Node {
             let mut rng = rand::rng();
             for event in events {
                 let crate::mdns::LanEvent::Discovered(peer) = event;
-                let Some((transport_id, _local_addr)) =
-                    self.find_udp_transport_for_remote_addr(peer.addr, None)
-                else {
-                    debug!(
-                        addr = %peer.addr,
-                        "lan: skip discovered peer with no compatible UDP transport"
-                    );
-                    continue;
-                };
                 if !lan_target_on_link(peer.addr, &peer.interfaces, on_link) {
                     if on_link.read_failed() {
                         debug!(
@@ -1495,6 +1486,18 @@ impl Node {
                     );
                     continue;
                 }
+                // Recorded for `show_lan_peers` once the advert is on-link
+                // and not an impostor's, even when no transport can dial it.
+                self.record_lan_sighting(&peer);
+                let Some((transport_id, _local_addr)) =
+                    self.find_udp_transport_for_remote_addr(peer.addr, None)
+                else {
+                    debug!(
+                        addr = %peer.addr,
+                        "lan: skip discovered peer with no compatible UDP transport"
+                    );
+                    continue;
+                };
                 let pair = PendingPair {
                     node: *identity.node_addr(),
                     identity,
@@ -1643,6 +1646,38 @@ impl Node {
                     "lan: failed to initiate connection to discovered peer"
                 );
             }
+        }
+    }
+
+    /// Record an mDNS sighting into the `show_lan_peers` registry. Recorded
+    /// even when the peer is not dialable right now — the registry answers
+    /// "whose advert was seen on this LAN since start", not "who is
+    /// connected" (join against `show_peers` for that). Bounded: beyond the
+    /// cap the oldest sighting is evicted.
+    fn record_lan_sighting(&mut self, peer: &crate::mdns::LanDiscoveredPeer) {
+        const LAN_SEEN_CAP: usize = 256;
+        let now_ms = Self::now_ms();
+        let entry = self
+            .lan_seen
+            .entry(peer.npub.clone())
+            .or_insert_with(|| crate::control::snapshot::LanSeenRow {
+                npub: peer.npub.clone(),
+                addr: String::new(),
+                scope: None,
+                first_seen_ms: now_ms,
+                last_seen_ms: now_ms,
+            });
+        entry.addr = peer.addr.to_string();
+        entry.scope = peer.scope.clone();
+        entry.last_seen_ms = now_ms;
+        if self.lan_seen.len() > LAN_SEEN_CAP
+            && let Some(oldest) = self
+                .lan_seen
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_ms)
+                .map(|(npub, _)| npub.clone())
+        {
+            self.lan_seen.remove(&oldest);
         }
     }
 

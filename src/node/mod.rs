@@ -640,6 +640,13 @@ pub struct Node {
     /// to the supervisor FSM.
     transport_presence_rx: Option<crate::transport::PresenceRx>,
 
+    // === LAN (mDNS) Discovery Registry ===
+    /// Every peer whose mDNS LAN-rendezvous advert was seen since start,
+    /// keyed by npub — recorded by `poll_lan_rendezvous` even when the peer
+    /// is not dialable right now, projected into the entity snapshot as
+    /// `show_lan_peers`. Bounded by `LAN_SEEN_CAP` (oldest sighting evicted).
+    lan_seen: HashMap<String, crate::control::snapshot::LanSeenRow>,
+
     // === Per-Peer Control Machines ===
     /// Per-peer lifecycle control FSMs, keyed by the stable `LinkId` that spans
     /// the handshake→active lifetime. Each machine owns its handshake crypto
@@ -1083,6 +1090,7 @@ impl Node {
             child_exit_rx: None,
             transport_presence_tx: None,
             transport_presence_rx: None,
+            lan_seen: HashMap::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -1265,6 +1273,7 @@ impl Node {
             child_exit_rx: None,
             transport_presence_tx: None,
             transport_presence_rx: None,
+            lan_seen: HashMap::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -2970,6 +2979,10 @@ impl Node {
             })
             .collect();
 
+        // --- LAN-seen (show_lan_peers) --- newest sighting first.
+        let mut lan_rows: Vec<snap::LanSeenRow> = self.lan_seen.values().cloned().collect();
+        lan_rows.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms).then(a.npub.cmp(&b.npub)));
+
         let snapshot = snap::EntitySnapshot {
             peers: snap::reconcile_rows(&prev.peers, peer_rows, |r| r.node_addr),
             sessions: snap::reconcile_rows(&prev.sessions, session_rows, |r| r.remote_addr),
@@ -2978,6 +2991,7 @@ impl Node {
             transports: snap::reconcile_rows(&prev.transports, transport_rows, |r| r.transport_id),
             mmp_peers: snap::reconcile_rows(&prev.mmp_peers, mmp_peer_rows, |r| r.peer),
             mmp_sessions: snap::reconcile_rows(&prev.mmp_sessions, mmp_session_rows, |r| r.remote),
+            lan_seen: snap::reconcile_rows(&prev.lan_seen, lan_rows, |r| r.npub.clone()),
         };
         self.entities_snapshot.store(std::sync::Arc::new(snapshot));
     }
