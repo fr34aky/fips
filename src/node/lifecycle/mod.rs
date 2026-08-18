@@ -1132,6 +1132,14 @@ impl Node {
         let mut seen: HashSet<NodeAddr> = HashSet::new();
         for event in events {
             let crate::mdns::LanEvent::Discovered(peer) = event;
+            let identity = match crate::PeerIdentity::from_npub(&peer.npub) {
+                Ok(id) => id,
+                Err(err) => {
+                    debug!(npub = %peer.npub, error = %err, "lan: skip bad npub");
+                    continue;
+                }
+            };
+            self.record_lan_sighting(&peer);
             let Some((transport_id, _local_addr)) =
                 self.find_udp_transport_for_remote_addr(peer.addr)
             else {
@@ -1140,13 +1148,6 @@ impl Node {
                     "lan: skip discovered peer with no compatible UDP transport"
                 );
                 continue;
-            };
-            let identity = match crate::PeerIdentity::from_npub(&peer.npub) {
-                Ok(id) => id,
-                Err(err) => {
-                    debug!(npub = %peer.npub, error = %err, "lan: skip bad npub");
-                    continue;
-                }
             };
             let peer_node_addr = *identity.node_addr();
             if !seen.insert(peer_node_addr) {
@@ -1205,6 +1206,39 @@ impl Node {
                     error = %err,
                     "lan: failed to initiate connection to discovered peer"
                 );
+            }
+        }
+    }
+
+    /// Record an mDNS sighting into the `show_lan_peers` registry. Recorded
+    /// even when the peer is not dialable right now — the registry answers
+    /// "whose advert was seen on this LAN since start", not "who is
+    /// connected" (join against `show_peers` for that). Bounded: beyond the
+    /// cap the oldest sighting is evicted.
+    fn record_lan_sighting(&mut self, peer: &crate::mdns::LanDiscoveredPeer) {
+        const LAN_SEEN_CAP: usize = 256;
+        let now_ms = Self::now_ms();
+        let entry = self
+            .lan_seen
+            .entry(peer.npub.clone())
+            .or_insert_with(|| crate::control::snapshot::LanSeenRow {
+                npub: peer.npub.clone(),
+                addr: String::new(),
+                scope: None,
+                first_seen_ms: now_ms,
+                last_seen_ms: now_ms,
+            });
+        entry.addr = peer.addr.to_string();
+        entry.scope = peer.scope.clone();
+        entry.last_seen_ms = now_ms;
+        if self.lan_seen.len() > LAN_SEEN_CAP {
+            if let Some(oldest) = self
+                .lan_seen
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_ms)
+                .map(|(npub, _)| npub.clone())
+            {
+                self.lan_seen.remove(&oldest);
             }
         }
     }

@@ -1359,6 +1359,29 @@ pub(crate) fn show_connections_from_handle(
     json!({ "connections": connections })
 }
 
+/// `show_lan_peers` — peers whose mDNS LAN-rendezvous advert was seen since
+/// node start (unauthenticated sightings; join `show_peers` by npub for
+/// connection state). Rendered off-loop from the entity snapshot (R4).
+pub(crate) fn show_lan_peers_from_handle(handle: &super::read_handle::ControlReadHandle) -> Value {
+    let entities = handle.entities();
+    let now = now_ms();
+    let lan_peers: Vec<Value> = entities
+        .lan_seen
+        .iter()
+        .map(|row| {
+            json!({
+                "npub": row.npub,
+                "addr": row.addr,
+                "scope": row.scope,
+                "first_seen_ms": row.first_seen_ms,
+                "last_seen_ms": row.last_seen_ms,
+                "age_ms": now.saturating_sub(row.last_seen_ms),
+            })
+        })
+        .collect();
+    json!({ "lan_peers": lan_peers })
+}
+
 /// `show_transports` — Transport instances.
 pub fn show_transports(node: &Node) -> Value {
     let transports: Vec<Value> = node

@@ -353,6 +353,24 @@ pub struct Node {
     /// rx_loop select arm that feeds `Event::ChildExited` to the supervisor FSM.
     child_exit_rx: Option<tokio::sync::mpsc::Receiver<crate::node::lifecycle::supervisor::Child>>,
 
+    // === Embedder Command Channel ===
+    /// Sender half of the embedder command channel, cloned into every
+    /// [`ControlCommandHandle`](crate::control::ControlCommandHandle) handed
+    /// out by [`Self::control_command_handle`]. Held on `self` for the node's
+    /// lifetime so the rx_loop arm never observes a spuriously-closed channel.
+    control_cmd_tx: tokio::sync::mpsc::Sender<crate::control::ControlMessage>,
+    /// Receiver half, `take()`-en by the rx_loop select arm that dispatches
+    /// embedder commands through the same `commands::dispatch` as the control
+    /// socket.
+    control_cmd_rx: Option<tokio::sync::mpsc::Receiver<crate::control::ControlMessage>>,
+
+    // === LAN (mDNS) Discovery Registry ===
+    /// Every peer whose mDNS LAN-rendezvous advert was seen since start,
+    /// keyed by npub — recorded by `poll_lan_rendezvous` even when the peer
+    /// is not dialable right now, projected into the entity snapshot as
+    /// `show_lan_peers`. Bounded by `LAN_SEEN_CAP` (oldest sighting evicted).
+    lan_seen: HashMap<String, crate::control::snapshot::LanSeenRow>,
+
     // === Per-Peer Control Machines ===
     /// Per-peer lifecycle control FSMs, keyed by the stable `LinkId` that spans
     /// the handshake→active lifetime. Each machine owns its handshake crypto
@@ -619,6 +637,12 @@ impl Node {
         let (decrypt_fallback_tx, decrypt_fallback_rx) =
             tokio::sync::mpsc::unbounded_channel::<decrypt_worker::DecryptWorkerEvent>();
 
+        // Embedder command channel (see `control_command_handle`): created at
+        // construction so handles can be taken before the node moves into its
+        // runtime task; the rx_loop takes the receiver.
+        let (control_cmd_tx, control_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::control::ControlMessage>(8);
+
         let started_at = std::time::Instant::now();
         let context = Arc::new(context::NodeContext::new(
             Arc::new(config.clone()),
@@ -644,6 +668,9 @@ impl Node {
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
+            control_cmd_tx,
+            control_cmd_rx: Some(control_cmd_rx),
+            lan_seen: HashMap::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -768,6 +795,12 @@ impl Node {
         let (decrypt_fallback_tx, decrypt_fallback_rx) =
             tokio::sync::mpsc::unbounded_channel::<decrypt_worker::DecryptWorkerEvent>();
 
+        // Embedder command channel (see `control_command_handle`): created at
+        // construction so handles can be taken before the node moves into its
+        // runtime task; the rx_loop takes the receiver.
+        let (control_cmd_tx, control_cmd_rx) =
+            tokio::sync::mpsc::channel::<crate::control::ControlMessage>(8);
+
         let started_at = std::time::Instant::now();
         let context = Arc::new(context::NodeContext::new(
             Arc::new(config.clone()),
@@ -793,6 +826,9 @@ impl Node {
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
+            control_cmd_tx,
+            control_cmd_rx: Some(control_cmd_rx),
+            lan_seen: HashMap::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -1404,6 +1440,17 @@ impl Node {
             self.routing_snapshot.clone(),
             self.entities_snapshot.clone(),
         )
+    }
+
+    /// Clonable handle for the mutating control commands (`connect` /
+    /// `disconnect`), served by the rx_loop through the same
+    /// `commands::dispatch` as the control socket — without the socket.
+    /// Public for embedders (Android): grab a handle before moving the node
+    /// into its runtime task, like [`Self::control_read_handle`]. Requests
+    /// sent before `run_rx_loop_with_shutdown` starts queue (bounded) and are
+    /// served once it does; after shutdown they fail with an error.
+    pub fn control_command_handle(&self) -> crate::control::ControlCommandHandle {
+        crate::control::ControlCommandHandle::new(self.control_cmd_tx.clone())
     }
 
     /// Get the stats history collector.
@@ -2109,6 +2156,10 @@ impl Node {
             })
             .collect();
 
+        // --- LAN-seen (show_lan_peers) --- newest sighting first.
+        let mut lan_rows: Vec<snap::LanSeenRow> = self.lan_seen.values().cloned().collect();
+        lan_rows.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms).then(a.npub.cmp(&b.npub)));
+
         let snapshot = snap::EntitySnapshot {
             peers: snap::reconcile_rows(&prev.peers, peer_rows, |r| r.node_addr),
             sessions: snap::reconcile_rows(&prev.sessions, session_rows, |r| r.remote_addr),
@@ -2117,6 +2168,7 @@ impl Node {
             transports: snap::reconcile_rows(&prev.transports, transport_rows, |r| r.transport_id),
             mmp_peers: snap::reconcile_rows(&prev.mmp_peers, mmp_peer_rows, |r| r.peer),
             mmp_sessions: snap::reconcile_rows(&prev.mmp_sessions, mmp_session_rows, |r| r.remote),
+            lan_seen: snap::reconcile_rows(&prev.lan_seen, lan_rows, |r| r.npub.clone()),
         };
         self.entities_snapshot.store(std::sync::Arc::new(snapshot));
     }

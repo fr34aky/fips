@@ -467,6 +467,8 @@ pub(crate) struct EntitySnapshot {
     pub mmp_peers: Vec<Arc<MmpPeerRow>>,
     /// `show_mmp` session-layer rows (sessions with an MMP instance).
     pub mmp_sessions: Vec<Arc<MmpSessionRow>>,
+    /// `show_lan_peers` rows (mDNS-discovered LAN peers seen since start).
+    pub lan_seen: Vec<Arc<LanSeenRow>>,
 }
 
 impl EntitySnapshot {
@@ -481,8 +483,24 @@ impl EntitySnapshot {
             transports: Vec::new(),
             mmp_peers: Vec::new(),
             mmp_sessions: Vec::new(),
+            lan_seen: Vec::new(),
         }
     }
+}
+
+/// `show_lan_peers` row: a peer whose mDNS LAN-rendezvous advert was seen
+/// since node start. The beacon is unauthenticated — a row proves an advert
+/// carrying this npub was observed on the LAN, not that the peer holds the
+/// key (the Noise IK handshake is the authentication; join against
+/// `show_peers` for connection state). Timestamps are wall-clock ms.
+#[derive(Clone, PartialEq)]
+pub(crate) struct LanSeenRow {
+    pub npub: String,
+    /// Most recently advertised socket address.
+    pub addr: String,
+    pub scope: Option<String>,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
 }
 
 /// Per-peer link/transport/connectivity fields for `show_peers` derived from a

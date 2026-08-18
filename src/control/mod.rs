@@ -32,6 +32,68 @@ const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// A message sent from the accept loop to the main event loop.
 pub type ControlMessage = (Request, oneshot::Sender<Response>);
 
+/// Embedder-facing handle for the mutating control commands (`connect` /
+/// `disconnect`), dispatched on the rx_loop exactly like control-socket
+/// commands — without the socket. Obtain via
+/// [`crate::Node::control_command_handle`] before the node moves into its
+/// runtime task (the mutating twin of
+/// [`read_handle::ControlReadHandle`]). Cloneable; cheap.
+#[derive(Clone)]
+pub struct ControlCommandHandle {
+    tx: mpsc::Sender<ControlMessage>,
+}
+
+impl ControlCommandHandle {
+    pub(crate) fn new(tx: mpsc::Sender<ControlMessage>) -> Self {
+        Self { tx }
+    }
+
+    /// Send a command and wait for the rx_loop's response, returned as the
+    /// serialized [`Response`] (`{"status":"ok"|"error", ...}`). `Err` when
+    /// the node has shut down (or its rx_loop never starts). Blocks the
+    /// calling thread — must not be called from an async context; use
+    /// [`Self::command`] there.
+    pub fn command_blocking(
+        &self,
+        command: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = Request {
+            command: command.to_string(),
+            params,
+        };
+        self.tx
+            .blocking_send((request, resp_tx))
+            .map_err(|_| "node not running".to_string())?;
+        let response = resp_rx
+            .blocking_recv()
+            .map_err(|_| "node stopped before responding".to_string())?;
+        Ok(serde_json::to_value(&response).unwrap_or_default())
+    }
+
+    /// Async variant of [`Self::command_blocking`].
+    pub async fn command(
+        &self,
+        command: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = Request {
+            command: command.to_string(),
+            params,
+        };
+        self.tx
+            .send((request, resp_tx))
+            .await
+            .map_err(|_| "node not running".to_string())?;
+        let response = resp_rx
+            .await
+            .map_err(|_| "node stopped before responding".to_string())?;
+        Ok(serde_json::to_value(&response).unwrap_or_default())
+    }
+}
+
 /// Handle a single client connection over any AsyncRead + AsyncWrite stream.
 ///
 /// Shared between Unix and Windows implementations to avoid duplicating

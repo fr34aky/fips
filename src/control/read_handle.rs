@@ -201,6 +201,8 @@ pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -
         "show_connections" => Some(Response::ok(queries::show_connections_from_handle(handle))),
         "show_transports" => Some(Response::ok(queries::show_transports_from_handle(handle))),
         "show_mmp" => Some(Response::ok(queries::show_mmp_from_handle(handle))),
+        // mDNS LAN-rendezvous sightings (registry fed by `poll_lan_rendezvous`).
+        "show_lan_peers" => Some(Response::ok(queries::show_lan_peers_from_handle(handle))),
         _ => None,
     }
 }
