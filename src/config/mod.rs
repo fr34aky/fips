@@ -41,7 +41,7 @@ pub use node::{
     NodeConfig, NostrRendezvousConfig, NostrRendezvousPolicy, RateLimitConfig, RekeyConfig,
     RendezvousConfig, RetryConfig, SessionConfig, SessionMmpConfig, TreeConfig,
 };
-pub use peer::{ConnectPolicy, PeerAddress, PeerConfig};
+pub use peer::{ConnectPolicy, PeerAddress, PeerConfig, TransportSpec};
 pub use transport::{
     BleConfig, DirectoryServiceConfig, EthernetConfig, NymConfig, TcpConfig, TorConfig,
     TransportInstances, TransportsConfig, UdpConfig,

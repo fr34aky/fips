@@ -406,14 +406,24 @@ impl Node {
     /// service. A wildcard IPv4 socket cannot send to an IPv6 link-local
     /// target, and vice versa, so callers must choose by socket family rather
     /// than by transport type alone.
+    ///
+    /// `instance` names a specific configured UDP instance
+    /// ([`TransportSpec`](crate::config::TransportSpec)) and is the only way to
+    /// discriminate two wildcard sockets: they are family-compatible with the
+    /// same addresses, so without a name the lowest `TransportId` always wins
+    /// and one socket carries everything. When it is `Some`, a non-matching
+    /// instance is never substituted — the caller gets `None` and can say so,
+    /// rather than dialing down the wrong lane.
     fn find_udp_transport_for_remote_addr(
         &self,
         remote_addr: SocketAddr,
+        instance: Option<&str>,
     ) -> Option<(TransportId, SocketAddr)> {
         self.transports
             .iter()
             .filter(|(id, handle)| {
                 handle.transport_type().name == "udp"
+                    && instance.is_none_or(|want| handle.name() == Some(want))
                     && handle.is_operational()
                     && !self.supervisor.nostr_rendezvous.is_bootstrap_transport(id)
             })
@@ -1148,7 +1158,7 @@ impl Node {
         for event in events {
             let crate::mdns::LanEvent::Discovered(peer) = event;
             let Some((transport_id, _local_addr)) =
-                self.find_udp_transport_for_remote_addr(peer.addr)
+                self.find_udp_transport_for_remote_addr(peer.addr, None)
             else {
                 debug!(
                     addr = %peer.addr,
@@ -2408,7 +2418,12 @@ impl Node {
             if attempted >= max_attempts {
                 break;
             }
-            if addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
+            // The transport field may name a specific instance
+            // (`"udp/aware"`); everything below dispatches on the type half
+            // and hands the instance half to whichever resolver can honour it.
+            let spec = addr.spec();
+
+            if spec.kind == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
                 if !allow_bootstrap_nat {
                     continue;
                 }
@@ -2458,10 +2473,11 @@ impl Node {
                     continue;
                 }
             } else {
-                let tid = if addr.transport == "udp"
+                let tid = if spec.kind == "udp"
                     && let Ok(remote_socket_addr) = addr.addr.parse::<SocketAddr>()
                 {
-                    match self.find_udp_transport_for_remote_addr(remote_socket_addr) {
+                    match self.find_udp_transport_for_remote_addr(remote_socket_addr, spec.instance)
+                    {
                         Some((id, _)) => id,
                         None => {
                             debug!(
@@ -2472,8 +2488,20 @@ impl Node {
                             continue;
                         }
                     }
+                } else if spec.instance.is_some() {
+                    // Only the UDP resolver above can honour an instance name.
+                    // Matching any instance of the type here would be the
+                    // silent wrong-lane substitution this whole mechanism
+                    // exists to prevent, so refuse instead.
+                    debug!(
+                        transport = %addr.transport,
+                        addr = %addr.addr,
+                        "Instance-qualified address for a transport type that \
+                         does not support instance selection"
+                    );
+                    continue;
                 } else {
-                    match self.find_transport_for_type(&addr.transport) {
+                    match self.find_transport_for_type(spec.kind) {
                         Some(id) => id,
                         None => {
                             debug!(
