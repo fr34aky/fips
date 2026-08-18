@@ -259,6 +259,8 @@ pub(crate) fn snapshot_dispatch(request: &Request, handle: &ControlReadHandle) -
         // resolved at publish time, and the `native` counter family comes from
         // the `MetricsRegistry`, so this renders entirely off-loop.
         "show_native_flows" => Some(Response::ok(queries::show_native_flows_from_handle(handle))),
+        // mDNS LAN-rendezvous sightings (registry fed by `poll_lan_rendezvous`).
+        "show_lan_peers" => Some(Response::ok(queries::show_lan_peers_from_handle(handle))),
         _ => None,
     }
 }

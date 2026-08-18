@@ -134,6 +134,18 @@ impl Node {
         // Drop unused sender to avoid keeping channel open if control is disabled
         drop(control_tx);
 
+        // Embedder command channel (`Node::control_command_handle`): same
+        // dispatch as the control socket, without the socket. Taken like
+        // `child_exit_rx`; the `Node`-held sender keeps it open for the
+        // node's lifetime, so the arm simply stays pending when unused.
+        let (mut embedder_cmd_rx, _embedder_cmd_guard) = match self.control_cmd_rx.take() {
+            Some(rx) => (rx, None),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                (rx, Some(tx))
+            }
+        };
+
         // Native datagram API socket. Experimental, off by default, and built
         // on Linux, FreeBSD and macOS: Windows has no way to pass a descriptor
         // between processes at all, which is the mechanism itself. Bound
@@ -408,6 +420,16 @@ impl Node {
                     // the data-plane dispatch path carries no `show_*` arm. A
                     // `show_*` that somehow arrives (none does) falls through to
                     // `commands::dispatch`, which returns "unknown command".
+                    let response = commands::dispatch(
+                        self,
+                        &request.command,
+                        request.params.as_ref(),
+                    ).await;
+                    let _ = response_tx.send(response);
+                }
+                // Embedder commands (`ControlCommandHandle`): same mutating
+                // dispatch as the control-socket arm above.
+                Some((request, response_tx)) = embedder_cmd_rx.recv() => {
                     let response = commands::dispatch(
                         self,
                         &request.command,
