@@ -3010,7 +3010,7 @@ async fn app_owned_udp_fd_seam_delivers_the_bound_socket() {
 
     node.start().await.unwrap();
 
-    let fd = rx
+    let socket = rx
         .try_recv()
         .expect("the seam fires once the UDP socket is bound");
     let live_fd = node
@@ -3020,9 +3020,13 @@ async fn app_owned_udp_fd_seam_delivers_the_bound_socket() {
         .expect("the loopback UDP transport came up")
         .raw_fd();
     assert_eq!(
-        Some(fd),
+        Some(socket.fd),
         live_fd,
         "the delivered fd must be the live transport's socket, not some other descriptor",
+    );
+    assert_eq!(
+        socket.instance, None,
+        "a `Single` UDP config has no instance name to report",
     );
 
     assert!(
@@ -3057,12 +3061,19 @@ async fn app_owned_udp_fd_seam_delivers_every_udp_listener_that_binds() {
     let rx = node.enable_app_owned_udp_fd();
     node.start().await.unwrap();
 
-    let mut delivered: Vec<_> = rx.try_iter().collect();
+    let mut delivered: Vec<_> = rx
+        .try_iter()
+        .map(|socket| (socket.instance, socket.fd))
+        .collect();
     delivered.sort_unstable();
     let mut live: Vec<_> = node
         .transports
         .values()
-        .filter_map(|handle| handle.raw_fd())
+        .filter_map(|handle| {
+            handle
+                .raw_fd()
+                .map(|fd| (handle.name().map(str::to_string), fd))
+        })
         .collect();
     live.sort_unstable();
     assert_eq!(
@@ -3070,6 +3081,22 @@ async fn app_owned_udp_fd_seam_delivers_every_udp_listener_that_binds() {
         "every UDP listener that bound must be handed out, not just the first",
     );
     assert_eq!(delivered.len(), 2, "both named listeners bound");
+
+    // The label is what makes two descriptors usable: an embedder pins each
+    // socket to a different network, and arrival order — the transports come
+    // out of a `HashMap` — cannot tell it which is which.
+    let names: Vec<_> = delivered
+        .iter()
+        .map(|(instance, _)| instance.as_deref())
+        .collect();
+    assert!(
+        names.contains(&Some("main")) && names.contains(&Some("backup")),
+        "each fd names the configured instance it belongs to, got {names:?}",
+    );
+    assert_ne!(
+        delivered[0].1, delivered[1].1,
+        "two instances are two distinct sockets",
+    );
 
     node.stop().await.unwrap();
 }
@@ -3166,16 +3193,20 @@ fn app_owned_udp_fd_seam_second_arm_replaces_the_first() {
     let rx1 = node.enable_app_owned_udp_fd();
     let rx2 = node.enable_app_owned_udp_fd();
 
+    let sent = crate::node::AppOwnedUdpSocket {
+        instance: Some("aware".to_string()),
+        fd: 7,
+    };
     node.supervisor
         .udp_fd_tx
         .as_ref()
         .expect("the second arming installed a sender")
-        .send(7)
+        .send(sent.clone())
         .expect("the surviving receiver is live");
 
     assert_eq!(
         rx2.try_recv().ok(),
-        Some(7),
+        Some(sent),
         "the last receiver armed is the one the node feeds",
     );
     assert!(

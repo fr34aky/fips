@@ -698,13 +698,13 @@ pub(crate) struct Supervisor {
     /// [`Node::dns_local_addr`](crate::Node::dns_local_addr).
     pub(in crate::node) dns_local_addr: Option<std::net::SocketAddr>,
 
-    /// Sender for the raw fd of each UDP listen socket the transport spawn
-    /// binds, armed by
+    /// Sender for each UDP listen socket the transport spawn binds — its raw
+    /// fd and the instance name it was configured under — armed by
     /// [`Node::enable_app_owned_udp_fd`](crate::Node::enable_app_owned_udp_fd)
     /// and fired from the transport-spawn arm of `start()` once the socket is
     /// bound. `None` unless the embedder armed it.
     #[cfg(unix)]
-    pub(in crate::node) udp_fd_tx: Option<std::sync::mpsc::Sender<std::os::unix::io::RawFd>>,
+    pub(in crate::node) udp_fd_tx: Option<std::sync::mpsc::Sender<crate::node::AppOwnedUdpSocket>>,
 
     /// Node-side driver state for the Nostr overlay peer-rendezvous
     /// subsystem: the engine handle, its startup timestamp, the one-shot

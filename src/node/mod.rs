@@ -245,6 +245,37 @@ pub struct UpdatePeersOutcome {
     pub unchanged: usize,
 }
 
+/// One bound UDP listen socket, handed to an embedder that armed
+/// [`Node::enable_app_owned_udp_fd`].
+///
+/// A bare descriptor would be enough for the single-listener case and useless
+/// for any other: a node configured with several named UDP instances
+/// ([`TransportInstances::Named`](crate::config::TransportInstances::Named))
+/// delivers one message per instance, and the whole point of the seam — the
+/// embedder associating a socket with one host network — needs to know *which*
+/// socket it is holding. Naming it here rather than making the embedder infer
+/// it from arrival order is deliberate: transports are created from a
+/// `HashMap`, so arrival order carries no meaning, and guessing wrong pins a
+/// lane's socket to another lane's network, which is precisely the fault this
+/// seam exists to correct.
+///
+/// A struct rather than a tuple so the receiving side reads as
+/// `socket.instance` / `socket.fd`, and so a future addition (the bound local
+/// address, say) does not break every embedder.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppOwnedUdpSocket {
+    /// The configured instance name this listener was built from — the key in
+    /// a `Named` UDP config, and the same name a peer address qualifies its
+    /// transport field with (`"udp/aware"`, see
+    /// [`TransportSpec`](crate::config::TransportSpec)). `None` for a
+    /// `Single` config, which has no name to give.
+    pub instance: Option<String>,
+    /// The bound socket's raw descriptor. Borrowed, not owned: FIPS keeps the
+    /// socket, and the fd is valid only while the transport is running.
+    pub fd: std::os::unix::io::RawFd,
+}
+
 /// Key for addr_to_link reverse lookup.
 type AddrKey = (TransportId, TransportAddr);
 
@@ -3077,15 +3108,20 @@ impl Node {
     /// # async fn f(node: &mut fips::Node) -> Result<(), Box<dyn std::error::Error>> {
     /// let rx = node.enable_app_owned_udp_fd();          // after new(), before start()
     /// node.start().await?;
-    /// let fd = rx.recv_timeout(std::time::Duration::from_secs(1))?;
-    /// # let _ = fd; Ok(())
+    /// let socket = rx.recv_timeout(std::time::Duration::from_secs(1))?;
+    /// # let _ = (socket.instance, socket.fd); Ok(())
     /// # }
     /// ```
     ///
     /// One message is sent per UDP transport that successfully binds — the
     /// usual single-listener configuration therefore yields exactly one, while
     /// a config with several named UDP listeners yields one per listener, all
-    /// of which an embedder pinning sockets to a network needs. A
+    /// of which an embedder pinning sockets to a network needs. Each message
+    /// carries the instance name its listener was configured under
+    /// ([`AppOwnedUdpSocket::instance`]), which is the only thing that tells
+    /// two otherwise-identical descriptors apart: pinning the wrong socket to
+    /// the wrong network is exactly the fault this seam exists to let an
+    /// embedder fix, so an fd is never handed over unlabelled. A
     /// [`Self::stop`] followed by another [`Self::start`] delivers the new
     /// socket's fd on the same channel, since that is a genuinely different
     /// descriptor. Nothing at all is sent when no UDP transport is configured
@@ -3115,9 +3151,7 @@ impl Node {
     /// the supervisor as `udp_fd_tx` and [`Self::start`] fires it from the
     /// transport-spawn arm, right after the handle reports a successful start.
     #[cfg(unix)]
-    pub fn enable_app_owned_udp_fd(
-        &mut self,
-    ) -> std::sync::mpsc::Receiver<std::os::unix::io::RawFd> {
+    pub fn enable_app_owned_udp_fd(&mut self) -> std::sync::mpsc::Receiver<AppOwnedUdpSocket> {
         let (udp_fd_tx, udp_fd_rx) = std::sync::mpsc::channel();
         self.supervisor.udp_fd_tx = Some(udp_fd_tx);
         udp_fd_rx

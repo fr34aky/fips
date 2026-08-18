@@ -1495,15 +1495,20 @@ impl Node {
 
                     match handle.start().await {
                         Ok(()) => {
-                            // Hand the freshly-bound socket's fd to an embedder
-                            // that armed `enable_app_owned_udp_fd`. Non-UDP
-                            // handles report `None` by construction, so no
-                            // transport-type test is needed here.
+                            // Hand the freshly-bound socket to an embedder that
+                            // armed `enable_app_owned_udp_fd`, labelled with the
+                            // instance it belongs to so two UDP listeners can be
+                            // told apart. Non-UDP handles report `None` for the
+                            // fd by construction, so no transport-type test is
+                            // needed here.
                             #[cfg(unix)]
                             if let (Some(tx), Some(fd)) =
                                 (&self.supervisor.udp_fd_tx, handle.raw_fd())
                             {
-                                let _ = tx.send(fd);
+                                let _ = tx.send(crate::node::AppOwnedUdpSocket {
+                                    instance: name.clone(),
+                                    fd,
+                                });
                             }
                             self.transports.insert(id, handle);
                             Event::SubstrateUp { child }
