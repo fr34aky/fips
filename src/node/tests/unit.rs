@@ -1253,6 +1253,69 @@ fn active_peer_same_path_discovery_refreshes_stale_peer() {
     ));
 }
 
+/// An instance-qualified candidate is the peer's *current* path only when it
+/// names the instance the peer is actually on. Without this, every qualified
+/// address looked like a different path from the `"udp"` a transport reports as
+/// its type, so a platform lane that re-pushes its peers — Wi-Fi Aware does, on
+/// every data-path callback — would re-dial a peer it is already connected to,
+/// for as long as it stayed connected.
+#[tokio::test]
+async fn an_instance_qualified_candidate_matches_only_its_own_instance() {
+    let mut listeners = std::collections::HashMap::new();
+    for name in ["main", "backup"] {
+        listeners.insert(
+            name.to_string(),
+            crate::config::UdpConfig {
+                bind_addr: Some("127.0.0.1:0".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+    let mut config = crate::Config::new();
+    config.transports.udp = crate::config::TransportInstances::Named(listeners);
+    config.dns.enabled = false;
+
+    let mut node = make_node_with(config);
+    node.start().await.unwrap();
+
+    let main_id = *node
+        .transports
+        .iter()
+        .find(|(_, handle)| handle.name() == Some("main"))
+        .expect("the `main` listener came up")
+        .0;
+
+    let peer_full = Identity::generate();
+    let peer_identity = PeerIdentity::from_pubkey_full(peer_full.pubkey_full());
+    let peer_node_addr = *peer_identity.node_addr();
+    let mut active_peer = ActivePeer::new(peer_identity, LinkId::new(7), Node::now_ms());
+    active_peer.set_current_addr(main_id, TransportAddr::from_string("127.0.0.1:9"));
+    node.peers.insert(peer_node_addr, active_peer);
+
+    let matches = |transport: &str| {
+        let candidate = crate::config::PeerAddress::new(transport, "127.0.0.1:9");
+        node.active_peer_candidate_is_fresh_enough_to_skip(
+            &peer_node_addr,
+            std::slice::from_ref(&candidate),
+        )
+    };
+
+    assert!(
+        matches("udp"),
+        "an unqualified candidate still matches, as it always did",
+    );
+    assert!(
+        matches("udp/main"),
+        "the instance the peer is on is the same path, not an alternative",
+    );
+    assert!(
+        !matches("udp/backup"),
+        "a different instance is a genuinely different path",
+    );
+
+    node.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn node_context_mirrors_config_and_immutable_facades() {
     let mut node = make_node();

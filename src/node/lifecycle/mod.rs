@@ -3195,11 +3195,21 @@ impl Node {
         let current_transport = peer
             .transport_id()
             .and_then(|id| self.transports.get(&id))
-            .map(|transport| transport.transport_type().name);
+            .map(|transport| (transport.transport_type().name, transport.name()));
 
+        // Compare against the candidate's *parsed* transport: a peer address
+        // may name an instance (`"udp/aware"`), while a handle reports its type
+        // and its instance name separately. Comparing the raw field to the type
+        // name would call every instance-qualified address an alternative path,
+        // so a platform lane that re-pushes its peers — Wi-Fi Aware does, on
+        // every NDP callback — would re-dial a peer it is already connected to,
+        // forever.
+        let spec = candidate.spec();
         candidate.addr == current_addr
             && current_transport
-                .map(|transport| transport == candidate.transport)
+                .map(|(kind, instance)| {
+                    kind == spec.kind && spec.instance.is_none_or(|want| instance == Some(want))
+                })
                 .unwrap_or(true)
     }
 
