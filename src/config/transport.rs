@@ -96,6 +96,18 @@ pub struct UdpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_only: Option<bool>,
 
+    /// Dial scoping (`dial_prefixes`): optional list of CIDR prefixes
+    /// (e.g. `["192.168.49.0/24"]`). When set, this instance is *scoped*:
+    /// outbound transport selection uses it only for remote addresses
+    /// inside one of the prefixes — and prefers it over unscoped
+    /// instances there — while generic selection (relay/WAN peers, LAN
+    /// discovery outside the prefixes) skips it entirely. Inbound is
+    /// unaffected. Embedders bind a scoped instance to a secondary
+    /// interface address (e.g. an Android local-only Wi-Fi network) so
+    /// same-link peers are dialed from the socket that interface routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_prefixes: Option<Vec<String>>,
+
     /// Accept inbound handshake msg1 from new peers. Default: true.
     /// Setting this to false combined with `auto_connect: true` on
     /// peer-side configurations gives a "client" posture: this node
@@ -134,6 +146,12 @@ impl UdpConfig {
     /// Get the send buffer size, using default if not configured.
     pub fn send_buf_size(&self) -> usize {
         self.send_buf_size.unwrap_or(DEFAULT_UDP_SEND_BUF)
+    }
+
+    /// Configured dial-scoping prefixes (raw CIDR strings; empty when
+    /// unscoped). Parsing/validation happens at transport construction.
+    pub fn dial_prefixes(&self) -> &[String] {
+        self.dial_prefixes.as_deref().unwrap_or(&[])
     }
 
     /// Whether this UDP transport should be advertised on Nostr discovery.
