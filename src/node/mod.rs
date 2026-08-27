@@ -1040,7 +1040,12 @@ impl Node {
         self.transports
             .iter()
             .find(|(_, handle)| {
-                handle.transport_type().name == transport_type && handle.is_operational()
+                handle.transport_type().name == transport_type
+                    && handle.is_operational()
+                    // Dial-scoped instances (UDP `dial_prefixes`) only serve
+                    // remotes inside their prefixes; a generic "any transport
+                    // of this type" request must never land on one.
+                    && !handle.dial_scoped()
             })
             .map(|(id, _)| *id)
     }

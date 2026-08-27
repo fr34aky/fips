@@ -18,7 +18,7 @@ use crate::nostr::is_punch_packet;
 use io::{AsyncUdpSocket, UdpRawSocket};
 use stats::UdpStats;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -26,6 +26,49 @@ use tracing::{debug, info, trace, warn};
 
 /// DNS cache TTL for hostname resolution (60 seconds).
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// A parsed `dial_prefixes` entry: network address + prefix length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialPrefix {
+    net: IpAddr,
+    len: u8,
+}
+
+impl DialPrefix {
+    /// Parse `"addr/len"` CIDR notation. Returns `None` on malformed
+    /// input or an out-of-range prefix length for the address family.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (addr, len) = s.trim().split_once('/')?;
+        let net: IpAddr = addr.parse().ok()?;
+        let len: u8 = len.parse().ok()?;
+        let max = match net {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        (len <= max).then_some(Self { net, len })
+    }
+
+    /// Whether `ip` falls inside this prefix (same family, leading
+    /// `len` bits equal).
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.net, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = if self.len == 0 { 0 } else { u32::MAX << (32 - self.len as u32) };
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = if self.len == 0 { 0 } else { u128::MAX << (128 - self.len as u32) };
+                (u128::from(net) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+
+    /// Prefix length in bits.
+    pub fn len(&self) -> u8 {
+        self.len
+    }
+}
 
 /// UDP transport for FIPS.
 ///
@@ -56,6 +99,9 @@ pub struct UdpTransport {
     /// Embedder socket-protect hook (Android `VpnService.protect`), applied
     /// to the socket on start/adopt before any traffic is sent.
     socket_protect: Option<crate::transport::SocketProtect>,
+    /// Parsed `dial_prefixes` (empty = unscoped). Malformed config
+    /// entries are dropped with a warning at construction.
+    dial_prefixes: Vec<DialPrefix>,
 }
 
 impl UdpTransport {
@@ -66,6 +112,17 @@ impl UdpTransport {
         config: UdpConfig,
         packet_tx: PacketTx,
     ) -> Self {
+        let dial_prefixes = config
+            .dial_prefixes()
+            .iter()
+            .filter_map(|s| {
+                let parsed = DialPrefix::parse(s);
+                if parsed.is_none() {
+                    warn!(prefix = %s, "udp: ignoring malformed dial_prefixes entry");
+                }
+                parsed
+            })
+            .collect();
         Self {
             transport_id,
             name,
@@ -78,7 +135,24 @@ impl UdpTransport {
             stats: Arc::new(UdpStats::new()),
             dns_cache: StdMutex::new(HashMap::new()),
             socket_protect: None,
+            dial_prefixes,
         }
+    }
+
+    /// Whether this instance is dial-scoped (has at least one parsed
+    /// `dial_prefixes` entry).
+    pub fn dial_scoped(&self) -> bool {
+        !self.dial_prefixes.is_empty()
+    }
+
+    /// Longest configured dial prefix containing `ip`, as a prefix
+    /// length in bits. `None` when unscoped or no prefix matches.
+    pub fn dial_prefix_match(&self, ip: IpAddr) -> Option<u8> {
+        self.dial_prefixes
+            .iter()
+            .filter(|p| p.contains(ip))
+            .map(|p| p.len())
+            .max()
     }
 
     /// Install the embedder socket-protect hook (Android
@@ -636,6 +710,61 @@ mod tests {
             mtu: Some(1280),
             ..Default::default()
         }
+    }
+
+    /// CIDR parsing: valid v4/v6, malformed input, out-of-range lengths.
+    #[test]
+    fn dial_prefix_parse() {
+        assert!(DialPrefix::parse("192.168.49.0/24").is_some());
+        assert!(DialPrefix::parse("fd00::/8").is_some());
+        assert!(DialPrefix::parse(" 10.0.0.0/8 ").is_some(), "trims whitespace");
+        assert!(DialPrefix::parse("192.168.49.0").is_none(), "missing /len");
+        assert!(DialPrefix::parse("192.168.49.0/33").is_none(), "v4 len > 32");
+        assert!(DialPrefix::parse("fd00::/129").is_none(), "v6 len > 128");
+        assert!(DialPrefix::parse("not-an-ip/24").is_none());
+        assert!(DialPrefix::parse("192.168.49.0/abc").is_none());
+    }
+
+    /// Containment: family mismatch never matches; /0 matches everything
+    /// in-family; boundary bits respected.
+    #[test]
+    fn dial_prefix_contains() {
+        let p = DialPrefix::parse("192.168.49.0/24").unwrap();
+        assert!(p.contains("192.168.49.7".parse().unwrap()));
+        assert!(!p.contains("192.168.50.7".parse().unwrap()));
+        assert!(!p.contains("fd00::1".parse().unwrap()), "family mismatch");
+
+        let v6 = DialPrefix::parse("fe80::/10").unwrap();
+        assert!(v6.contains("fe80::1234".parse().unwrap()));
+        assert!(!v6.contains("fd00::1".parse().unwrap()));
+
+        let all4 = DialPrefix::parse("0.0.0.0/0").unwrap();
+        assert!(all4.contains("203.0.113.9".parse().unwrap()));
+        assert!(!all4.contains("::1".parse().unwrap()), "v4 /0 is still v4-only");
+    }
+
+    /// Transport-level scoping: malformed entries dropped, longest
+    /// matching prefix wins, unscoped transport reports no match.
+    #[test]
+    fn dial_prefix_scoping_on_transport() {
+        let (tx, _rx) = packet_channel(10);
+        let config = UdpConfig {
+            dial_prefixes: Some(vec![
+                "192.168.0.0/16".to_string(),
+                "192.168.49.0/24".to_string(),
+                "bogus".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let t = UdpTransport::new(TransportId::new(1), None, config, tx.clone());
+        assert!(t.dial_scoped());
+        assert_eq!(t.dial_prefix_match("192.168.49.7".parse().unwrap()), Some(24));
+        assert_eq!(t.dial_prefix_match("192.168.2.7".parse().unwrap()), Some(16));
+        assert_eq!(t.dial_prefix_match("10.0.0.1".parse().unwrap()), None);
+
+        let unscoped = UdpTransport::new(TransportId::new(2), None, UdpConfig::default(), tx);
+        assert!(!unscoped.dial_scoped());
+        assert_eq!(unscoped.dial_prefix_match("192.168.49.7".parse().unwrap()), None);
     }
 
     #[tokio::test]

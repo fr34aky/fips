@@ -832,6 +832,26 @@ impl TransportHandle {
         }
     }
 
+    /// Whether this transport is dial-scoped to specific prefixes (UDP
+    /// `dial_prefixes`). Scoped instances are only selected for remotes
+    /// inside their prefixes and are skipped by generic outbound
+    /// selection and the mDNS advertised-port pick.
+    pub fn dial_scoped(&self) -> bool {
+        match self {
+            TransportHandle::Udp(t) => t.dial_scoped(),
+            _ => false,
+        }
+    }
+
+    /// Longest configured dial prefix containing `ip` (UDP only), as a
+    /// prefix length in bits.
+    pub fn dial_prefix_match(&self, ip: std::net::IpAddr) -> Option<u8> {
+        match self {
+            TransportHandle::Udp(t) => t.dial_prefix_match(ip),
+            _ => None,
+        }
+    }
+
     /// Get the local bound address (UDP/TCP only, returns None for other transports).
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match self {

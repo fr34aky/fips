@@ -406,23 +406,50 @@ impl Node {
     /// service. A wildcard IPv4 socket cannot send to an IPv6 link-local
     /// target, and vice versa, so callers must choose by socket family rather
     /// than by transport type alone.
+    ///
+    /// Dial-scoped instances (UDP `dial_prefixes`) are consulted first: a
+    /// remote inside a scoped instance's prefix is dialed from that instance
+    /// (longest prefix wins, then lowest transport id — HashMap-driven id
+    /// allocation makes id order across instances nondeterministic, so the
+    /// prefix must decide, not the id). Remotes outside every prefix never
+    /// use a scoped instance: on Android a scoped socket is bound to a
+    /// local-only secondary network that cannot reach the WAN.
     fn find_udp_transport_for_remote_addr(
         &self,
         remote_addr: SocketAddr,
     ) -> Option<(TransportId, SocketAddr)> {
-        self.transports
-            .iter()
-            .filter(|(id, handle)| {
-                handle.transport_type().name == "udp"
-                    && handle.is_operational()
-                    && !self.supervisor.nostr_rendezvous.is_bootstrap_transport(id)
-            })
-            .filter_map(|(id, handle)| {
-                let local_addr = handle.local_addr()?;
-                socket_addr_families_compatible(local_addr, remote_addr)
-                    .then_some((*id, local_addr))
-            })
-            .min_by_key(|(id, _)| id.as_u32())
+        let mut best_scoped: Option<(u8, TransportId, SocketAddr)> = None;
+        let mut best_unscoped: Option<(TransportId, SocketAddr)> = None;
+        for (id, handle) in self.transports.iter().filter(|(id, handle)| {
+            handle.transport_type().name == "udp"
+                && handle.is_operational()
+                && !self.supervisor.nostr_rendezvous.is_bootstrap_transport(id)
+        }) {
+            let Some(local_addr) = handle.local_addr() else {
+                continue;
+            };
+            if !socket_addr_families_compatible(local_addr, remote_addr) {
+                continue;
+            }
+            if handle.dial_scoped() {
+                if let Some(plen) = handle.dial_prefix_match(remote_addr.ip()) {
+                    let better = match best_scoped {
+                        None => true,
+                        Some((best_plen, best_id, _)) => {
+                            plen > best_plen || (plen == best_plen && id.as_u32() < best_id.as_u32())
+                        }
+                    };
+                    if better {
+                        best_scoped = Some((plen, *id, local_addr));
+                    }
+                }
+            } else if best_unscoped.is_none_or(|(best_id, _)| id.as_u32() < best_id.as_u32()) {
+                best_unscoped = Some((*id, local_addr));
+            }
+        }
+        best_scoped
+            .map(|(_, id, local_addr)| (id, local_addr))
+            .or(best_unscoped)
     }
 
     /// Initiate a connection to a peer on a specific transport and address.
@@ -1596,6 +1623,7 @@ impl Node {
                         .filter(|(id, h)| {
                             h.transport_type().name == "udp"
                                 && h.is_operational()
+                                && !h.dial_scoped()
                                 && !self.supervisor.nostr_rendezvous.is_bootstrap_transport(id)
                         })
                         .filter_map(|(id, h)| h.local_addr().map(|addr| (*id, addr.port())))
