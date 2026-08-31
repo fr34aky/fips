@@ -618,6 +618,9 @@ jobs:
           # ── Firewall baseline (fips0 nftables default-deny) ────────────
           - suite: firewall
             type: firewall
+          # ── Dynamic interface binding (absent → present → absent) ──────
+          - suite: iface-binding
+            type: iface-binding
           # ── Outbound LAN gateway integration test ──────────────────────
           - suite: gateway
             type: gateway
@@ -633,6 +636,9 @@ jobs:
           - suite: ethernet-only
             type: chaos
             scenario: ethernet-only
+          - suite: ethernet-churn
+            type: chaos
+            scenario: ethernet-churn
           - suite: tcp-mesh
             type: chaos
             scenario: tcp-mesh
@@ -767,6 +773,22 @@ jobs:
         if: matrix.type == 'firewall' && always()
         run: |
           docker compose -f testing/firewall/docker-compose.yml down --volumes --remove-orphans
+
+      # ── Dynamic interface binding integration test ─────────────────────────
+      - name: Run interface binding integration test
+        if: matrix.type == 'iface-binding'
+        run: bash testing/iface-binding/test.sh --skip-build --keep-up
+
+      - name: Collect logs on failure (iface-binding)
+        if: matrix.type == 'iface-binding' && failure()
+        run: |
+          docker compose -f testing/iface-binding/docker-compose.yml logs --no-color
+          docker exec fips-ifb-node-a fipsctl show transports || true
+
+      - name: Stop containers (iface-binding)
+        if: matrix.type == 'iface-binding' && always()
+        run: |
+          docker compose -f testing/iface-binding/docker-compose.yml down --volumes --remove-orphans
 
       # ── Chaos simulation ───────────────────────────────────────────────────
       - name: Install Python deps (chaos)
