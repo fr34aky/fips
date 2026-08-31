@@ -181,6 +181,21 @@ pub enum NodeError {
     NoOperationalTransports,
 }
 
+impl Node {
+    /// Test-only: place a transport into the node's map directly.
+    ///
+    /// The snapshot tests live in `crate::control` and so cannot reach the
+    /// private `transports` field, but the interface-presence block they need
+    /// to pin only exists on a real interface-bound transport. Mirrors
+    /// `isolate_peer_acl_for_test`: a narrow hook, so the fixture stays honest
+    /// rather than the snapshot being hand-authored JSON that nothing
+    /// produces.
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn insert_transport_for_test(&mut self, id: TransportId, handle: TransportHandle) {
+        self.transports.insert(id, handle);
+    }
+}
+
 impl NodeError {
     /// Whether this failure is expected to clear on its own.
     ///

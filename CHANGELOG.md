@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed_attempts`. The original boot-race bug was expensive precisely because
   nothing an operator could see said the node was deaf.
 
+- `fipstop`'s transports view carries the same interface presence. The State
+  column shows an interface-bound transport's presence rather than its
+  lifecycle state — `up` is true from the moment the transport starts and stays
+  true while its interface is missing, which is precisely the wrong answer in
+  the one case someone is scanning that column for — and a new Policy column
+  reads `required` or `optional` beside it, with an absent required interface
+  red and an absent optional one yellow: the same split the daemon makes
+  between staying `Full` and reporting `Degraded`. The instance name and the
+  thing a transport is bound to are now separate columns, so netdev names line
+  up down the list instead of trailing ragged inside a packed label. The detail
+  pane gains an Interface block: netdev, presence and how long it has been
+  held, carrier, what the absence policy means rather than which key sets it,
+  bind count (flagged once it has rebound) and failed binds when there are any.
+  The table fits an 80-column terminal — the OpenWrt serial console and the
+  xterm and tmux default — dropping the byte counters below 100 columns and
+  stacking the detail pane below 110, rather than shrinking every column until
+  none of them can be read.
+
 - `testing/iface-binding/` integration suite (`ci-local.sh --only
   iface-binding`, and a GitHub matrix leg): two daemons whose only transports
   are interface-bound, run against a veth pair the harness creates, downs,
