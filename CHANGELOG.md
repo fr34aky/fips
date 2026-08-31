@@ -156,6 +156,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is marked `optional: true` for the same reason: it only exists while a radio
   is in station mode.
 
+  **Upgrade note: an existing `/etc/fips/fips.yaml` is preserved and does not
+  gain the new key.** It is a package conffile, so on a router where
+  `fips-mesh-setup` or `fips-ap-setup` had already uncommented a block, that
+  block stays as it was, with no `optional` key — and `optional` defaults to
+  false. Such a block is therefore `required`, so an absent `fips-mesh0` keeps
+  the node `Degraded` and is reported once at `error` ten seconds in, where the
+  same block in the shipped file is silent. Add `optional: true` to the block
+  to match what the package now ships.
+
 - The Ethernet receive loop backs off and exits on a dead socket instead of
   spinning on `Err` with a `warn!` per iteration, and the ad-hoc ENXIO
   socket-reopen in the beacon sender is gone. Both hand recovery to the
