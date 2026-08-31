@@ -148,6 +148,12 @@ pub(crate) fn plan_initiate(request: &LookupRequest, rv: &impl RoutingView) -> V
 pub(crate) enum RequestOutcome {
     /// request_id already in the dedup cache — drop.
     Duplicate,
+    /// A request this node originated, looped back to it — drop without
+    /// recording. Kept separate from `Duplicate`, which means another node
+    /// resent a request, so the two do not share a rejection counter: this
+    /// one has a nonzero floor in healthy operation and says nothing about
+    /// the peer that delivered it.
+    OwnRequestLooped,
     /// We are the lookup target — the shell generates + sends the response.
     RespondAsTarget,
     /// Forward the request onward (the shell calls the forward planner).
@@ -267,13 +273,27 @@ pub(crate) fn classify_request(
     // request instead of being accepted here. Dropping it as the duplicate it
     // is also stops the copy being forwarded a second time: our flood already
     // reached the peers that could carry it.
+    //
+    // `request.origin` looks like the cheaper identity test and cannot be
+    // used. It is unsigned and set by whoever sends the frame, so a peer
+    // could put this node's address on any request and make it refuse to
+    // transit that request. An id has to have been issued here to match,
+    // which is what makes this test safe to drop on.
+    //
+    // The test reaches only as far as `PendingLookup::ids`, which keeps the
+    // last `MAX_RECORDED_IDS` that a target's ladder issued. A ladder
+    // configured with more rungs than that loses its earliest ids, and a
+    // returning copy of one of those attempts is recorded as transit again.
+    // The bound is inherited from the originator test in `classify_response`
+    // rather than introduced here, and a reply to such an attempt was already
+    // being dropped as unsolicited.
     if lookup
         .pending_lookups
         .get(&request.target)
         .is_some_and(|pending| pending.matches(request.request_id))
     {
         return Classification {
-            outcome: RequestOutcome::Duplicate,
+            outcome: RequestOutcome::OwnRequestLooped,
             evicted: None,
         };
     }

@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   succeeded, and the failure grew likelier as the bloom fill ratio rose.
   Contributed by Arjen.
 
+- A lookup request of this node's own, returning to it, is no longer counted as
+  a duplicate from the peer that delivered it. The fix above drops that copy,
+  and it recorded the drop under the existing `req_duplicate` rejection, whose
+  documented meaning is that a peer resent a request. A returning copy has a
+  nonzero floor in healthy operation and rises with the bloom fill ratio, so
+  folding the two together put a permanent number on a counter an operator
+  reads as neighbour misbehaviour, and made the two events indistinguishable.
+  It now has its own rejection reason and counter, `req_own_loopback`, shown in
+  `fipstop` as "Own Loopback". `req_duplicate` returns to meaning only what it
+  says.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added

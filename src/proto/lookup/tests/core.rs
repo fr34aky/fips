@@ -489,7 +489,12 @@ fn classify_request_drops_our_own_request_looped_back_to_us() {
     pending.record(77);
     lookup.pending_lookups.insert(target, pending);
 
-    let request = make_request_id(77, target, 3);
+    // Built here rather than through `make_request_id`, whose origin is a
+    // third party: the defect is our *own* request returning, so the request
+    // under test has to carry our address as its origin. The guard keys on
+    // the id and ignores the origin, so this asserts the same behaviour the
+    // helper would; it asserts it on the shape the defect actually has.
+    let request = LookupRequest::new(77, target, my_addr, TreeCoordinate::root(my_addr), 3, 0);
     let classification = classify_request(
         &mut lookup,
         &request,
@@ -500,7 +505,10 @@ fn classify_request_drops_our_own_request_looped_back_to_us() {
         4096,
         1,
     );
-    assert!(matches!(classification.outcome, RequestOutcome::Duplicate));
+    assert!(matches!(
+        classification.outcome,
+        RequestOutcome::OwnRequestLooped
+    ));
     assert!(classification.evicted.is_none());
     // Crucially, our own id must not enter the transit dedup cache.
     assert!(!lookup.recent_requests.contains_key(&77));
