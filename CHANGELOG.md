@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Discovery
+
+- A node no longer relays away the answer to its own lookup. A request is
+  flooded to every tree peer whose bloom filter claims the target, so a false
+  positive can send a copy out into the wider network and circulate it back to
+  the node that originated it. The only identity test on arrival was whether
+  the request named this node as the target, which a lookup this node
+  originated never satisfies, so the copy was filed in the request dedup cache
+  as ordinary transit under this node's own `request_id`. When the target
+  answered, the reply was reverse-path forwarded to the peer that looped the
+  request, the pending lookup was never satisfied, and discovery reported that
+  its requests went unanswered while the answers were in fact arriving. An
+  inbound response is now matched against this node's outstanding lookups
+  before the transit dedup record, and a returning copy of this node's own
+  request is dropped as the duplicate it is rather than recorded, so that id
+  never enters the transit cache at all. This was a race rather than a hard
+  failure: a reply that beat the looped copy found a clean cache and
+  succeeded, and the failure grew likelier as the bloom fill ratio rose.
+  Contributed by Arjen.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added
