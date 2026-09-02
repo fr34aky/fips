@@ -1208,14 +1208,21 @@ the same socket. The supervisor learns about presence
 (`Event::ChildAbsent` / `Event::ChildPresent`) and republishes health; it does
 not drive rebinding.
 
-Peer state needs no separate grace period. A send over an absent interface
-returns `InterfaceUnavailable` and the peer entry survives untouched, so peers
-are already held across a detach and resume when the interface returns; the
-liveness reaper is the effective linger bound. A recreated mesh interface
-comes back with the same MAC (it is derived from the phy) and Noise sessions
-are keyed on the remote peer, so a local rebind is invisible to peers. A
-dedicated linger timer would be a second answer to a question already
-answered.
+Peer state gets no grace period, and needs none. A transport's detach edge
+withdraws every peer whose active link runs over it, on the same path the
+liveness reaper uses, so those peers and the routes through them are gone at
+the edge rather than up to `link_dead_timeout_secs` later — there is nothing
+left for a linger timer to bound. A send over an absent interface still
+returns `InterfaceUnavailable`, and a *half-built* link is still held on that
+error, because the binder is already working to bring the interface back and
+the initiator's resend has somewhere to land; an established peer is not held.
+The trade is deliberate: an absence shorter than the dead timeout that then
+recovers now costs a re-peer where it previously cost nothing, and that is
+accepted because black-holing is silent, poisons other nodes' routing and
+takes the full timeout to clear, where a re-peer is bounded, visible and
+self-healing. A recreated mesh interface comes back with the same MAC (it is
+derived from the phy), so the local address peers hold is unchanged across the
+rebind.
 
 ### Logging
 

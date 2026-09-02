@@ -2215,3 +2215,181 @@ async fn a_first_epoch_change_against_a_silent_peering_still_restarts_it() {
         "the replacement must carry the epoch the msg1 announced"
     );
 }
+
+/// A transient send failure during msg2 leaves the half-built link alone.
+///
+/// The interface under the transport is absent or mid-rebind, and the binder
+/// is already working to bring it back. Tearing the link down here meant the
+/// initiator's msg1 resend had nothing to land on, and — worse — recorded
+/// `HandshakeReject::BadState`, a counter whose whole meaning is "the remote
+/// sent something invalid". A local interface flap is not the remote's fault,
+/// and an operator reading that counter would conclude it was.
+///
+/// Nothing leaks by staying: an initiator that never resends leaves a stale
+/// connection, which `check_timeouts` reaps at `handshake_timeout_secs` like
+/// any other abandoned handshake.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_transient_msg2_failure_keeps_the_link_for_the_retry() {
+    use crate::config::EthernetConfig;
+    use crate::proto::fmp::wire::build_msg1;
+    use crate::transport::TransportHandle;
+    use crate::transport::ethernet::EthernetTransport;
+
+    let mut node_b = make_node();
+    let node_a = make_node();
+    let transport_id = TransportId::new(1);
+    node_b.supervisor.state = NodeState::Running;
+
+    // An interface no host has, so every send off this transport reports
+    // `InterfaceUnavailable` — the real error, from the real code path,
+    // rather than a stub that merely returns something transient.
+    let config = EthernetConfig {
+        interface: "fips-absent-x0".to_string(),
+        ethertype: None,
+        mtu: None,
+        recv_buf_size: None,
+        send_buf_size: None,
+        listen: Some(true),
+        announce: Some(false),
+        auto_connect: None,
+        accept_connections: Some(true),
+        beacon_interval_secs: None,
+        optional: Some(true),
+    };
+    let (tx, _rx) = crate::transport::packet_channel(8);
+    let mut eth = EthernetTransport::new(transport_id, Some("lab".into()), config, tx);
+    eth.start_async()
+        .await
+        .expect("an absent interface is not a start failure");
+    node_b
+        .transports
+        .insert(transport_id, TransportHandle::Ethernet(eth));
+
+    let rejects_before = node_b.stats().handshake.snapshot().bad_state;
+
+    let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
+    let mut conn_a = outbound_leg(LinkId::new(1), peer_b_identity, 1000);
+    let noise_msg1 = conn_a
+        .start_handshake(node_a.identity().keypair(), node_a.startup_epoch(), 1000)
+        .unwrap();
+    let wire_msg1 = build_msg1(SessionIndex::new(7), &noise_msg1);
+    let packet = ReceivedPacket::with_timestamp(
+        transport_id,
+        TransportAddr::from_string("aa:bb:cc:dd:ee:ff"),
+        wire_msg1,
+        1000,
+    );
+
+    node_b.handle_msg1(packet).await;
+
+    assert_eq!(
+        node_b.link_count(),
+        1,
+        "the link must survive a transport that is merely between interfaces"
+    );
+    assert_eq!(
+        node_b.stats().handshake.snapshot().bad_state,
+        rejects_before,
+        "a local interface flap must not be recorded as the peer's misbehaviour"
+    );
+}
+
+/// A transient msg2 failure on the RESTART path leaves the fresh leg pending.
+///
+/// The epoch-mismatch restart arm tears the stale peering down in Phase 1 and
+/// then sends msg2 for the fresh leg. When the interface under the transport is
+/// absent, that send is deferred rather than failed, so `PromoteToActive` never
+/// runs and the machine stays registered at `Handshaking{ReceivedMsg1}` — a
+/// third outcome the arm's post-promote `debug_assert!` did not admit. Without
+/// that assertion widened, this test panics at the assertion in any build with
+/// debug assertions on, which is every `cargo test` and every `cargo build`
+/// without `--release`.
+///
+/// It also pins the deferral's own contract on this arm: the half-built link
+/// survives for the initiator's msg1 resend, and a local interface flap is not
+/// charged to the peer as `HandshakeReject::BadState`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_transient_msg2_failure_on_the_restart_path_leaves_the_fresh_leg_pending() {
+    use crate::config::EthernetConfig;
+    use crate::peer::machine::{HandshakePhase, PeerState};
+    use crate::transport::TransportHandle;
+    use crate::transport::ethernet::EthernetTransport;
+
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let source_addr = TransportAddr::from_string("aa:bb:cc:dd:ee:ff");
+    node.supervisor.state = NodeState::Running;
+
+    // An interface no host has, so every send off this transport reports
+    // `InterfaceUnavailable` — the real error from the real code path.
+    let config = EthernetConfig {
+        interface: "fips-absent-x0".to_string(),
+        ethertype: None,
+        mtu: None,
+        recv_buf_size: None,
+        send_buf_size: None,
+        listen: Some(true),
+        announce: Some(false),
+        auto_connect: None,
+        accept_connections: Some(true),
+        beacon_interval_secs: None,
+        optional: Some(true),
+    };
+    let (tx, _rx) = crate::transport::packet_channel(8);
+    let mut eth = EthernetTransport::new(transport_id, Some("lab".into()), config, tx);
+    eth.start_async()
+        .await
+        .expect("an absent interface is not a start failure");
+    node.transports
+        .insert(transport_id, TransportHandle::Ethernet(eth));
+
+    let stale_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &source_addr,
+        IDLE_SECS,
+    );
+    let rejects_before = node.stats().handshake.snapshot().bad_state;
+
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        source_addr.clone(),
+        genuine_msg1(&initiator, &node),
+        Node::now_ms(),
+    ))
+    .await;
+
+    let fresh_link = node
+        .addr_to_link
+        .get(&(transport_id, source_addr.clone()))
+        .copied()
+        .expect("the fresh leg's reverse map entry must survive the deferral");
+    assert_ne!(
+        fresh_link, stale_link,
+        "the restart must have replaced the stale link, not kept it"
+    );
+    assert!(
+        matches!(
+            node.peer_machines.get(&fresh_link).map(|m| m.state()),
+            Some(PeerState::Handshaking {
+                phase: HandshakePhase::ReceivedMsg1,
+                ..
+            })
+        ),
+        "a deferred msg2 must leave the machine pending, not promoted and not gone"
+    );
+    assert!(
+        node.get_peer(&initiator_addr).is_none(),
+        "no promotion can have happened: PromoteToActive never ran"
+    );
+    assert_eq!(
+        node.stats().handshake.snapshot().bad_state,
+        rejects_before,
+        "a local interface flap must not be recorded as the peer's misbehaviour"
+    );
+}

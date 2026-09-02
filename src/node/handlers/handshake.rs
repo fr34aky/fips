@@ -933,8 +933,14 @@ impl Node {
 
                 // Post-`Promoted` shell tail (byte-identical to the pre-refactor
                 // Promoted arm), reached only when promotion succeeded (machine now
-                // Established); a send/promote failure removed the machine and
-                // already cleaned up.
+                // Established). Three outcomes reach this line: a terminal send
+                // failure or a promote failure removed the machine, leaving it
+                // absent; a TRANSIENT msg2 send failure aborted the queue before
+                // `PromoteToActive` ran and deliberately left the half-built leg in
+                // place, so the machine is still registered at
+                // `Handshaking{ReceivedMsg1}` (`peer_actions.rs`, the
+                // `is_transient` branch); or promotion succeeded. The tail below is
+                // gated on `Established`, so only the third runs it.
                 //
                 // DEFENSIVE CROSS-CONNECTION: the machine's
                 // `PromotionResolved{CrossConnectionWon/Lost}` follow-ups run the
@@ -944,11 +950,16 @@ impl Node {
                 // path: Phase-1 `remove_active_peer` removed `peers[addr]`, so
                 // `promote_connection` returns `Promoted`. The full cross-connection
                 // link surgery is wired later; the
-                // debug_assert below catches any regression that reaches a non-
-                // Established, non-absent state.
+                // debug_assert below catches any regression that reaches a state
+                // other than those three.
                 debug_assert!(matches!(
                     self.peer_machines.get(&link_id).map(|m| m.state()),
-                    Some(PeerState::Established { .. }) | None
+                    Some(PeerState::Established { .. })
+                        | Some(PeerState::Handshaking {
+                            phase: HandshakePhase::ReceivedMsg1,
+                            ..
+                        })
+                        | None
                 ));
                 if matches!(
                     self.peer_machines.get(&link_id).map(|m| m.state()),
@@ -1061,9 +1072,13 @@ impl Node {
                 // sends msg2 (bytes identical to `wire_msg2`), promotes via
                 // `promote_connection`, feeds PromotionResolved back, and runs the
                 // inert RegisterDecryptSession (register stays in
-                // `promote_connection`). Its send-failure / promote-failure arms
-                // run the pre-refactor cleanup and remove the machine, leaving it
-                // absent (not Established).
+                // `promote_connection`). Its TERMINAL send-failure and its
+                // promote-failure arms run the pre-refactor cleanup and remove the
+                // machine, leaving it absent (not Established); its TRANSIENT
+                // send-failure arm aborts the queue before `PromoteToActive` and
+                // leaves the machine registered at `Handshaking{ReceivedMsg1}` for
+                // the initiator's msg1 resend to land on. The `Established` gate
+                // below covers all three.
                 let ambient = PeerActionCtx {
                     verified_identity: peer_identity,
                     transport_id: packet.transport_id,
@@ -1078,8 +1093,10 @@ impl Node {
 
                 // Post-`Promoted` shell tail (byte-identical to the pre-refactor
                 // Promoted arm), reached only when promotion succeeded (the machine
-                // is now Established); a send/promote failure removed the machine
-                // and already cleaned up.
+                // is now Established); a terminal send failure or a promote failure
+                // removed the machine and already cleaned up, and a transient send
+                // failure left it registered at `Handshaking{ReceivedMsg1}` — which
+                // is what the gate below is for.
                 if matches!(
                     self.peer_machines.get(&link_id).map(|m| m.state()),
                     Some(PeerState::Established { .. })

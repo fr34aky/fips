@@ -237,6 +237,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Node lifecycle
 
+- Losing an interface no longer leaves its peers in the routing table. The
+  peers stayed in the registry, the routes through them stayed selectable, and
+  the node kept advertising reachability it no longer had — so transit traffic
+  was dropped in silence and other nodes kept routing toward this one for those
+  destinations, until the liveness reaper noticed up to
+  `node.link_dead_timeout_secs` later. Measured on real hardware, a detached
+  dongle took the node's parent with it and no new parent was chosen for
+  twenty-seven seconds, with four alternative peers available the whole time. A
+  transport's detach edge now withdraws every peer whose active link runs over
+  it, on the same path the liveness reaper uses, so sessions, path MTU, session
+  indices, the link, the control machine, tree cleanup and re-announce, and
+  bloom withdrawal unwind exactly as they already did. It is not filtered by
+  `optional`: whether an interface's absence is normal is a statement about
+  node health, and says nothing about whether the routes over it still work.
+  The trade is that an absence shorter than the dead timeout that then recovers
+  now costs a re-peer where it previously cost nothing, accepted because
+  black-holing is silent, poisons other nodes' routing and takes the full
+  timeout to clear, where a re-peer is bounded, visible and self-healing.
+
+- A local interface flap during a handshake is no longer charged to the remote.
+  A msg2 send refused because the interface is absent or mid-rebind was treated
+  as a failed handshake: the link was removed, the reverse-address entry
+  dropped, the session index freed, the control machine torn down, and the
+  whole thing recorded under the reject reason that means "the remote sent
+  something invalid", which is what an operator reading the rejects would have
+  concluded. The initiator meanwhile resent msg1 into a link that no longer
+  existed and had to rebuild from nothing. A transport error the daemon is
+  already working to clear now leaves the half-built link exactly where it is
+  for that resend to land on; only a terminal error still tears down, and a
+  link nobody resends to is reaped at `node.rate_limit.handshake_timeout_secs`
+  like every other abandoned handshake. The rekey msg1 send site keeps its
+  teardown, which was already benign, and stops reporting a local self-clearing
+  condition at `warn`.
+
 - A heartbeat whose send failed no longer counts as one that was delivered.
   The peer's "last heartbeat" timestamp was stamped before the send and left
   alone whatever came back, so a failure suppressed the next attempt for a
