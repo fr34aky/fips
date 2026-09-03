@@ -25,6 +25,23 @@ pub mod ethernet;
 #[cfg(unix)]
 pub(crate) mod watcher;
 
+/// Presence lifecycle for a transport bound to a local resource that can
+/// disappear and come back: the phase machine, the absence policy, and the
+/// damping that keeps a flapping resource from flapping node health with it.
+///
+/// Transport-agnostic on purpose. Only the *probe* — "is my thing there, and
+/// is it still the same one?" — is specific to what is bound, and that stays
+/// with the transport that knows how to ask.
+///
+/// Crate-internal on purpose, for the same reason as `watcher` above: it is a
+/// mechanism the crate's own transports share, not a surface an embedder
+/// builds against. `ethernet` re-exports the two types it used to own, so the
+/// published path stays `transport::ethernet::{AbsencePolicy, Presence}`.
+/// Gated with the one transport that binds through it today; widen the gate
+/// when a second binder arrives.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod presence;
+
 #[cfg(ble_available)]
 pub mod ble;
 
