@@ -271,6 +271,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   teardown, which was already benign, and stops reporting a local self-clearing
   condition at `warn`.
 
+- A peer reachable over two interfaces is no longer re-dialled on the path it
+  is not using. Beacon discovery skipped only a candidate naming the peer's
+  *current* path, which is the one case that could not churn anything, so the
+  alternate path was dialled every discovery tick; each dial that completed
+  promoted and displaced a healthy incumbent, tore down the session, and, when
+  that peer was the parent, switched parents and re-announced mesh-wide.
+  Measured on real hardware, seventeen dials to one peer in fifteen minutes,
+  alternating wifi and cable, displacing a link reporting etx 1.0 and loss 0.0.
+  Discovery now asks whether the link it already holds is answering rather than
+  which path the candidate names. Failover is unchanged: a peer that goes quiet
+  for longer than `node.heartbeat_interval_secs` is dialled again on every
+  path, alternate included. **One behaviour goes with it.** A peer held on an
+  adopted NAT-traversal transport that is *also* reachable by Ethernet or BLE
+  beacon used to drift onto the local path on the next discovery tick, and now
+  stays on the traversed path for as long as that path answers. Migrating it is
+  still done by the configured-peer refresh (a config reload, a runtime peer
+  update, or `fipsctl connect`), and a traversed link that goes quiet still
+  releases the peer to every path.
+
 - A heartbeat whose send failed no longer counts as one that was delivered.
   The peer's "last heartbeat" timestamp was stamped before the send and left
   alone whatever came back, so a failure suppressed the next attempt for a
