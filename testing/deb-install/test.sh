@@ -51,6 +51,11 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# Set by --deb. DEB_PREPARED keeps the copy-into-cache to a single operation
+# however many scenarios run in one process.
+SUPPLIED_DEB=""
+DEB_PREPARED=0
+
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
@@ -169,6 +174,25 @@ container_systemd_version() {
 build_deb() {
     mkdir -p "$DEB_CACHE_DIR"
 
+    # A supplied package wins outright and bypasses the staleness check below.
+    # That check compares mtimes, so a cached package could otherwise beat the
+    # artifact the caller explicitly handed over, which is exactly the silent
+    # substitution this suite exists to stop making.
+    if [ -n "$SUPPLIED_DEB" ]; then
+        if [ "$DEB_PREPARED" -eq 1 ]; then
+            return 0
+        fi
+        if [ ! -f "$SUPPLIED_DEB" ]; then
+            echo "  ERROR: --deb $SUPPLIED_DEB does not exist" >&2
+            return 1
+        fi
+        rm -f "$DEB_CACHE_DIR"/*.deb
+        cp "$SUPPLIED_DEB" "$DEB_CACHE_DIR/"
+        DEB_PREPARED=1
+        log "Installing the supplied package $(basename "$SUPPLIED_DEB")"
+        return 0
+    fi
+
     local cached_deb
     cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
 
@@ -188,45 +212,25 @@ build_deb() {
         log "No cached .deb, building"
     fi
 
-    local builder_tag="fips-deb-test:builder"
-    log "Building Debian 12 cargo-deb builder image (slow on first run)"
-    docker build -t "$builder_tag" -f - "$REPO_ROOT" <<'DOCKERFILE' >/dev/null
-FROM debian:12
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config libdbus-1-dev curl ca-certificates \
-    libclang-dev clang && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install cargo-deb --version 3.6.3 --locked
-WORKDIR /src
-COPY Cargo.toml Cargo.lock build.rs LICENSE README.md ./
-COPY src ./src
-COPY packaging ./packaging
-COPY docs ./docs
-RUN cargo build --release && cargo deb --no-build
-DOCKERFILE
-
-    if [ ! "$(docker images -q "$builder_tag" 2>/dev/null)" ]; then
-        echo "  ERROR: builder image build failed"
+    # Build through the shared container script rather than a builder defined
+    # here. This suite used to compile its own package inside a Debian 12 image
+    # while the release compiled on the newest GitHub runner, so the package it
+    # tested had a lower glibc floor than the package users received and could
+    # not exhibit a defect that only the release environment produced. It stayed
+    # green through five releases that could not start on two of the five
+    # distributions in its own matrix.
+    log "Building the .deb in the pinned build container (slow on first run)"
+    if ! bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
+            --output-dir "$DEB_CACHE_DIR" >&2; then
+        echo "  ERROR: container build failed" >&2
         return 1
     fi
 
-    log "Extracting .deb from builder image"
-    rm -f "$DEB_CACHE_DIR"/*.deb
-    local cid
-    cid=$(docker create "$builder_tag")
-    docker cp "$cid:/src/target/debian/." "$DEB_CACHE_DIR/" >/dev/null 2>&1
-    docker rm "$cid" >/dev/null
-    # Cargo-deb leaves intermediate artifacts; keep just the .deb.
-    find "$DEB_CACHE_DIR" -mindepth 1 -not -name 'fips_*_amd64.deb' -delete 2>/dev/null || true
     cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
     if [ -n "$cached_deb" ]; then
         log "Cached at $cached_deb ($(stat -c %s "$cached_deb") bytes)"
     else
-        echo "  ERROR: no .deb produced by cargo-deb"
+        echo "  ERROR: no .deb produced by the container build" >&2
         return 1
     fi
 }
@@ -564,6 +568,35 @@ test_ubuntu26() { _run_deb_install_scenario ubuntu26 ubuntu:26.04;  }
 # ─────────────────────────────────────────────────────────────────────
 
 ALL_SCENARIOS="debian12 debian13 ubuntu22 ubuntu24 ubuntu26"
+
+# `--deb PATH` installs a package the caller already built, which is how one
+# build serves all five distributions and how GitHub CI and a local run come to
+# do the same work: both build once through the container script and hand the
+# result here. Keep ALL_SCENARIOS above on its own line at column zero;
+# check-ci-parity.sh reads it to compare this matrix against the GitHub one.
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --deb)
+            SUPPLIED_DEB="${2:?--deb requires a path}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: test.sh [--deb PATH] [scenario ...]"
+            echo "scenarios: $ALL_SCENARIOS"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            _args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 if [ $# -eq 0 ]; then
     scenarios="$ALL_SCENARIOS"
