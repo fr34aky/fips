@@ -999,13 +999,25 @@ run_dns_resolver() {
 }
 
 # Run deb-install harness (multi-distro real-package install)
+#
+# Bounded because this worker is what gates artifact publication: a suite that
+# hangs stops every branch publishing, which is worse than a red. The harness
+# bounds its own service starts now, so this is the backstop for anything else
+# that wedges -- a docker daemon that stops answering, a container that never
+# boots. 40 minutes is well above the observed cold-cache cost of a full
+# five-distro run and is not a performance budget.
+DEB_INSTALL_TIMEOUT=${DEB_INSTALL_TIMEOUT:-2400}
 run_deb_install() {
     info "[deb-install] Running multi-distro test (slow — builds .deb + per-distro install)"
-    if bash testing/deb-install/test.sh 2>&1; then
-        record "deb-install" 0
-    else
-        record "deb-install" 1
+    local rc=0
+    timeout "$DEB_INSTALL_TIMEOUT" bash testing/deb-install/test.sh 2>&1 || rc=$?
+    if [[ $rc -eq 124 ]]; then
+        # Say so explicitly. A bare red here reads as a failed assertion, and
+        # the difference matters: a timeout means no assertion was reached.
+        echo "  ERROR: deb-install exceeded ${DEB_INSTALL_TIMEOUT}s and was killed;" >&2
+        echo "         no verdict was reached, so this is not an assertion failure." >&2
     fi
+    record "deb-install" "$rc"
 }
 
 # Run Tor SOCKS5 outbound test (live Tor network)

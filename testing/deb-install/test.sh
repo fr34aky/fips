@@ -36,6 +36,16 @@ DEB_CACHE_DIR="$CACHE_DIR/deb"
 BOOT_TIMEOUT=30
 SERVICE_TIMEOUT=20
 DAEMON_TIMEOUT=15
+# Bounds on a single `systemctl start`, which is not a wait loop and needs its
+# own limit. See start_unit() for why an unbounded one can never return.
+UNIT_START_TIMEOUT=30
+# fips-gateway.service's ExecStartPre waits up to 30s for fips0 to appear, by
+# design, so its start legitimately takes longer than any other.
+GATEWAY_START_TIMEOUT=60
+# The gateway-enable block restarts fips.service inside the container. Above
+# systemd's default TimeoutStopSec of 90s, so a wedged stop trips this rather
+# than this cutting a healthy stop short.
+CONFIG_RESTART_TIMEOUT=120
 
 PASS=0
 FAIL=0
@@ -95,6 +105,41 @@ wait_for_systemd() {
     # and returning 0 here made the timeout indistinguishable from a clean boot.
     echo "  ERROR: systemd did not reach running state in ${BOOT_TIMEOUT}s" >&2
     return 1
+}
+
+# Start a unit without waiting for its start job to finish.
+#
+# Start a unit and wait for its start job, under a bound.
+#
+# Blocking is the right default and the call returning is what synchronises the
+# checks after it: `fips-gateway.service` in particular has an ExecStartPre that
+# waits up to 30s for fips0, so a caller that does not wait races it. What the
+# old code lacked was the bound, not the wait.
+start_unit() {
+    local name="$1" unit="$2" limit="${3:-$UNIT_START_TIMEOUT}"
+    timeout "$limit" docker exec "$name" systemctl start "$unit" 2>&1
+}
+
+# Queue a unit's start job and return without waiting for it.
+#
+# For `fips-dns.service` only, and the reason is specific rather than general.
+# It is Type=oneshot with Requires=fips.service, so its start job waits on a
+# dependency that a broken daemon never satisfies: fips.service restarts every
+# 5s for ever and the oneshot's job is never dispatched. `systemctl start` then
+# never returns. That is the whole class of fault this suite exists to find, and
+# the suite answered it by hanging -- no FAIL, no Results line, no exit status,
+# observed at 21 minutes against a package whose binaries could not load.
+#
+# Queueing moves the verdict onto the wait_for_service_active call that follows,
+# which carries a timeout and dumps the journal when it fails. RemainAfterExit=yes
+# on that unit makes `is-active` a correct readiness test for a oneshot.
+#
+# This bounds these call sites, not every `docker exec` in the file. The backstop
+# for the rest is the caller's own limit: ci-local.sh bounds the whole suite, and
+# the GitHub leg carries timeout-minutes.
+start_unit_queued() {
+    local name="$1" unit="$2"
+    timeout "$UNIT_START_TIMEOUT" docker exec "$name" systemctl start --no-block "$unit" 2>&1
 }
 
 wait_for_service_active() {
@@ -349,8 +394,8 @@ DOCKERFILE
 
     # Start the services as a simulated boot. (On a real system,
     # they'd come up on next reboot.)
-    docker exec "$name" systemctl start fips.service 2>&1 || true
-    docker exec "$name" systemctl start fips-dns.service 2>&1 || true
+    start_unit "$name" fips.service || true
+    start_unit_queued "$name" fips-dns.service || true
 
     if wait_for_service_active "$name" fips.service; then
         pass "fips.service active after explicit start"
@@ -381,10 +426,21 @@ DOCKERFILE
         return
     fi
 
-    # Wait for fips-dns.service. This should have run fips-dns-setup
-    # which configures the resolver backend and writes
-    # /run/fips/dns-backend.
-    sleep 2
+    # Wait for fips-dns.service to finish. Its start job is queued rather than
+    # waited on above, so this is what makes /run/fips/dns-backend safe to read:
+    # fips-dns-setup waits up to 30s for fips0 and restarts systemd-resolved
+    # before it writes that file, so reading it on a timer races the setup.
+    # RemainAfterExit=yes makes is-active correct for this oneshot.
+    if wait_for_service_active "$name" fips-dns.service; then
+        pass "fips-dns.service completed"
+    else
+        fail "fips-dns.service did not complete in ${SERVICE_TIMEOUT}s"
+        echo "  --- fips-dns.service journal ---"
+        docker exec "$name" journalctl -u fips-dns.service --no-pager 2>&1 | tail -20
+        cleanup_container "$name"
+        return
+    fi
+
     local backend
     backend=$(docker exec "$name" cat /run/fips/dns-backend 2>/dev/null || echo "(missing)")
     local ver
@@ -441,7 +497,7 @@ DOCKERFILE
     # default preset) and ipv6 forwarding (gateway checks before
     # the DNS upstream check).
     docker exec "$name" sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-    docker exec "$name" bash -c '
+    timeout "$CONFIG_RESTART_TIMEOUT" docker exec "$name" bash -c '
         systemctl unmask fips-gateway.service 2>/dev/null
         # Patch in a minimal gateway config since the shipped fips.yaml
         # has gateway disabled by default.
@@ -482,7 +538,7 @@ EOF
         fail "non-root fips group member cannot reach control socket after restart"
     fi
 
-    docker exec "$name" systemctl start fips-gateway.service >/dev/null 2>&1 || true
+    start_unit "$name" fips-gateway.service "$GATEWAY_START_TIMEOUT" >/dev/null 2>&1 || true
     sleep 3
     if docker exec "$name" journalctl -u fips-gateway.service --no-pager 2>/dev/null \
             | grep -q "DNS upstream is reachable"; then
