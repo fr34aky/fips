@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.5.0-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.5.1-green.svg)](#status--roadmap)
 
 A self-organizing encrypted mesh network built on Nostr identities,
 capable of operating over arbitrary transports without central
@@ -191,9 +191,13 @@ and Android. Linux is not one target. Debian, Ubuntu, Arch and NixOS
 are the same glibc build, and what
 differs is the packaging: Debian and Ubuntu take the same `.deb`, Arch
 takes `fips` from the AUR, and NixOS uses the Nix flake described
-below. **Only the `.deb` is exercised per release**, by the
+below. **Only the `.deb` is exercised by an install test**, by the
 `deb-install` suite across debian12, debian13, ubuntu22, ubuntu24 and
-ubuntu26; neither the AUR package nor the flake is. OpenWrt is a musl
+ubuntu26; neither the AUR package nor the flake is. That suite runs on
+every push and pull request, against a `.deb` built by the same pinned
+container as the released one. It does not run at a tag: no workflow
+installs the published artifact, so the released package is checked by
+hand. OpenWrt is a musl
 target rather than glibc, and it takes an `.ipk` on 24.x and earlier or
 an `.apk` on 25 and later; both carry the `fips-mesh-setup` and
 `fips-ap-setup` helpers.
@@ -258,7 +262,7 @@ Nix / NixOS section of [packaging/README.md](packaging/README.md).
   then [fips-architecture.md](docs/design/fips-architecture.md) for
   the protocol stack.
 - **[Release notes](docs/releases/)** — per-version notes, including
-  [v0.5.0](docs/releases/release-notes-v0.5.0.md).
+  [v0.5.1](docs/releases/release-notes-v0.5.1.md).
 
 If you want to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [testing/README.md](testing/README.md).
@@ -299,11 +303,13 @@ testing/      Docker-based integration test harnesses + chaos simulation
 
 ## Status & roadmap
 
-FIPS is at **v0.5.0** on the `master` branch, the first feature
-release since v0.4.0.
-[v0.4.2](https://github.com/jmcorgan/fips/releases/tag/v0.4.2) was the
-last release on the maintenance line, so how much of this release is
-new to you depends on which version you are upgrading from. The core
+FIPS is at **v0.5.1** on the `maint` branch, a maintenance release
+that makes the Linux packages install and run on Debian 12 and Ubuntu
+22.04, where every artifact from v0.3.0 through v0.5.0 installed and
+then could not start.
+[v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) was the
+last feature release, so how much of it is new to you depends on which
+version you are upgrading from. The core
 protocol
 works end-to-end over UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a
 global, public test mesh of thousands of nodes.

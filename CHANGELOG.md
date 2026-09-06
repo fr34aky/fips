@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet. Everything previously staged here is folded into
+`[0.5.1]` below.
+
+## [0.5.1] - 2026-09-06
+
 ### Fixed
 
 #### Discovery
@@ -57,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would not load fails the build rather than reaching a user. The declared
   dependency is derived from the binaries instead of hand-written, so it states
   the floor it was built against.
+
+- The `.deb` install suite no longer hangs when the daemon it installed cannot
+  run. It started `fips-dns.service` with no timeout, and that unit is
+  `Type=oneshot` with `Requires=fips.service`, so a daemon that cannot execute
+  is restarted every five seconds for ever, the oneshot start job is never
+  dispatched, and `systemctl start` never returns. The suite then produced no
+  failure line, no results line and no exit status at all, which is the whole
+  class of fault it exists to find: it stopped reporting at exactly the point it
+  was most needed. Observed at 21 minutes against a package whose binaries could
+  not load. The start is now queued rather than waited on, with a bounded wait
+  for the unit to become active, so a dead daemon fails the suite instead of
+  stalling the run that gates artifact publication.
 
 ## [0.5.0] - 2026-08-30
 

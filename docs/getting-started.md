@@ -66,6 +66,13 @@ per-platform installer:
 - Windows: `.zip` with service-install scripts
 - Generic systemd Linux: `.tar.gz` with an `install.sh` script
 
+FIPS supports every version of a supported distribution that its vendor
+still supports for free: currently Ubuntu 22.04, Debian 12, Ubuntu 24.04,
+Debian 13 and Ubuntu 26.04. The Linux binaries are built in a container
+pinned to the oldest of those, so they run on all of them. The glibc floor
+that follows is declared in `packaging/build-floor.env` and is enforced on
+every artifact by `testing/check-glibc-floor.sh`.
+
 See the [project README's Quick start section](../README.md#quick-start)
 for download links and per-platform invocations.
 

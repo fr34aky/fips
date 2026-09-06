@@ -182,9 +182,9 @@ There is no Android daemon artifact. Android is supported as an embedded
 crate.
 
 The full per-commit changelog lives in
-[`CHANGELOG.md`](CHANGELOG.md). Issues and discussion at
+[`CHANGELOG.md`](../../CHANGELOG.md). Issues and discussion at
 [github.com/jmcorgan/fips](https://github.com/jmcorgan/fips). Security
-reports have a private channel; see [`SECURITY.md`](SECURITY.md).
+reports have a private channel; see [`SECURITY.md`](../../SECURITY.md).
 
 ## Contributors
 
