@@ -17,8 +17,13 @@ pub mod ethernet;
 
 /// Kernel link-event notifications, shared by any transport or detector that
 /// needs to react to interface state without polling for it.
+///
+/// Crate-internal on purpose. It is a mechanism the node's own subsystems
+/// share, not a surface an embedder builds against, and publishing it would
+/// commit the library to its shape before anything outside the crate has asked
+/// for it.
 #[cfg(unix)]
-pub mod watcher;
+pub(crate) mod watcher;
 
 #[cfg(ble_available)]
 pub mod ble;
