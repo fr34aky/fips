@@ -107,9 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restricted sandbox. A backend only decides *when to look* — the fingerprint
   comparison, the debounce and the settled-back suppression are shared — so the
   remaining backends (`NotifyIpInterfaceChange` on Windows, an embedder push on
-  Android and iOS, where SELinux blocks netlink) land behind the same seam
-  without touching the reaction. What the node does with
-  the signal is the connected-socket rebind described under Fixed above.
+  iOS) land behind the same seam without touching the reaction. Android takes
+  the netlink source, and falls back to the timer where policy refuses the
+  group bind. What the node does with the signal is the connected-socket
+  rebind described under Fixed above.
   Bluetooth is not covered: an adapter's state is not an IP attachment and is
   invisible to this detector.
 

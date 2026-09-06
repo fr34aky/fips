@@ -6,7 +6,7 @@
 //!
 //! | Platform | Source |
 //! | -------- | ------ |
-//! | Linux | netlink `RTNLGRP_LINK` (`RTM_NEWLINK` / `RTM_DELLINK`) |
+//! | Linux, Android | netlink `RTNLGRP_LINK` (`RTM_NEWLINK` / `RTM_DELLINK`) |
 //! | macOS, FreeBSD | `PF_ROUTE` socket, `RTM_IFINFO` |
 //! | Fallback | none — the watcher never fires, and callers poll |
 //!
@@ -67,12 +67,13 @@ impl LinkEventSocket {
     }
 }
 
-/// Netlink multicast groups a watcher can subscribe to on Linux.
+/// Netlink multicast groups a watcher can subscribe to where the backend is
+/// netlink.
 ///
 /// Spelled as literals because the constants' names and availability differ
 /// across libc versions; the values are ABI. These are the `RTMGRP_*` bitmask
 /// form taken by `sockaddr_nl.nl_groups`, not the `RTNLGRP_*` ordinals.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod groups {
     /// Interfaces appearing, disappearing, or changing state.
     pub const LINK: u32 = 0x1;
@@ -98,10 +99,10 @@ pub mod groups {
 
 /// Open the platform's link-event socket, non-blocking.
 ///
-/// `groups` is ignored off Linux: `PF_ROUTE` has no group selection and
-/// delivers every routing message to every reader, so a caller that wants
-/// more than link events already has them there.
-#[cfg(target_os = "linux")]
+/// `groups` is ignored where the backend is `PF_ROUTE`: it has no group
+/// selection and delivers every routing message to every reader, so a caller
+/// that wants more than link events already has them there.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_link_socket(groups: u32) -> std::io::Result<LinkEventSocket> {
     let fd = unsafe {
         libc::socket(
@@ -132,7 +133,7 @@ fn open_link_socket(groups: u32) -> std::io::Result<LinkEventSocket> {
 }
 
 /// Open the platform's link-event socket, non-blocking.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_link_socket(_groups: u32) -> std::io::Result<LinkEventSocket> {
     // PF_ROUTE delivers RTM_IFINFO (and the rest of the routing messages) to
     // every reader; no bind and no group selection exist for it.
@@ -182,9 +183,9 @@ impl LinkWatcher {
     /// Subscribes to link events only, which is what a caller asking "is this
     /// interface here?" needs.
     pub fn new() -> Self {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let groups = groups::LINK;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let groups = 0;
         Self::with_groups(groups)
     }

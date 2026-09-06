@@ -23,7 +23,7 @@
 //!
 //! | Platform | Backend | Latency |
 //! |---|---|---|
-//! | Linux | `NETLINK_ROUTE` multicast | kernel event, ~ms |
+//! | Linux, Android | `NETLINK_ROUTE` multicast | kernel event, ~ms |
 //! | macOS, FreeBSD | `PF_ROUTE` socket | kernel event, ~ms |
 //! | everything else | timer, `node.netmon.poll_interval_secs` | up to one period |
 //!
@@ -36,8 +36,11 @@
 //! everything regardless.
 //!
 //! Still to come, behind the same seam and without touching the handler:
-//! `NotifyIpInterfaceChange` on Windows, and an embedder push on Android and
-//! iOS (where netlink is blocked by SELinux policy). Every platform runs the
+//! `NotifyIpInterfaceChange` on Windows, and an embedder push on iOS. Android
+//! takes the netlink source above, which is the right backend when the policy
+//! allows the group bind and degrades to the timer when it does not; a
+//! `ConnectivityManager` push belongs there too, because a timer is not
+//! reliable under Doze. Every platform runs the
 //! timer regardless — as the only signal where there is no backend, and as a
 //! backstop where there is one, since a kernel event stream can drop messages
 //! or stop.
@@ -421,14 +424,14 @@ fn build_wake_source(cfg: &NetmonConfig) -> WakeSource {
 
     #[cfg(unix)]
     {
-        // On Linux the mask matters: the default route moving between two
-        // interfaces that stay up emits nothing in the link group, so a
-        // presence watcher would never fire for the change this detector
-        // exists to catch. Elsewhere `PF_ROUTE` delivers every routing
-        // message regardless and the mask is ignored.
-        #[cfg(target_os = "linux")]
+        // Where the backend is netlink the mask matters: the default route
+        // moving between two interfaces that stay up emits nothing in the
+        // link group, so a presence watcher would never fire for the change
+        // this detector exists to catch. Under `PF_ROUTE` every routing
+        // message is delivered regardless and the mask is ignored.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let watcher = LinkWatcher::with_groups(crate::transport::watcher::groups::EGRESS_PATH);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let watcher = LinkWatcher::new();
 
         if watcher.is_event_driven() {
