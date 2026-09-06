@@ -40,6 +40,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fipstop` as "Own Loopback". `req_duplicate` returns to meaning only what it
   says.
 
+#### Packaging
+
+- The Linux `.deb` and the systemd tarball now install and run on Debian 12 and
+  Ubuntu 22.04. Every Linux artifact from v0.3.0 through v0.5.0 was built on the
+  newest available runner, whose C library made the standard library's `pidfd`
+  references a hard `GLIBC_2.39` version requirement instead of the weak,
+  runtime-checked ones it is meant to compile to. The loader refuses an image on
+  that entry alone, so `fips`, `fipstop` and `fips-gateway` could not start;
+  `fipsctl` was unaffected, which is why an install that was checked by running
+  it looked healthy while the daemon was dead. No source code caused this and
+  none was changed. The Linux artifacts are now built in a container pinned to
+  the oldest supported distribution, declared with the floor in
+  `packaging/build-floor.env`, and every producer runs
+  `testing/check-glibc-floor.sh` on what it made, so a package or a tarball that
+  would not load fails the build rather than reaching a user. The declared
+  dependency is derived from the binaries instead of hand-written, so it states
+  the floor it was built against.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added
