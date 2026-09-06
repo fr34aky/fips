@@ -58,8 +58,16 @@
 //! - **The set of up, non-loopback interface addresses**, on unix, where
 //!   `getifaddrs(3)` is available through the `libc` dependency the crate
 //!   already carries. This catches a medium arriving or leaving without
-//!   displacing the default route — a LAN cable plugged in beside live WLAN,
-//!   or the address a link-local Ethernet transport peers over.
+//!   displacing the default route. A peer on the same LAN is reached by the
+//!   on-link subnet route, and the probe above follows the *default* route by
+//!   construction, so it looks straight past that path: unplug a LAN cable on
+//!   a host whose default route is cellular and the source addresses do not
+//!   move, while every connected socket to that peer is stranded.
+//!
+//!   It is a proxy for "could the local end of one of our peerings have
+//!   moved", and a broad one — it enumerates every address the host has,
+//!   rather than the local end of the peerings the node actually holds, so a
+//!   container bridge or a tunnel interface appearing moves it too.
 //!
 //! On platforms without `getifaddrs` (Windows) only the source-address probe
 //! contributes, which still catches every default-route move. The native
