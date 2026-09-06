@@ -22,9 +22,9 @@ contribution. There is no wire format change and no new configuration.
   it.
 - **Any other Linux: upgrade at your convenience.** Your daemon was
   running, and you gain the two discovery fixes.
-- **macOS, Windows, FreeBSD and OpenWrt: nothing changed for you.** The
-  defect was in how the Linux artifacts were built. Those artifacts are
-  rebuilt from the same source and are otherwise as v0.5.0 shipped them.
+- **macOS, Windows, FreeBSD and OpenWrt: the packaging defect never
+  affected you**, since it was in how the Linux artifacts were built. You
+  do get the two discovery fixes, which are not gated by platform.
 - **From source: you were never affected.** A binary you built runs
   against the C library you built it on.
 
@@ -54,9 +54,10 @@ an older C library. **`fipsctl` was unaffected**, which is why an
 install checked by running a command looked healthy while the daemon was
 dead.
 
-**No source code caused this and none was changed.** The defect was in
-the build environment, and the release contains no behavioral change to
-the daemon.
+**No source code caused the packaging defect and none was changed to fix
+it.** The defect was in the build environment. The two discovery fixes
+below are this release's only behavioral change, and they are unrelated to
+it.
 
 **Why the declared dependency did not stop it.** The `.deb` said it
 needed `libc6` with no version, which every glibc satisfies. So a
@@ -126,9 +127,10 @@ It now has its own rejection reason and counter, `req_own_loopback`,
 shown in `fipstop` as "Own Loopback". `req_duplicate` returns to meaning
 only what it says.
 
-**If you watch these counters**, expect `req_duplicate` to drop and a
-new non-zero `Own Loopback` to appear. That is the same traffic,
-correctly attributed, not a new fault.
+**If you watch these counters**, expect a new non-zero `Own Loopback` to
+appear on a node that originates lookups. That is traffic that was
+previously counted elsewhere or not at all, correctly attributed, rather
+than a new fault.
 
 ## Compatibility
 
@@ -145,18 +147,19 @@ The library surface is unchanged. Configuration is unchanged.
 **Package upgrade, Debian and Ubuntu.** The usual upgrade replaces the
 binaries and restarts the service. On Debian 12 and Ubuntu 22.04 the
 daemon will start for the first time, so this is a first start rather
-than a restart: check `fipsctl status` afterwards and expect to see peer
-establishment, not a resumed session.
+than a restart: check `fipsctl show status` afterwards and expect to see
+peer establishment, not a resumed session.
 
 **Check what you actually have.** If you want to confirm the floor of an
 installed binary rather than trust the version string:
 
 ```text
 objdump -T /usr/bin/fips | grep GLIBC_ | sed 's/.*GLIBC_//' | sort -uV | tail -1
-```text
+```
 
-An artifact from this release reports 2.34. One from v0.5.0 or earlier
-reports 2.39.
+An artifact from this release prints `2.34) __libc_start_main`. One from
+v0.5.0 or earlier prints `2.39) pidfd_spawnp`, which names the symbol that
+caused this.
 
 **Rolling upgrade.** No coordination is needed. Upgrade nodes in any
 order.
@@ -182,9 +185,11 @@ There is no Android daemon artifact. Android is supported as an embedded
 crate.
 
 The full per-commit changelog lives in
-[`CHANGELOG.md`](../../CHANGELOG.md). Issues and discussion at
+[`CHANGELOG.md`](https://github.com/jmcorgan/fips/blob/v0.5.1/CHANGELOG.md).
+Issues and discussion at
 [github.com/jmcorgan/fips](https://github.com/jmcorgan/fips). Security
-reports have a private channel; see [`SECURITY.md`](../../SECURITY.md).
+reports have a private channel; see
+[`SECURITY.md`](https://github.com/jmcorgan/fips/blob/v0.5.1/SECURITY.md).
 
 ## Contributors
 

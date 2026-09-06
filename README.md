@@ -194,9 +194,10 @@ takes `fips` from the AUR, and NixOS uses the Nix flake described
 below. **Only the `.deb` is exercised by an install test**, by the
 `deb-install` suite across debian12, debian13, ubuntu22, ubuntu24 and
 ubuntu26; neither the AUR package nor the flake is. That suite runs on
-every push and pull request, against a `.deb` built by the same pinned
-container as the released one. It does not run at a tag: no workflow
-installs the published artifact, so the released package is checked by
+every push and pull request, on x86_64, against a `.deb` built by the same
+pinned container as the released one. It does not run at a tag, and the
+arm64 package is install-tested by nothing: no workflow installs a published
+artifact, so the released packages are checked by
 hand. OpenWrt is a musl
 target rather than glibc, and it takes an `.ipk` on 24.x and earlier or
 an `.apk` on 25 and later; both carry the `fips-mesh-setup` and
@@ -308,11 +309,14 @@ that makes the Linux packages install and run on Debian 12 and Ubuntu
 22.04, where every artifact from v0.3.0 through v0.5.0 installed and
 then could not start.
 [v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) was the
-last feature release, so how much of it is new to you depends on which
-version you are upgrading from. The core
+last feature release, so how much of that release is new to you depends on
+which version you are upgrading from. The core
 protocol
 works end-to-end over UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a
 global, public test mesh of thousands of nodes.
+
+v0.5.1 is a packaging fix and carries two discovery fixes; the feature
+content below is v0.5.0's.
 
 v0.5.0 is a platform-and-lifecycle release. It adds FreeBSD as a
 packaged platform (x86_64 only), OpenWrt setup helpers for an 802.11s

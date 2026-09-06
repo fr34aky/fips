@@ -57,9 +57,11 @@ Nothing yet. Everything previously staged here is folded into
   it looked healthy while the daemon was dead. No source code caused this and
   none was changed. The Linux artifacts are now built in a container pinned to
   the oldest supported distribution, declared with the floor in
-  `packaging/build-floor.env`, and every producer runs
+  `packaging/build-floor.env`, and every producer on the release path runs
   `testing/check-glibc-floor.sh` on what it made, so a package or a tarball that
-  would not load fails the build rather than reaching a user. The declared
+  would not load fails the build rather than reaching a user. The deprecated
+  host-build targets in `packaging/Makefile` are not on that path and are not
+  floor-checked. The declared
   dependency is derived from the binaries instead of hand-written, so it states
   the floor it was built against.
 

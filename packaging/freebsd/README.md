@@ -24,7 +24,7 @@ Output: `deploy/fips-<version>-freebsd-<arch>.pkg` (e.g.
 ## Install
 
 ```sh
-pkg add ./deploy/fips-<version>-freebsd-amd64.pkg
+pkg add ./deploy/fips-0.5.1-freebsd-amd64.pkg
 # post-install seeds this from the sample if absent, at mode 0600
 vi /usr/local/etc/fips/fips.yaml
 sysrc fips_enable=YES fips_dns_enable=YES
