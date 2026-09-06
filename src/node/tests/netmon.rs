@@ -8,8 +8,10 @@
 use super::spanning_tree::*;
 use super::*;
 use crate::config::PeerConfig;
+use crate::config::TcpConfig;
 use crate::node::netmon::NetChange;
-use crate::transport::TransportId;
+use crate::transport::tcp::TcpTransport;
+use crate::transport::{TransportAddr, TransportHandle, TransportId, packet_channel};
 
 /// Add `peer` to the node's config as an auto-connect peer.
 ///
@@ -182,6 +184,67 @@ async fn every_peer_is_heartbeated_so_the_far_side_re_pins() {
     assert!(
         before.is_none() || after > before,
         "the heartbeat must go now, not at the next due interval"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A peer on a connection-oriented transport is deliberately left out of the
+/// immediate fan-out.
+///
+/// Its send would await `write_all` on a stream the medium change has very
+/// likely just stranded — unbounded, and on the rx loop, where it would hold
+/// every other arm of the select behind it. Such a peer keeps the periodic
+/// heartbeat it had before this detector existed. If this ever starts passing
+/// because the peer *was* heartbeated, the rx loop has a new way to stall.
+#[tokio::test]
+async fn a_peer_on_a_connection_oriented_transport_is_left_to_the_periodic_heartbeat() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+    let peer_1 = identity_of(&nodes, 1);
+    configure_auto_peer(&mut nodes[0].node, &peer_1);
+
+    // Re-pin the peer onto a TCP transport. Nothing is connected on it, which
+    // is the point: the fan-out must decide from the transport's kind, before
+    // it ever reaches a send.
+    let tcp_id = TransportId::new(77);
+    let cfg = TcpConfig {
+        bind_addr: None,
+        ..Default::default()
+    };
+    let (tx, _rx) = packet_channel(64);
+    nodes[0].node.transports.insert(
+        tcp_id,
+        TransportHandle::Tcp(TcpTransport::new(tcp_id, None, cfg, tx)),
+    );
+    nodes[0]
+        .node
+        .peers
+        .get_mut(&addr_1)
+        .expect("peer 1 is established")
+        .set_current_addr(tcp_id, TransportAddr::from_string("10.0.0.2:2121"));
+
+    let before = nodes[0]
+        .node
+        .get_peer(&addr_1)
+        .unwrap()
+        .last_heartbeat_sent();
+
+    nodes[0]
+        .node
+        .handle_net_change(NetChange::for_test(1))
+        .await;
+
+    let after = nodes[0]
+        .node
+        .get_peer(&addr_1)
+        .unwrap()
+        .last_heartbeat_sent();
+    assert_eq!(
+        before, after,
+        "a connection-oriented peer must not be heartbeated from the rx loop"
     );
 
     cleanup_nodes(&mut nodes).await;

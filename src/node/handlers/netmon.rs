@@ -36,11 +36,16 @@
 //!    wildcard listen socket resolves a route per packet, so sends keep working
 //!    immediately, and `activate_connected_udp_sessions` reinstalls a
 //!    correctly-bound connected socket on a later tick.
-//! 2. **Heartbeat every peer at once.** The frame leaves over the new path and
-//!    carries the node's new source address, so the far side re-pins on receipt
-//!    instead of waiting out its own `heartbeat_interval_secs`. Without it the
-//!    forward direction is fixed but the reverse still points at the old
-//!    address until the node next happens to send.
+//! 2. **Heartbeat every peer whose send path cannot block.** The frame leaves
+//!    over the new path and carries the node's new source address, so the far
+//!    side re-pins on receipt instead of waiting out its own
+//!    `heartbeat_interval_secs`. Without it the forward direction is fixed but
+//!    the reverse still points at the old address until the node next happens
+//!    to send. This runs on the rx loop, so it covers the connectionless
+//!    transports only — see
+//!    [`Node::heartbeat_all_peers_after_net_change`] for why awaiting a
+//!    connection-oriented write here would hold the loop, and what a peer on
+//!    one of those gets instead.
 //!
 //! Nothing here tears a peering down. On a live node both WLAN→LAN and
 //! LAN→WLAN now cost no reconnection at all — the Noise session, the tree
@@ -65,15 +70,16 @@ impl Node {
         // the route now, not one still pinned to the interface just left.
         let sockets_rebound = self.drop_connected_sockets_after_net_change();
 
+        let heartbeated = self.heartbeat_all_peers_after_net_change().await;
+
         info!(
             generation = change.generation,
             change = %change.summary,
             peers,
             sockets_rebound,
+            heartbeated,
             "Transport medium changed; rebinding sends and re-pinning peers"
         );
-
-        self.heartbeat_all_peers_after_net_change().await;
     }
 
     /// Drop every per-peer `connect()`-ed UDP socket, returning how many were
@@ -102,13 +108,47 @@ impl Node {
         0
     }
 
-    /// Send one heartbeat to every peer immediately, so each learns the node's
-    /// new source address in one RTT rather than at the next due interval.
-    async fn heartbeat_all_peers_after_net_change(&mut self) {
+    /// Send one heartbeat to every peer whose send path cannot block, so each
+    /// learns the node's new source address in one RTT rather than at the next
+    /// due interval. Returns how many went out.
+    ///
+    /// The filter is not an optimisation. A connectionless transport's send
+    /// completes without ever awaiting the wire: the UDP fast path hands the
+    /// frame to the encrypt workers and returns, and a raw datagram write does
+    /// not wait for a peer. A connection-oriented one awaits `write_all` on a
+    /// stream, unbounded — the connect above it is wrapped in a timeout, the
+    /// write is not — and a medium change is precisely the condition that
+    /// leaves a send window full against a path that has just gone away. This
+    /// runs on the rx loop, so that write would hold every other arm of the
+    /// select for as long as the stranded socket takes to fail.
+    ///
+    /// Bounding it with a timeout is not the fix either: dropping a partial
+    /// `write_all` would leave a half-written frame on the stream, which the
+    /// peer cannot resynchronise from. Nor can the fan-out simply be spawned,
+    /// because the send needs `&mut self` for the session counter and the MMP
+    /// sender record.
+    ///
+    /// So a peer on TCP, Tor, Nym or BLE keeps the periodic heartbeat it had
+    /// before this detector existed. It is not stranded by the omission: those
+    /// transports re-dial on send, and `link_dead_timeout_secs` remains the
+    /// backstop. Doing better for them means dropping the stale connection
+    /// rather than writing into it, which is a different change with a real
+    /// cost behind it — a Tor peer pays a fresh circuit — and is not this one.
+    async fn heartbeat_all_peers_after_net_change(&mut self) -> usize {
         let now = Instant::now();
         let heartbeat = [LinkMessageType::Heartbeat.to_byte()];
-        let targets: Vec<NodeAddr> = self.peers.keys().copied().collect();
+        let targets: Vec<NodeAddr> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.transport_id()
+                    .and_then(|id| self.transports.get(&id))
+                    .is_some_and(|t| !t.transport_type().connection_oriented)
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
 
+        let sent = targets.len();
         for addr in targets {
             if let Some(peer) = self.peers.get_mut(&addr) {
                 peer.mark_heartbeat_sent(now);
@@ -121,6 +161,7 @@ impl Node {
                 );
             }
         }
+        sent
     }
 }
 

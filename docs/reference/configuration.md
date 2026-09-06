@@ -215,9 +215,13 @@ the peering reports itself connected and carries nothing until
 
 On a detected change the node drops those sockets (the wildcard listen socket
 resolves a route per packet, so sends keep working, and a correctly bound
-connected socket is reinstalled on a later tick) and heartbeats every peer at
-once so the far side re-pins to the new source address. No peering is torn
-down: sessions, tree positions and routes survive the switch.
+connected socket is reinstalled on a later tick) and heartbeats every peer on a
+connectionless transport at once so the far side re-pins to the new source
+address. A peer reached over TCP, Tor, Nym or BLE is left to its periodic
+heartbeat, since sending to it here would block the node's receive loop on a
+stream the medium change has very likely just stranded; those transports
+re-dial on send. No peering is torn down: sessions, tree positions and routes
+survive the switch.
 
 Detection uses the best backend the platform has:
 

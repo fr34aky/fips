@@ -62,8 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dropping the sockets is self-healing rather than disruptive: the wildcard
   listen socket resolves a route per packet, so sends keep working immediately,
   and a correctly-bound connected socket is reinstalled on a later tick. Every
-  peer is also heartbeated at once, so the far side re-pins to the new source
-  address rather than waiting out its own heartbeat interval. Measured on a live
+  peer on a connectionless transport is also heartbeated at once, so the far
+  side re-pins to the new source address rather than waiting out its own
+  heartbeat interval. A peer on a connection-oriented transport keeps the
+  periodic heartbeat instead: that send awaits an unbounded `write_all` on a
+  stream the medium change has very likely just stranded, and this reaction
+  runs on the rx loop. Measured on a live
   node, a WLAN/LAN switch in either direction now costs no reconnection at all —
   the Noise session, tree position and routes survive it. Linux and macOS (the
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
