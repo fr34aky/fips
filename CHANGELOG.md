@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data plane
 
+- A peer that stops reading can no longer stall the node. TCP, Tor and Nym
+  wrote to their sockets directly from the caller's task, and `write_all`
+  blocks once the peer's receive window and this node's send buffer are both
+  full — which is what a peer that has gone away, or whose path has just
+  changed medium, produces. The callers are the rx loop's tick handlers, so a
+  single unresponsive peer held every other arm of the event loop behind it:
+  other peers' liveness, forwarding, and control RPCs. Each connection now has
+  its own writer task owning the write half, and sending is an enqueue onto a
+  bounded queue, so the only code that can await the wire is a task with
+  nothing else to do. A peer that stops draining fills its queue and its sends
+  then fail immediately, which is the signal the caller's retry and liveness
+  handling already expects. Frames are written whole, and a write error takes
+  the connection down with it, so a peer never sees a partial frame it cannot
+  resynchronise from.
+
 - A per-peer `connect()`-ed UDP socket is no longer left pinned to an interface
   the host has moved off. Established UDP peers get their own socket for the
   send fast path; `open_connected_fd` binds the wildcard and then calls
