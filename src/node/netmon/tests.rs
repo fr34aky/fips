@@ -35,6 +35,19 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
+/// A distinct peer address. Only identity matters here, so the byte pattern is
+/// arbitrary as long as two peers differ.
+fn peer(n: u8) -> NodeAddr {
+    NodeAddr::from_bytes([n; 16])
+}
+
+/// A fingerprint in which `peers` are all reached from `source`. The common
+/// shape: every peering rides one medium, so they move together.
+fn all_from(peers: &[NodeAddr], source: Option<IpAddr>) -> NetFingerprint {
+    let sources: Vec<_> = peers.iter().map(|p| (*p, source)).collect();
+    NetFingerprint::for_test(&sources)
+}
+
 /// A timer-only wake source at the config's poll period — the portable
 /// backend's behaviour, and the baseline the netlink tests compare against.
 fn timer_wake(poll_secs: u64) -> WakeSource {
@@ -62,7 +75,7 @@ fn scripted(samples: Vec<NetFingerprint>) -> (impl Fn() -> NetFingerprint, Arc<A
 
 #[tokio::test(start_paused = true)]
 async fn steady_attachment_reports_nothing() {
-    let steady = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
+    let steady = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
     let (sampler, _) = scripted(vec![steady]);
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -72,11 +85,11 @@ async fn steady_attachment_reports_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_default_route_move_is_reported() {
-    // The WLAN → 5G shape: the interface set changes and the preferred source
-    // address moves with it.
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+async fn a_medium_change_under_a_peer_is_reported() {
+    // The WLAN → 5G shape: the local address the kernel would reach the peer
+    // from moves, which is the whole signal.
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![wlan, cell]);
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -84,22 +97,115 @@ async fn a_default_route_move_is_reported() {
 
     let change = expect_change(&mut rx).await;
     assert_eq!(change.generation, 1);
-    assert!(change.summary.v4_source_moved);
-    assert_eq!(change.summary.v4_source, Some(v4(10, 40, 0, 7)));
-    assert_eq!(change.summary.added, vec![v4(10, 40, 0, 7)]);
-    assert_eq!(change.summary.removed, vec![v4(192, 168, 1, 10)]);
+    assert_eq!(change.summary.probed, 1);
+    assert_eq!(
+        change.summary.moved,
+        vec![PeerSourceMove {
+            peer: peer(1),
+            before: Some(v4(192, 168, 1, 10)),
+            after: Some(v4(10, 40, 0, 7)),
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_losing_its_route_is_reported() {
+    // The route to this peer is gone, so it is stranded on whatever socket it
+    // holds — the single most important case to report, and the one a
+    // "compare the addresses we can see" fingerprint would miss because the
+    // absence of a route is not an address.
+    let up = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let down = all_from(&[peer(1)], None);
+    let (sampler, _) = scripted(vec![up, down]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    let change = expect_change(&mut rx).await;
+    assert_eq!(change.summary.moved.len(), 1);
+    assert_eq!(change.summary.moved[0].after, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_joining_is_absorbed_rather_than_reported() {
+    // Peer churn is ordinary node behaviour and says nothing about the medium.
+    // The reaction is to drop every connected socket and heartbeat every peer,
+    // so firing it every time a peer authenticates would make a busy node
+    // continuously tear down its own send fast path.
+    let one = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let two = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
+    let (sampler, _) = scripted(vec![one, two]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    expect_quiet(&mut rx, "a peer appearing is not a medium change").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_leaving_is_absorbed_rather_than_reported() {
+    let two = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
+    let one = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let (sampler, _) = scripted(vec![two, one]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    expect_quiet(&mut rx, "a peer being reaped is not a medium change").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_joins_is_compared_on_the_sample_after() {
+    // The other half of absorbing churn: `last` has to take the new peer on
+    // board, or a peer authenticated after startup would sit outside every
+    // future comparison and its medium changes would never be seen.
+    let source = Some(v4(192, 168, 1, 10));
+    let one = all_from(&[peer(1)], source);
+    let two = all_from(&[peer(1), peer(2)], source);
+    let moved = NetFingerprint::for_test(&[(peer(1), source), (peer(2), Some(v4(10, 40, 0, 7)))]);
+    let (sampler, _) = scripted(vec![one, two, moved]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    let change = expect_change(&mut rx).await;
+    assert_eq!(
+        change.summary.moved,
+        vec![PeerSourceMove {
+            peer: peer(2),
+            before: source,
+            after: Some(v4(10, 40, 0, 7)),
+        }],
+        "the peer that joined one sample ago must be under comparison now"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn churn_during_a_handover_does_not_mask_the_handover() {
+    // Both at once: a peer leaves while the medium moves under the peer that
+    // stays. The intersection rule must ignore the departure and still report
+    // the move.
+    let before = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
+    let after = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
+    let (sampler, _) = scripted(vec![before, after]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    let change = expect_change(&mut rx).await;
+    assert_eq!(change.summary.moved.len(), 1);
+    assert_eq!(change.summary.moved[0].peer, peer(1));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_handover_burst_coalesces_into_one_event() {
-    // A handover is not atomic: the old address goes, then briefly nothing has
-    // a route, then the new address arrives. Reporting each step would have the
-    // handler probing every peer three times against a picture still in
-    // motion. The debounce must ride the burst out and report once, against the
-    // settled state.
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let gone = NetFingerprint::for_test(None, &[]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+    // A handover is not atomic: the route goes, then briefly there is none, then
+    // the new one arrives. Reporting each step would have the handler probing
+    // every peer three times against a picture still in motion. The debounce
+    // must ride the burst out and report once, against the settled state.
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let gone = all_from(&[peer(1)], None);
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![wlan, gone, cell]);
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -111,7 +217,7 @@ async fn a_handover_burst_coalesces_into_one_event() {
         "the burst must report once, not per step"
     );
     assert_eq!(
-        change.summary.v4_source,
+        change.summary.moved[0].after,
         Some(v4(10, 40, 0, 7)),
         "the reported state must be the settled one, not the mid-handover one"
     );
@@ -120,12 +226,12 @@ async fn a_handover_burst_coalesces_into_one_event() {
 
 #[tokio::test(start_paused = true)]
 async fn a_flap_that_settles_back_reports_nothing() {
-    // An address that leaves and returns within the debounce window is not a
+    // A route that leaves and returns within the debounce window is not a
     // medium change. Reporting it would have every peer probed for nothing,
     // which on a host with churning routes is exactly the reconnect storm this
     // is meant to avoid.
-    let steady = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let gone = NetFingerprint::for_test(None, &[]);
+    let steady = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let gone = all_from(&[peer(1)], None);
     let (sampler, _) = scripted(vec![steady.clone(), gone, steady]);
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -144,9 +250,9 @@ async fn an_unread_change_coalesces_rather_than_queues() {
     // which subsumes any number of changes. A second change arriving before the
     // first is drained must therefore drop, not queue: the node must never work
     // through a backlog of stale network states.
-    let a = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let b = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
-    let c = NetFingerprint::for_test(Some(v4(172, 16, 3, 2)), &[v4(172, 16, 3, 2)]);
+    let a = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let b = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
+    let c = all_from(&[peer(1)], Some(v4(172, 16, 3, 2)));
     let (sampler, _) = scripted(vec![a, b, c]);
     let (tx, mut rx) = mpsc::channel(1);
 
@@ -165,8 +271,8 @@ async fn an_unread_change_coalesces_rather_than_queues() {
 
 #[tokio::test(start_paused = true)]
 async fn a_closed_receiver_ends_the_poller() {
-    let a = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[]);
-    let b = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[]);
+    let a = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let b = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![a, b]);
     let (tx, rx) = mpsc::channel(1);
     drop(rx);
@@ -179,46 +285,123 @@ async fn a_closed_receiver_ends_the_poller() {
         .expect("and exit cleanly, not by panic");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_node_with_no_peers_reports_nothing() {
+    // Nothing is bound to the old path, so there is nothing to repair. The
+    // fingerprint is empty and stays empty however the host's interfaces move,
+    // which is the deliberate consequence of probing peers rather than the
+    // host.
+    let (sampler, _) = scripted(vec![NetFingerprint::for_test(&[])]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    expect_quiet(&mut rx, "a node holding no peers has nothing to report").await;
+}
+
+// === Live sampling ===
+
+/// An off-link destination standing in for a peer. RFC 5737 TEST-NET-1, so the
+/// route lookup is a route lookup and nothing is reachable there even by
+/// accident. Nothing is ever sent to it.
+const OFF_LINK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+
 #[test]
 fn sampling_the_live_host_is_self_consistent() {
     // Two samples taken back to back on an idle host describe the same
     // attachment. This is the property the whole detector rests on: if plain
     // sampling were noisy, every poll would look like a medium change.
-    let first = NetFingerprint::sample();
-    let second = NetFingerprint::sample();
+    let targets = [(peer(1), OFF_LINK)];
+    let first = NetFingerprint::sample(&targets);
+    let second = NetFingerprint::sample(&targets);
     assert_eq!(
         first, second,
         "consecutive samples of an unchanged host must agree"
     );
-}
-
-#[test]
-fn live_interface_addresses_exclude_loopback() {
-    // Loopback is present on every host and never changes, so including it
-    // would only add noise. Unix enumerates; elsewhere the set is empty by
-    // design and the assertion holds vacuously.
-    let sample = NetFingerprint::sample();
     assert!(
-        !sample.local_addrs.iter().any(|ip| ip.is_loopback()),
-        "loopback must not contribute to the fingerprint: {:?}",
-        sample.local_addrs
+        first.moved(&second).is_empty(),
+        "and must show no peer as having moved"
     );
 }
 
 #[test]
-fn summary_of_an_empty_diff_is_legible() {
-    let same = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    assert_eq!(same.diff(&same).to_string(), "no visible difference");
+fn every_target_is_recorded_whether_or_not_it_has_a_route() {
+    // A peer with no route must stay in the map as `None` rather than dropping
+    // out of it. Dropping it would make "the route to this peer just vanished"
+    // indistinguishable from "this peer was reaped", and the intersection rule
+    // would then discard exactly the event the detector exists to catch. The
+    // assertion holds on a CI container with no route at all.
+    let targets = [(peer(1), OFF_LINK), (peer(2), OFF_LINK)];
+    let sample = NetFingerprint::sample(&targets);
+    assert_eq!(sample.sources.len(), 2);
+    assert!(sample.sources.contains_key(&peer(1)));
+    assert!(sample.sources.contains_key(&peer(2)));
 }
 
 #[test]
-fn summary_names_the_new_source_address() {
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
-    let rendered = wlan.diff(&cell).to_string();
-    assert!(rendered.contains("v4 source -> 10.40.0.7"), "{}", rendered);
-    assert!(rendered.contains("+1 addr"), "{}", rendered);
-    assert!(rendered.contains("-1 addr"), "{}", rendered);
+fn a_probe_never_yields_a_loopback_or_unspecified_source() {
+    // Either of those would be the kernel declining to choose, not an answer,
+    // and treating one as an address would make the fingerprint move whenever
+    // the route lookup failed differently.
+    let sample = NetFingerprint::sample(&[(peer(1), OFF_LINK)]);
+    if let Some(Some(ip)) = sample.sources.get(&peer(1)) {
+        assert!(!ip.is_loopback(), "loopback source for an off-link probe");
+        assert!(
+            !ip.is_unspecified(),
+            "unspecified source reported as an answer"
+        );
+    }
+}
+
+// === Summary rendering ===
+
+#[test]
+fn summary_of_nothing_moving_is_legible() {
+    let summary = NetChangeSummary {
+        moved: Vec::new(),
+        probed: 4,
+    };
+    assert_eq!(summary.to_string(), "no visible difference");
+}
+
+#[test]
+fn summary_names_the_peer_and_its_new_source() {
+    let wlan = all_from(&[peer(0xab)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(0xab)], Some(v4(10, 40, 0, 7)));
+    let summary = NetChangeSummary {
+        moved: wlan.moved(&cell),
+        probed: 1,
+    };
+    let rendered = summary.to_string();
+    assert!(rendered.contains("1/1 peers"), "{}", rendered);
+    assert!(rendered.contains("abababab -> 10.40.0.7"), "{}", rendered);
+}
+
+#[test]
+fn summary_says_when_a_peer_lost_its_route() {
+    let up = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let down = all_from(&[peer(1)], None);
+    let summary = NetChangeSummary {
+        moved: up.moved(&down),
+        probed: 1,
+    };
+    assert!(summary.to_string().contains("no route"), "{}", summary);
+}
+
+#[test]
+fn summary_truncates_a_whole_table_moving_at_once() {
+    // The common case is every peer moving together, and a log line naming a
+    // hundred of them is not a log line.
+    let peers: Vec<NodeAddr> = (1..=10).map(peer).collect();
+    let before = all_from(&peers, Some(v4(192, 168, 1, 10)));
+    let after = all_from(&peers, Some(v4(10, 40, 0, 7)));
+    let summary = NetChangeSummary {
+        moved: before.moved(&after),
+        probed: peers.len(),
+    };
+    let rendered = summary.to_string();
+    assert!(rendered.contains("10/10 peers"), "{}", rendered);
+    assert!(rendered.contains("+7 more"), "{}", rendered);
 }
 
 // === Wake source ===
@@ -228,8 +411,8 @@ fn summary_names_the_new_source_address() {
 /// is an hour, so only the ping can be what woke the detector.
 #[tokio::test(start_paused = true)]
 async fn an_event_ping_wakes_the_detector_before_the_timer_would() {
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![wlan, cell]);
     let (tx, mut rx) = mpsc::channel(1);
     let (pings, ping_rx) = mpsc::channel(1);
@@ -240,7 +423,7 @@ async fn an_event_ping_wakes_the_detector_before_the_timer_would() {
     pings.send(()).await.expect("the backend can ping");
 
     let change = expect_change(&mut rx).await;
-    assert_eq!(change.summary.v4_source, Some(v4(10, 40, 0, 7)));
+    assert_eq!(change.summary.moved[0].after, Some(v4(10, 40, 0, 7)));
 }
 
 /// A netlink socket drops messages under memory pressure, and a backend can go
@@ -248,8 +431,8 @@ async fn an_event_ping_wakes_the_detector_before_the_timer_would() {
 /// so an event-driven backend is never worse than the poller it replaced.
 #[tokio::test(start_paused = true)]
 async fn the_backstop_still_fires_when_the_backend_says_nothing() {
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![wlan, cell]);
     let (tx, mut rx) = mpsc::channel(1);
     // Held, never sent on: the backend is alive but has missed the event.
@@ -260,7 +443,7 @@ async fn the_backstop_still_fires_when_the_backend_says_nothing() {
 
     let change = expect_change(&mut rx).await;
     assert_eq!(
-        change.summary.v4_source,
+        change.summary.moved[0].after,
         Some(v4(10, 40, 0, 7)),
         "the backstop must reach the change the backend missed"
     );
@@ -271,8 +454,8 @@ async fn the_backstop_still_fires_when_the_backend_says_nothing() {
 /// worse still.
 #[tokio::test(start_paused = true)]
 async fn a_dead_backend_falls_back_to_the_timer() {
-    let wlan = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let cell = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     let (sampler, _) = scripted(vec![wlan, cell]);
     let (tx, mut rx) = mpsc::channel(1);
     let (pings, ping_rx) = mpsc::channel(1);
@@ -285,7 +468,7 @@ async fn a_dead_backend_falls_back_to_the_timer() {
 
     let change = expect_change(&mut rx).await;
     assert_eq!(
-        change.summary.v4_source,
+        change.summary.moved[0].after,
         Some(v4(10, 40, 0, 7)),
         "detection must survive the backend it was using"
     );
@@ -408,8 +591,8 @@ async fn a_route_change_alone_reaches_the_watcher() {
 /// several times a second across the whole peer set.
 #[tokio::test(start_paused = true)]
 async fn reports_are_spaced_out_under_clean_flapping() {
-    let a = NetFingerprint::for_test(Some(v4(192, 168, 1, 10)), &[v4(192, 168, 1, 10)]);
-    let b = NetFingerprint::for_test(Some(v4(10, 40, 0, 7)), &[v4(10, 40, 0, 7)]);
+    let a = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let b = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
     // Alternates every sample: each poll sees a settled but different picture.
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
@@ -437,5 +620,158 @@ async fn reports_are_spaced_out_under_clean_flapping() {
         "consecutive reports must be at least {:?} apart, got {:?}",
         MIN_CHANGE_INTERVAL,
         started.elapsed()
+    );
+}
+
+/// The claim this whole shape exists to make: an interface appearing that is
+/// not the route to any peer does not move the fingerprint.
+///
+/// This is the case that made the host-wide address set unusable — a container
+/// bridge, a VPN, a `veth` pair or a tunnel coming up moved it, and the node
+/// answered by dropping every connected socket and heartbeating every peer, for
+/// a `docker compose up`. Here a second interface arrives with an address and a
+/// subnet of its own, carrying no route to the peer, and nothing is reported.
+///
+/// Structurally this cannot fail while the fingerprint holds only per-peer
+/// probe results — there is no host-wide enumeration left in the module to go
+/// wrong. The test is here so that a future signal added back into
+/// `NetFingerprint::sample` has to answer to it.
+///
+/// Like the watcher test above, this needs `CAP_NET_ADMIN` in a namespace it
+/// may reconfigure:
+///
+/// ```text
+/// unshare -rn cargo test --lib netmon -- --ignored --nocapture
+/// ```
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a private netns; run under `unshare -rn`"]
+async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint() {
+    use futures::TryStreamExt;
+    use std::net::Ipv4Addr;
+
+    // Its own destination, in RFC 5737 TEST-NET-2 rather than the TEST-NET-1
+    // that [`OFF_LINK`] uses: `unshare -rn` gives the whole test binary one
+    // namespace, so the routes the netlink test above installs are still there
+    // and a shared prefix collides with EEXIST depending on the order they run.
+    const NET: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 0);
+    const DEST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 9);
+
+    /// Bring up a dummy interface carrying `addr/24`, returning its index.
+    async fn dummy_up(handle: &rtnetlink::Handle, name: &str, addr: Ipv4Addr) -> u32 {
+        handle
+            .link()
+            .add(rtnetlink::LinkDummy::new(name).build())
+            .execute()
+            .await
+            .expect("creating a dummy link needs CAP_NET_ADMIN in this namespace");
+        let index = handle
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute()
+            .try_next()
+            .await
+            .expect("link query")
+            .expect("the link just created exists")
+            .header
+            .index;
+        handle
+            .address()
+            .add(index, std::net::IpAddr::V4(addr), 24)
+            .execute()
+            .await
+            .expect("adding an address");
+        handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .expect("bringing the link up");
+        index
+    }
+
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+
+    // The medium the peer is actually reached over: an interface plus the
+    // default route out of it.
+    let carrier = dummy_up(&handle, "mc-carrier", Ipv4Addr::new(10, 99, 0, 1)).await;
+    handle
+        .route()
+        .add(
+            rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                .output_interface(carrier)
+                .build(),
+        )
+        .execute()
+        .await
+        .expect("adding a default route");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let targets = [(peer(1), DEST)];
+    let before = NetFingerprint::sample(&targets);
+    assert_eq!(
+        before.sources.get(&peer(1)),
+        Some(&Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)))),
+        "the peer must be reached over the carrier before anything else appears, \
+         or this test proves nothing about what happens next"
+    );
+
+    // The interloper: a bridge-shaped interface with its own subnet, exactly
+    // what `docker compose up` leaves behind. It is up, it is not loopback, and
+    // it carries an address — every property the old host-wide set keyed on —
+    // but no peer is reached through it.
+    dummy_up(&handle, "mc-bridge", Ipv4Addr::new(172, 30, 0, 1)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let after = NetFingerprint::sample(&targets);
+    assert_eq!(
+        before.moved(&after),
+        Vec::new(),
+        "an interface carrying no route to any peer must not be a medium change"
+    );
+
+    // The other half, in the same namespace and against the same live sampler:
+    // put a more specific route to the peer out of the interloper, and the
+    // fingerprint must move with it. Two things ride on this. It stops the
+    // assertion above passing because sampling had quietly stopped working,
+    // which is the failure mode a negative assertion is worst at catching. And
+    // it is the per-peer route case in its own right — the default route never
+    // moves here, nothing about the host's attachment changes, and no
+    // host-wide sample could represent this at all.
+    let bridge = handle
+        .link()
+        .get()
+        .match_name("mc-bridge".to_string())
+        .execute()
+        .try_next()
+        .await
+        .expect("link query")
+        .expect("mc-bridge exists")
+        .header
+        .index;
+    handle
+        .route()
+        .add(
+            rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(NET, 24)
+                .output_interface(bridge)
+                .build(),
+        )
+        .execute()
+        .await
+        .expect("adding a more specific route to the peer");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let moved = after.moved(&NetFingerprint::sample(&targets));
+    assert_eq!(
+        moved,
+        vec![PeerSourceMove {
+            peer: peer(1),
+            before: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1))),
+            after: Some(IpAddr::V4(Ipv4Addr::new(172, 30, 0, 1))),
+        }],
+        "the route to the peer moving is exactly what must be reported"
     );
 }

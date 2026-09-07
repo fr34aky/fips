@@ -257,3 +257,87 @@ async fn a_change_with_no_peers_is_harmless() {
     node.handle_net_change(NetChange::for_test(1)).await;
     assert!(node.peers.is_empty());
 }
+
+/// The detector reads the peer table through the published entity snapshot,
+/// and this is the seam: what a peer's transport address is determines whether
+/// it arrives on the other side as something to probe. Nothing else in the
+/// tree exercises `PeerRow::probe_target`, because nothing renders it — so if
+/// the publish site stopped populating it, every other test here would still
+/// pass while the detector silently probed an empty table and never reported
+/// anything again.
+///
+/// Each case re-pins the same established peer, because the address is the
+/// only variable that matters: the projection is a property of the address,
+/// not of the transport it was learned on. (The harness's own peers sit on a
+/// synthetic `loopback:1` transport, which is itself correctly unprobeable.)
+#[tokio::test]
+async fn only_a_peer_with_an_ip_endpoint_reaches_the_probe() {
+    // (address as the peer carries it, the destination the detector should
+    // probe, why)
+    let cases: [(TransportAddr, Option<&str>, &str); 6] = [
+        (
+            TransportAddr::from_string("10.0.0.2:2121"),
+            Some("10.0.0.2:2121"),
+            "an ordinary IPv4 peer is the whole point",
+        ),
+        (
+            TransportAddr::from_string("[2001:db8::1]:2121"),
+            Some("[2001:db8::1]:2121"),
+            "IPv6 literals round-trip through the row",
+        ),
+        (
+            TransportAddr::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            None,
+            "a MAC has no IP destination to ask the routing table about",
+        ),
+        (
+            TransportAddr::from_string("example.com:2121"),
+            None,
+            "resolving a hostname would put DNS on the detector's sample path",
+        ),
+        (
+            TransportAddr::from_string("abcdefghij234567.onion:2121"),
+            None,
+            "a .onion is reached through a local proxy, not a route",
+        ),
+        (
+            TransportAddr::from_string("[fe80::1%eth0]:2121"),
+            None,
+            "a scoped link-local literal is not a parseable SocketAddr",
+        ),
+    ];
+
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+    let transport_id = nodes[0]
+        .node
+        .peers
+        .get(&addr_1)
+        .and_then(|p| p.transport_id())
+        .expect("peer 1 has a transport");
+
+    for (addr, expected, why) in cases {
+        nodes[0]
+            .node
+            .peers
+            .get_mut(&addr_1)
+            .expect("peer 1 is established")
+            .set_current_addr(transport_id, addr.clone());
+
+        // The snapshot is published from the tick, which is its only writer.
+        nodes[0].node.record_stats_history();
+        let snapshot = nodes[0].node.entities_snapshot.load_full();
+
+        let got = crate::node::netmon::probe_targets(&snapshot)
+            .into_iter()
+            .find(|(peer, _)| *peer == addr_1)
+            .map(|(_, dest)| dest);
+
+        let want = expected.map(|s| s.parse::<std::net::SocketAddr>().unwrap());
+        assert_eq!(got, want, "{}: {}", addr, why);
+    }
+
+    cleanup_nodes(&mut nodes).await;
+}

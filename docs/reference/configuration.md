@@ -202,7 +202,7 @@ an interface arriving or leaving — and rebinds the send path immediately.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `node.netmon.enabled` | bool | `true` | Whether medium-change detection runs |
-| `node.netmon.poll_interval_secs` | u64 | `5` | How often the host's network attachment is sampled (backstop period where an event-driven backend exists) |
+| `node.netmon.poll_interval_secs` | u64 | `5` | How often the path to each peer is sampled (backstop period where an event-driven backend exists) |
 | `node.netmon.debounce_ms` | u64 | `250` | How long to wait for the picture to settle before acting (`0` disables) |
 
 Established UDP peers use a per-peer `connect()`-ed socket for the send fast
@@ -219,9 +219,34 @@ connected socket is reinstalled on a later tick) and heartbeats every peer on a
 connectionless transport at once so the far side re-pins to the new source
 address. A peer reached over TCP, Tor, Nym or BLE is left to its periodic
 heartbeat, since sending to it here would block the node's receive loop on a
-stream the medium change has very likely just stranded; those transports
-re-dial on send. No peering is torn down: sessions, tree positions and routes
-survive the switch.
+stream the medium change has very likely just stranded. No peering is torn
+down: sessions, tree positions and routes survive the switch.
+
+**What counts as a change.** For each peer whose transport address is a numeric
+IP endpoint, the node asks the kernel which local address it would use to reach
+*that peer* — a `connect(2)` on a UDP socket, which resolves the route and sends
+nothing. A change is reported when a peer present in two consecutive samples is
+now reached from a different local address, or has stopped being reachable at
+all.
+
+Because the question is asked per peer, an interface the node does not peer over
+cannot trigger anything: a container bridge, a VPN, a `veth` pair or a tunnel
+appearing is not the route to any peer, so it does not enter the sample. A peer
+on the same LAN, reached by its subnet route rather than the default route, is
+covered as well as one across the internet, and so is a more specific route
+moving under a single peer.
+
+Peers appearing and leaving are ignored on their own — that is ordinary node
+behaviour and says nothing about the medium. A peer whose address is not a
+probeable IP endpoint contributes nothing: a MAC on Ethernet or BLE, a `.onion`
+or Nym recipient reached through a local proxy, an IPv6 literal with a scope
+suffix, or a peer still carrying the hostname it was configured with (resolving
+one would put a DNS lookup on the sample path; the address becomes numeric as
+soon as an authenticated packet arrives from the peer). A node holding no peers
+detects nothing, which is correct — it has nothing bound to the old path.
+
+The cost is three syscalls per peer per sample, bounded by
+`node.limits.max_peers`, with no packets sent and no name resolution.
 
 Detection uses the best backend the platform has:
 

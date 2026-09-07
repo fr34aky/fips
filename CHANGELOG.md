@@ -47,13 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Node lifecycle
 
 - Transport-medium change detection, controlled by the new `node.netmon.*`
-  block (on by default). The node samples a coarse fingerprint of its network
-  attachment — the source addresses the routing table would pick for an off-link
-  destination, plus the set of up, non-loopback interface addresses — and
-  reports a change once the picture settles. A handover is not atomic (the old
-  address goes, briefly nothing has a route, the new one arrives), so a short
-  debounce coalesces the burst into one event and a fingerprint that settles
-  back where it started reports nothing. Linux subscribes to `NETLINK_ROUTE`
+  block (on by default). For each peer whose transport address is a numeric IP
+  endpoint, the node asks the kernel which local address it would use to reach
+  *that peer* — a `connect(2)` on a UDP socket, which resolves the route and
+  sends nothing — and reports a change once some peer held across two
+  consecutive samples is reached from a different local address, or has stopped
+  being reachable at all. Asking the question per peer rather than about the
+  host is what keeps it quiet: a container bridge, a VPN, a `veth` pair or a
+  tunnel appearing is not the route to any peer and cannot move the
+  fingerprint, while a peer on the same LAN — reached by its subnet route, not
+  the default route — is covered, as is a more specific route moving under a
+  single peer. Peers joining and leaving are ignored on their own, being
+  ordinary node behaviour rather than a statement about the medium. A peer
+  addressed by MAC, by `.onion` or Nym recipient, by a scoped IPv6 literal, or
+  by a hostname it has not yet been heard from on, has no route to ask about
+  and contributes nothing; a node with no peers detects nothing, having nothing
+  bound to the old path to repair. The peer table is read through the node's
+  existing lock-free entity snapshot, so the detector stays a detached task
+  holding no node state. A handover is not atomic (the route goes, briefly
+  there is none, the new one arrives), so a short debounce coalesces the burst
+  into one event and a fingerprint that settles back where it started reports
+  nothing. Linux subscribes to `NETLINK_ROUTE`
   multicast (the groups `ip monitor` uses) and macOS and FreeBSD to a
   `PF_ROUTE` socket, both reacting to the kernel event in milliseconds; every
   other platform samples on a timer at `node.netmon.poll_interval_secs`, which

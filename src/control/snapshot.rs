@@ -18,6 +18,7 @@
 //! also advances only on the tick.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::identity::NodeAddr;
@@ -629,6 +630,19 @@ pub(crate) struct PeerRow {
     pub is_parent: bool,
     pub is_child: bool,
     pub transport_addr: Option<String>,
+    /// The peer's current transport address as a numeric IP endpoint, when it
+    /// is one. Not rendered anywhere: this is the medium-change detector's
+    /// read of the peer table (see [`crate::node::netmon`]), carried here
+    /// because the detector is a detached task and this snapshot is the
+    /// node's existing lock-free read side.
+    ///
+    /// `None` covers everything that is not a probeable IP destination — a
+    /// MAC on Ethernet or BLE, a `.onion` or Nym recipient, a peer still
+    /// carrying the hostname it was configured with, an IPv6 literal with a
+    /// scope suffix. Typed rather than re-parsed from `transport_addr` above
+    /// so a change to that string's rendering cannot silently leave the
+    /// detector with nothing to probe.
+    pub probe_target: Option<SocketAddr>,
     pub link_info: Option<PeerLinkInfo>,
     pub tree_depth: Option<usize>,
     /// `effective_depth = tree_depth + link_cost` — the same quantity
