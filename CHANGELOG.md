@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data plane
 
-- A peer that stops reading can no longer stall the node. TCP, Tor and Nym
-  wrote to their sockets directly from the caller's task, and `write_all`
+- A peer that stops reading can no longer stall the node. TCP, Tor, Nym and
+  BLE wrote to their links directly from the caller's task, and a write
   blocks once the peer's receive window and this node's send buffer are both
   full — which is what a peer that has gone away, or whose path has just
   changed medium, produces. The callers are the rx loop's tick handlers, so a
@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then fail immediately, which is the signal the caller's retry and liveness
   handling already expects. Frames are written whole, and a write error takes
   the connection down with it, so a peer never sees a partial frame it cannot
-  resynchronise from.
+  resynchronise from. BLE was the worst of the four: it awaited the L2CAP
+  write while holding the connection-pool mutex, so one unresponsive peer
+  froze every other BLE operation as well — connects, evictions, and each
+  receive loop's teardown.
 
 - A per-peer `connect()`-ed UDP socket is no longer left pinned to an interface
   the host has moved off. Established UDP peers get their own socket for the
