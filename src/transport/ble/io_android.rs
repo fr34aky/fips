@@ -700,6 +700,17 @@ impl BleStream for AndroidStream {
         // this out via `next_send`. The queue is shallow (`SEND_QUEUE_CAP`) and
         // this waits for a slot rather than dropping, so backpressure reaches
         // the layers above instead of the link bufferbloating.
+        //
+        // The wait is only safe because of who calls it, and there are exactly
+        // two callers. The connection's writer task is one: an embedder that
+        // stops draining parks that task alone, and the layer above it is the
+        // connection's own bounded queue, which fills and starts refusing
+        // sends without waiting on anything. `pubkey_exchange` is the other,
+        // and it is safe for a different reason: it wraps this call in
+        // `tokio::time::timeout`, so its wait is bounded whatever the embedder
+        // does. Adding a third caller on a caller's task would put an
+        // unbounded wait back on the rx loop, which is the defect the writer
+        // task exists to remove.
         let mut payload = data.to_vec();
         loop {
             if self.closed.load(Ordering::Relaxed) {
