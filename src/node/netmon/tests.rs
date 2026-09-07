@@ -181,6 +181,72 @@ async fn a_peer_that_joins_is_compared_on_the_sample_after() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_move_in_the_window_after_a_peer_joins_is_still_reported() {
+    // The hole the intersection rule opens on its own, and the reason a peer
+    // seen for the first time is judged against its socket rather than skipped.
+    //
+    // `last` gains a peer only at the first wake after it appears, so a medium
+    // change inside that window is the detector's *first* sight of that peer:
+    // there is no earlier probe answer to compare against, the intersection is
+    // empty, and adopting the sample silently swallows the very event being
+    // adopted. Meanwhile the peer's connected socket is still pinned to the
+    // path the host has just left, and nothing else will repair it — the
+    // outage runs to `link_dead_timeout_secs`.
+    //
+    // The window is up to one poll interval after every peer that
+    // authenticates, and a medium change is itself what wakes the detector, so
+    // the two coincide readily. Its socket is bound on the old path while the
+    // probe already answers with the new one, and that disagreement is the
+    // report.
+    let empty = NetFingerprint::for_test(&[]);
+    let joined_after_the_move = NetFingerprint::for_test_bound(&[(
+        peer(1),
+        Some(v4(10, 40, 0, 7)),
+        Some(v4(192, 168, 1, 10)),
+    )]);
+    let (sampler, _) = scripted(vec![empty, joined_after_the_move]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    let change = expect_change(&mut rx).await;
+    assert_eq!(
+        change.summary.moved,
+        vec![PeerSourceMove {
+            peer: peer(1),
+            before: Some(v4(192, 168, 1, 10)),
+            after: Some(v4(10, 40, 0, 7)),
+        }],
+        "a peer whose socket is bound off the current path must be reported on \
+         first sight, not adopted"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_joining_onto_a_settled_path_is_still_not_a_change() {
+    // The other side of that rule: judging a first-seen peer against its socket
+    // must not turn ordinary peer churn into a medium change. A peer that
+    // authenticates while nothing is moving has its socket bound exactly where
+    // the probe says its traffic goes, so there is nothing to report.
+    let empty = NetFingerprint::for_test(&[]);
+    let joined = NetFingerprint::for_test_bound(&[(
+        peer(1),
+        Some(v4(192, 168, 1, 10)),
+        Some(v4(192, 168, 1, 10)),
+    )]);
+    let (sampler, _) = scripted(vec![empty, joined]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    expect_quiet(
+        &mut rx,
+        "a peer joining onto a path that has not moved is not a medium change",
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn churn_during_a_handover_does_not_mask_the_handover() {
     // Both at once: a peer leaves while the medium moves under the peer that
     // stays. The intersection rule must ignore the departure and still report
@@ -306,12 +372,21 @@ async fn a_node_with_no_peers_reports_nothing() {
 /// accident. Nothing is ever sent to it.
 const OFF_LINK: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
 
+/// A probe target for `peer`, with no connected socket behind it.
+fn target(p: NodeAddr, dest: SocketAddr) -> ProbeTarget {
+    ProbeTarget {
+        peer: p,
+        dest,
+        bound: None,
+    }
+}
+
 #[test]
 fn sampling_the_live_host_is_self_consistent() {
     // Two samples taken back to back on an idle host describe the same
     // attachment. This is the property the whole detector rests on: if plain
     // sampling were noisy, every poll would look like a medium change.
-    let targets = [(peer(1), OFF_LINK)];
+    let targets = [target(peer(1), OFF_LINK)];
     let first = NetFingerprint::sample(&targets);
     let second = NetFingerprint::sample(&targets);
     assert_eq!(
@@ -331,7 +406,7 @@ fn every_target_is_recorded_whether_or_not_it_has_a_route() {
     // indistinguishable from "this peer was reaped", and the intersection rule
     // would then discard exactly the event the detector exists to catch. The
     // assertion holds on a CI container with no route at all.
-    let targets = [(peer(1), OFF_LINK), (peer(2), OFF_LINK)];
+    let targets = [target(peer(1), OFF_LINK), target(peer(2), OFF_LINK)];
     let sample = NetFingerprint::sample(&targets);
     assert_eq!(sample.sources.len(), 2);
     assert!(sample.sources.contains_key(&peer(1)));
@@ -343,8 +418,8 @@ fn a_probe_never_yields_a_loopback_or_unspecified_source() {
     // Either of those would be the kernel declining to choose, not an answer,
     // and treating one as an address would make the fingerprint move whenever
     // the route lookup failed differently.
-    let sample = NetFingerprint::sample(&[(peer(1), OFF_LINK)]);
-    if let Some(Some(ip)) = sample.sources.get(&peer(1)) {
+    let sample = NetFingerprint::sample(&[target(peer(1), OFF_LINK)]);
+    if let Some(Some(ip)) = sample.sources.get(&peer(1)).map(|p| p.current) {
         assert!(!ip.is_loopback(), "loopback source for an off-link probe");
         assert!(
             !ip.is_unspecified(),
@@ -709,11 +784,11 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
         .expect("adding a default route");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let targets = [(peer(1), DEST)];
+    let targets = [target(peer(1), DEST)];
     let before = NetFingerprint::sample(&targets);
     assert_eq!(
-        before.sources.get(&peer(1)),
-        Some(&Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)))),
+        before.sources.get(&peer(1)).map(|p| p.current),
+        Some(Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)))),
         "the peer must be reached over the carrier before anything else appears, \
          or this test proves nothing about what happens next"
     );
@@ -773,5 +848,199 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
             after: Some(IpAddr::V4(Ipv4Addr::new(172, 30, 0, 1))),
         }],
         "the route to the peer moving is exactly what must be reported"
+    );
+}
+
+/// An interface going down and coming back up, which the docker suite does not
+/// cover: it moves the default route with both interfaces held up throughout,
+/// deliberately, so that it tests a medium change rather than a link failure.
+/// This is the other shape — the interface carrying a peer is taken away and
+/// given back.
+///
+/// Three transitions, and the third is the one worth having. Downing the
+/// interface a peer is reached over must report; bringing it back must report;
+/// downing an interface no peer is reached over must not. That last case is the
+/// down-direction counterpart of the container test above, and it is the one a
+/// link-state watcher gets wrong — the kernel emits exactly the same link event
+/// for all three.
+///
+/// Routes here are specific to this test's own prefix rather than defaults, so
+/// it shares the `unshare -rn` namespace with the tests above without fighting
+/// them over the default route.
+///
+/// ```text
+/// unshare -rn cargo test --lib netmon -- --ignored --nocapture
+/// ```
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a private netns; run under `unshare -rn`"]
+async fn an_interface_going_down_is_reported_only_when_a_peer_was_reached_over_it() {
+    use futures::TryStreamExt;
+    use std::net::Ipv4Addr;
+
+    // RFC 5737 TEST-NET-3, so this test's routes cannot collide with either of
+    // the two above in the shared namespace.
+    const NET: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 0);
+    const DEST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 9);
+    const PRIMARY: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
+    const BACKUP: Ipv4Addr = Ipv4Addr::new(10, 78, 0, 1);
+    const IDLE: Ipv4Addr = Ipv4Addr::new(10, 79, 0, 1);
+
+    let (connection, handle, _) = rtnetlink::new_connection().expect("netlink connection");
+    tokio::spawn(connection);
+
+    async fn index_of(handle: &rtnetlink::Handle, name: &str) -> u32 {
+        handle
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute()
+            .try_next()
+            .await
+            .expect("link query")
+            .expect("the link exists")
+            .header
+            .index
+    }
+
+    async fn dummy_up(handle: &rtnetlink::Handle, name: &str, addr: Ipv4Addr) -> u32 {
+        handle
+            .link()
+            .add(rtnetlink::LinkDummy::new(name).build())
+            .execute()
+            .await
+            .expect("creating a dummy link needs CAP_NET_ADMIN in this namespace");
+        let index = index_of(handle, name).await;
+        handle
+            .address()
+            .add(index, std::net::IpAddr::V4(addr), 24)
+            .execute()
+            .await
+            .expect("adding an address");
+        handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .expect("bringing the link up");
+        index
+    }
+
+    async fn set_link(handle: &rtnetlink::Handle, index: u32, up: bool) {
+        let msg = if up {
+            rtnetlink::LinkUnspec::new_with_index(index).up().build()
+        } else {
+            rtnetlink::LinkUnspec::new_with_index(index).down().build()
+        };
+        handle
+            .link()
+            .set(msg)
+            .execute()
+            .await
+            .expect("changing link state");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    async fn route_to_peer(handle: &rtnetlink::Handle, index: u32, metric: u32) {
+        handle
+            .route()
+            .add(
+                rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                    .destination_prefix(NET, 24)
+                    .output_interface(index)
+                    .priority(metric)
+                    .build(),
+            )
+            .execute()
+            .await
+            .expect("adding a route to the peer");
+    }
+
+    // Two paths to the peer, primary preferred, plus an interface carrying no
+    // route to it at all.
+    let primary = dummy_up(&handle, "mc-updn-a", PRIMARY).await;
+    let backup = dummy_up(&handle, "mc-updn-b", BACKUP).await;
+    let idle = dummy_up(&handle, "mc-updn-c", IDLE).await;
+    route_to_peer(&handle, primary, 100).await;
+    route_to_peer(&handle, backup, 200).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let targets = [target(peer(1), DEST)];
+    let on_primary = NetFingerprint::sample(&targets);
+    assert_eq!(
+        on_primary.sources.get(&peer(1)).map(|p| p.current),
+        Some(Some(IpAddr::V4(PRIMARY))),
+        "the peer must start out on the primary, or nothing below means anything"
+    );
+
+    // 1. The interface the peer is reached over goes down. The route with it,
+    //    so the kernel falls back to the higher-metric path.
+    set_link(&handle, primary, false).await;
+    let on_backup = NetFingerprint::sample(&targets);
+    assert_eq!(
+        on_primary.moved(&on_backup),
+        vec![PeerSourceMove {
+            peer: peer(1),
+            before: Some(IpAddr::V4(PRIMARY)),
+            after: Some(IpAddr::V4(BACKUP)),
+        }],
+        "losing the interface a peer was reached over is a medium change"
+    );
+
+    // 2. And back. Not symmetric with the above: this direction returns to an
+    //    interface that has been holding a stale address throughout.
+    //
+    //    The route has to be re-added by hand, because the kernel deleted it
+    //    when the link went down and does not restore it when the link returns
+    //    — verified in a namespace, not assumed. On a real host that re-add is
+    //    what the DHCP client or the network manager does on carrier-up, so
+    //    re-adding it here is modelling the real sequence rather than working
+    //    around it. The address, by contrast, does survive, which is exactly
+    //    the trap the detector exists for: the interface is up and addressed
+    //    again the instant the link returns, and only the route says whether
+    //    anything is reached over it.
+    set_link(&handle, primary, true).await;
+    route_to_peer(&handle, primary, 100).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let back_on_primary = NetFingerprint::sample(&targets);
+    assert_eq!(
+        on_backup.moved(&back_on_primary),
+        vec![PeerSourceMove {
+            peer: peer(1),
+            before: Some(IpAddr::V4(BACKUP)),
+            after: Some(IpAddr::V4(PRIMARY)),
+        }],
+        "the interface returning and reclaiming the route is a medium change too"
+    );
+
+    // 3. An interface no peer is reached over goes down. Same kernel link
+    //    event as case 1, and it must report nothing.
+    set_link(&handle, idle, false).await;
+    assert_eq!(
+        back_on_primary.moved(&NetFingerprint::sample(&targets)),
+        Vec::new(),
+        "an interface no peer was reached over going down is not a medium change"
+    );
+
+    // 4. Every path this test installed goes away at once. Where the peer
+    //    lands afterwards is deliberately not asserted: it depends on what
+    //    else the host offers, and in this shared namespace it falls back to
+    //    the default route another `--ignored` test installed. What must hold
+    //    either way is that the peer moved off the primary and that the move
+    //    is reported — a peer resolving to nothing at all is pinned by
+    //    `every_target_is_recorded_whether_or_not_it_has_a_route`, which runs
+    //    on a CI container with no route to fall back to.
+    set_link(&handle, primary, false).await;
+    set_link(&handle, backup, false).await;
+    let stranded = NetFingerprint::sample(&targets);
+    assert_ne!(
+        stranded.sources.get(&peer(1)).map(|p| p.current),
+        Some(Some(IpAddr::V4(PRIMARY))),
+        "the peer cannot still be reached over an interface that is down"
+    );
+    assert_eq!(
+        back_on_primary.moved(&stranded).len(),
+        1,
+        "losing every path this test installed is a medium change"
     );
 }

@@ -126,6 +126,17 @@
 //! answering entirely — the route to it is gone — is a move to "no source
 //! address" and does count, because that peer is exactly the one now stranded.
 //!
+//! A peer seen for the *first* time is the one case the intersection cannot
+//! decide, and it cannot simply be skipped: the sample in which a peer first
+//! appears may already be the post-change one, and adopting it silently would
+//! swallow the event while that peer's socket stayed pinned to the path the
+//! host has just left. Such a peer is judged against its own send path
+//! instead — the source `connect(2)` pinned its socket to, which needs no
+//! history and asks directly whether that socket is already stale. Churn still
+//! fires nothing on its own, because a peer joining onto a path that has not
+//! moved is pinned exactly where its traffic goes. See
+//! [`NetFingerprint::moved`] for the residual this leaves.
+//!
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -171,17 +182,32 @@ pub(crate) type NetChangeTx = mpsc::Sender<NetChange>;
 /// Where this host sits relative to the peers it holds: one local source
 /// address per peer, as the routing table would choose it right now.
 ///
-/// The contents are compared over the intersection of two samples' peer sets —
-/// see [`NetFingerprint::moved`], which is the whole definition of "the medium
-/// changed" and the only thing the detector asks of a sample.
+/// Each peer carries both the answer to that question and the source its
+/// connected socket is already pinned to, because a peer seen for the first
+/// time has no earlier sample to be compared against and is judged against its
+/// own socket instead. [`NetFingerprint::moved`] is the whole definition of
+/// "the medium changed" and the only thing the detector asks of a sample.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NetFingerprint {
-    /// Peer → the local address the kernel would send to it from. A peer whose
-    /// route lookup fails maps to `None`, which is a distinct and meaningful
-    /// value rather than an absent key: the peer is still ours, and having no
-    /// route to it is precisely the state worth reacting to. A peer with no
-    /// probeable address never appears at all.
-    sources: BTreeMap<NodeAddr, Option<IpAddr>>,
+    /// Peer → where its traffic leaves from. A peer with no probeable address
+    /// never appears at all.
+    sources: BTreeMap<NodeAddr, PeerPath>,
+}
+
+/// One peer's local end, from two directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerPath {
+    /// The local address the kernel would choose to reach this peer right now.
+    /// `None` when the route lookup fails, which is a real value rather than a
+    /// missing one: the peer is still ours, and having no route to it is
+    /// precisely the state worth reacting to.
+    current: Option<IpAddr>,
+    /// The local address this peer's connected UDP socket is bound to, if it
+    /// has one. Unlike `current` this is not a question put to the kernel — it
+    /// is what the send path is already doing, and it is the only thing that
+    /// gives a peer the detector has not seen before a baseline to be judged
+    /// against. See [`NetFingerprint::moved`].
+    bound: Option<IpAddr>,
 }
 
 impl NetFingerprint {
@@ -193,49 +219,137 @@ impl NetFingerprint {
     /// `node.limits.max_peers`, so a full table is a few hundred syscalls on a
     /// multi-second timer; it runs inline in the detector's task rather than
     /// through `spawn_blocking`.
-    pub(crate) fn sample(targets: &[(NodeAddr, SocketAddr)]) -> Self {
+    pub(in crate::node) fn sample(targets: &[ProbeTarget]) -> Self {
         Self {
             sources: targets
                 .iter()
-                .map(|(peer, dest)| (*peer, preferred_source(*dest)))
+                .map(|t| {
+                    (
+                        t.peer,
+                        PeerPath {
+                            current: preferred_source(t.dest),
+                            bound: t.bound,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
 
     /// Build a fingerprint directly, so a test can script a sequence of
-    /// samples instead of probing real peers.
+    /// samples instead of probing real peers. No peer has a connected socket;
+    /// [`Self::for_test_bound`] is the variant that gives one.
     #[cfg(test)]
     pub(crate) fn for_test(sources: &[(NodeAddr, Option<IpAddr>)]) -> Self {
         Self {
-            sources: sources.iter().copied().collect(),
+            sources: sources
+                .iter()
+                .map(|(peer, current)| {
+                    (
+                        *peer,
+                        PeerPath {
+                            current: *current,
+                            bound: None,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
-    /// Which peers held by *both* samples are now reached from a different
-    /// local address.
+    /// As [`Self::for_test`], with each peer's connected socket bound where the
+    /// third element says.
+    #[cfg(test)]
+    pub(crate) fn for_test_bound(sources: &[(NodeAddr, Option<IpAddr>, Option<IpAddr>)]) -> Self {
+        Self {
+            sources: sources
+                .iter()
+                .map(|(peer, current, bound)| {
+                    (
+                        *peer,
+                        PeerPath {
+                            current: *current,
+                            bound: *bound,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Which peers are now leaving from somewhere other than where their
+    /// traffic is actually going out.
     ///
-    /// The intersection is the point. A peer that has only just been
-    /// authenticated, or one that has just been reaped, differs between the two
-    /// samples for reasons that have nothing to do with the host's attachment,
-    /// and the reaction — drop every connected socket, heartbeat every peer —
-    /// is far too blunt to fire on ordinary peer churn. So a key missing from
-    /// either side is skipped, and only a peer observed twice can report
-    /// anything.
+    /// Two rules, because there are two ways to know:
+    ///
+    /// **A peer in both samples** is judged on whether its probe answer moved.
+    /// The comparison is over the *intersection* of the two peer sets, never
+    /// the union: a peer that has only just been authenticated, or one that has
+    /// just been reaped, differs between the samples for reasons that have
+    /// nothing to do with the host's attachment, and the reaction — drop every
+    /// connected socket, heartbeat every peer — is far too blunt to fire on
+    /// ordinary peer churn.
+    ///
+    /// **A peer only in the newer sample** has no previous probe answer to be
+    /// compared against, and skipping it outright leaves a hole this detector
+    /// cannot afford. `last` gains a peer only at the first wake *after* it
+    /// appears, so a medium change in that window is the detector's first
+    /// sight of that peer, and adopting it silently would swallow the very
+    /// event being adopted — while the peer's connected socket stays pinned to
+    /// the path the host has just left. The window is up to one
+    /// `poll_interval_secs` after every peer that authenticates, and a medium
+    /// change wakes the detector, so the two coincide readily rather than
+    /// rarely.
+    ///
+    /// So such a peer is judged against `bound` instead: the address its
+    /// connected socket is *actually* using. That needs no history — it asks
+    /// whether the send path is already stale, which is the question the whole
+    /// subsystem exists to answer, and it is exactly the peer that would
+    /// otherwise be left stranded. Churn still cannot fire anything on its own:
+    /// a peer joining onto a path that has not moved has `bound == current` and
+    /// reports nothing.
+    ///
+    /// A new peer with no connected socket (`bound` is `None`) is still
+    /// skipped, and is the residual. It is a much smaller one: with no socket
+    /// there is no pinning to repair, since the wildcard socket resolves a
+    /// route per packet, so the peer is not stranded. It costs only the
+    /// immediate heartbeat that would have told the far side to re-pin, leaving
+    /// it to notice at the next `heartbeat_interval_secs`.
     ///
     /// An empty result means nothing moved; it is the detector's entire
     /// definition of "no change".
     fn moved(&self, next: &Self) -> Vec<PeerSourceMove> {
-        self.sources
+        next.sources
             .iter()
-            .filter_map(|(peer, before)| next.sources.get(peer).map(|after| (peer, before, after)))
-            .filter(|(_, before, after)| before != after)
-            .map(|(peer, before, after)| PeerSourceMove {
-                peer: *peer,
-                before: *before,
-                after: *after,
+            .filter_map(|(peer, now)| {
+                let before = match self.sources.get(peer) {
+                    // Seen before: its own previous probe answer.
+                    Some(then) => then.current,
+                    // First sight: what its socket is bound to, if it has one.
+                    None => match now.bound {
+                        Some(bound) => Some(bound),
+                        None => return None,
+                    },
+                };
+                (before != now.current).then_some(PeerSourceMove {
+                    peer: *peer,
+                    before,
+                    after: now.current,
+                })
             })
             .collect()
     }
+}
+
+/// One peer to probe: where to aim, and what its send path is already using.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) struct ProbeTarget {
+    /// The peer this is about.
+    pub peer: NodeAddr,
+    /// Its transport address — the destination the route lookup is run for.
+    pub dest: SocketAddr,
+    /// The local address its connected UDP socket is bound to, if it has one.
+    pub bound: Option<IpAddr>,
 }
 
 /// One peer whose local source address changed between two samples.
@@ -483,11 +597,17 @@ pub(crate) fn spawn_detector(
 /// a MAC, a `.onion`, a Nym recipient and an unresolved hostname all arrive
 /// here as `None` and are skipped, with no per-transport special-casing in
 /// this module.
-pub(in crate::node) fn probe_targets(snapshot: &EntitySnapshot) -> Vec<(NodeAddr, SocketAddr)> {
+pub(in crate::node) fn probe_targets(snapshot: &EntitySnapshot) -> Vec<ProbeTarget> {
     snapshot
         .peers
         .iter()
-        .filter_map(|row| row.probe_target.map(|dest| (row.node_addr, dest)))
+        .filter_map(|row| {
+            row.probe_target.map(|dest| ProbeTarget {
+                peer: row.node_addr,
+                dest,
+                bound: row.bound_source,
+            })
+        })
         .collect()
 }
 

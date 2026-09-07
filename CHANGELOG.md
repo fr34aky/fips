@@ -58,7 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fingerprint, while a peer on the same LAN — reached by its subnet route, not
   the default route — is covered, as is a more specific route moving under a
   single peer. Peers joining and leaving are ignored on their own, being
-  ordinary node behaviour rather than a statement about the medium. A peer
+  ordinary node behaviour rather than a statement about the medium — except
+  that a peer seen for the first time is checked against its own
+  `connect()`-ed socket, and reported if that socket is pinned to a source the
+  routing table would no longer choose, so a medium change in the window
+  between a peer authenticating and the next sample is not adopted silently
+  while that peer sits stranded on the old path. A peer
   addressed by MAC, by `.onion` or Nym recipient, by a scoped IPv6 literal, or
   by a hostname it has not yet been heard from on, has no route to ask about
   and contributes nothing; a node with no peers detects nothing, having nothing

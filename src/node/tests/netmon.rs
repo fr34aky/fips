@@ -332,12 +332,69 @@ async fn only_a_peer_with_an_ip_endpoint_reaches_the_probe() {
 
         let got = crate::node::netmon::probe_targets(&snapshot)
             .into_iter()
-            .find(|(peer, _)| *peer == addr_1)
-            .map(|(_, dest)| dest);
+            .find(|t| t.peer == addr_1)
+            .map(|t| t.dest);
 
         let want = expected.map(|s| s.parse::<std::net::SocketAddr>().unwrap());
         assert_eq!(got, want, "{}: {}", addr, why);
     }
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The seed the join-window fix rests on, wired end to end.
+///
+/// A peer the detector has not seen before is judged against the source its
+/// connected socket was pinned to, and that value has to be the address
+/// `connect(2)` actually chose — not the wildcard the bind was requested with.
+/// `ConnectedPeerSocket::local_addr()` is the wildcard (`0.0.0.0:port`), and
+/// reading *that* would compare an unspecified address against a real one for
+/// every peer, so every peer joining would report a medium change: precisely
+/// the "peer churn fires the fan-out" behaviour the intersection rule exists to
+/// prevent. Nothing renders `bound_source`, so no other test would notice.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_peers_connected_socket_publishes_the_source_it_was_pinned_to() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+    let transport_id = nodes[0]
+        .node
+        .peers
+        .get(&addr_1)
+        .and_then(|p| p.transport_id())
+        .expect("peer 1 has a transport");
+
+    // No socket yet: nothing to seed from, and the peer must say so rather
+    // than offering the wildcard.
+    nodes[0].node.record_stats_history();
+    let row = |n: &Node| {
+        n.entities_snapshot
+            .load_full()
+            .peers
+            .iter()
+            .find(|r| r.node_addr == addr_1)
+            .expect("peer 1 has a row")
+            .clone()
+    };
+    assert_eq!(
+        row(&nodes[0].node).bound_source,
+        None,
+        "a peer with no connected socket has no pinned source to be judged against"
+    );
+
+    // The helper connects to 127.0.0.1:9, so the kernel pins the loopback
+    // source — a real address, and demonstrably not the `0.0.0.0` the bind was
+    // requested with.
+    install_connected_udp(&mut nodes[0].node, &addr_1, transport_id);
+    nodes[0].node.record_stats_history();
+
+    assert_eq!(
+        row(&nodes[0].node).bound_source,
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        "the published source must be what connect(2) pinned, not the wildcard bind"
+    );
 
     cleanup_nodes(&mut nodes).await;
 }

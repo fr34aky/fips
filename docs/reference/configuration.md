@@ -237,7 +237,15 @@ covered as well as one across the internet, and so is a more specific route
 moving under a single peer.
 
 Peers appearing and leaving are ignored on their own — that is ordinary node
-behaviour and says nothing about the medium. A peer whose address is not a
+behaviour and says nothing about the medium. A peer seen for the first time is
+the one exception, and it is not judged against history but against its own
+send path: if its `connect()`-ed socket is pinned to a source the routing table
+would no longer choose, it is reported. Without that, a medium change in the
+window between a peer authenticating and the detector's next sample would be
+the detector's first sight of that peer, and would be adopted silently while
+the peer's socket stayed pinned to the path the host had just left. A peer
+joining onto a path that has not moved has its socket pinned exactly where its
+traffic goes, so it still reports nothing. A peer whose address is not a
 probeable IP endpoint contributes nothing: a MAC on Ethernet or BLE, a `.onion`
 or Nym recipient reached through a local proxy, an IPv6 literal with a scope
 suffix, or a peer still carrying the hostname it was configured with (resolving

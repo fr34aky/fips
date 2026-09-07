@@ -18,7 +18,7 @@
 //! also advances only on the tick.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::identity::NodeAddr;
@@ -643,6 +643,17 @@ pub(crate) struct PeerRow {
     /// so a change to that string's rendering cannot silently leave the
     /// detector with nothing to probe.
     pub probe_target: Option<SocketAddr>,
+    /// Source address this peer's per-peer `connect()`-ed UDP socket was
+    /// pinned to by `connect(2)`, when it has one. Also not rendered, and read by the same detector:
+    /// it is what the send path is *actually* using, as against the
+    /// `probe_target` lookup's answer for what the kernel would choose now.
+    ///
+    /// `None` where there is no such socket — every platform but Linux and
+    /// macOS, a peer on another transport, and a peer whose socket has not
+    /// been installed yet or was just released — and also where the kernel
+    /// declined to name a source, which is not an address and must not be
+    /// compared as one.
+    pub bound_source: Option<IpAddr>,
     pub link_info: Option<PeerLinkInfo>,
     pub tree_depth: Option<usize>,
     /// `effective_depth = tree_depth + link_cost` — the same quantity
