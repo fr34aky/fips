@@ -35,6 +35,70 @@ fn set_link_dead_timeout(node: &mut crate::node::Node, secs: u64) {
     });
 }
 
+/// Set `node.heartbeat_interval_secs` on an already-constructed node, the same
+/// way `set_link_dead_timeout` does. This is the knob the retry gate must not
+/// floor.
+fn set_heartbeat_interval(node: &mut crate::node::Node, secs: u64) {
+    node.replace_context(|ctx| {
+        let mut cfg = (*ctx.config).clone();
+        cfg.node.heartbeat_interval_secs = secs;
+        ctx.config = std::sync::Arc::new(cfg);
+    });
+}
+
+/// A heartbeat whose send failed is not recorded as having landed, and the
+/// failed attempt is not retried on the very next tick.
+///
+/// The failure is forced by taking the node's transport handles away, so the
+/// encrypted send fails before any I/O with `TransportNotFound`. Marking the
+/// send before it happens, which is what this replaced, would record the peer
+/// as heartbeated and suppress the next attempt for a whole interval although
+/// the peer heard nothing.
+#[tokio::test]
+async fn a_failed_heartbeat_send_is_not_recorded_as_landed() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+    assert!(nodes[0].node.get_peer(&addr_1).is_some());
+
+    // Whatever landed during convergence is the baseline this asserts against.
+    let landed_before = nodes[0]
+        .node
+        .get_peer(&addr_1)
+        .unwrap()
+        .last_heartbeat_sent();
+
+    // Due on every tick, so the only variable is what the send does.
+    set_heartbeat_interval(&mut nodes[0].node, 0);
+    nodes[0].node.transports.clear();
+
+    nodes[0].node.check_link_heartbeats().await;
+
+    let peer = nodes[0].node.get_peer(&addr_1).expect("peer present");
+    let failed_at = peer
+        .last_heartbeat_attempt()
+        .expect("the attempt is recorded even though the send failed");
+    assert_eq!(
+        peer.last_heartbeat_sent(),
+        landed_before,
+        "a heartbeat whose send failed was recorded as having landed"
+    );
+
+    // The retry gate spaces the next attempt out rather than letting a failing
+    // peer be retried on every tick.
+    nodes[0].node.check_link_heartbeats().await;
+
+    let peer = nodes[0].node.get_peer(&addr_1).expect("peer present");
+    assert_eq!(
+        peer.last_heartbeat_attempt(),
+        Some(failed_at),
+        "a peer whose send failed was retried inside the retry interval"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// A peer past the link-dead timeout is NOT reaped while an FMP rekey is in
 /// progress with its msg1 budget unexhausted.
 #[tokio::test]
@@ -122,15 +186,6 @@ async fn heartbeat_unaffected_without_rekey() {
     );
 
     cleanup_nodes(&mut nodes).await;
-}
-
-/// Set `node.heartbeat_interval_secs`, the knob the retry gate must not floor.
-fn set_heartbeat_interval(node: &mut crate::node::Node, secs: u64) {
-    node.replace_context(|ctx| {
-        let mut cfg = (*ctx.config).clone();
-        cfg.node.heartbeat_interval_secs = secs;
-        ctx.config = std::sync::Arc::new(cfg);
-    });
 }
 
 /// Rewind a peer's heartbeat bookkeeping by `age`, as if that long had passed

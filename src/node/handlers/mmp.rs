@@ -35,6 +35,42 @@ use tracing::{debug, info, trace, warn};
 /// bounded this can come down to the tick.
 const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Decide whether a peer is due a heartbeat, from the two timestamps it keeps.
+///
+/// Two gates rather than one. `sent` is when a heartbeat last *landed*, and it
+/// alone paces a healthy peer. `attempt` is when one was last *tried*, and it
+/// gates only a peer whose last try failed, holding the retry off for
+/// [`HEARTBEAT_RETRY_INTERVAL`] so a peer whose send keeps failing is not
+/// retried on every tick.
+///
+/// **The retry gate is deliberately not consulted on the healthy path.** On a
+/// peer whose last send succeeded the two timestamps are equal, so gating there
+/// would clamp a configured `heartbeat_interval_secs` up to the retry interval,
+/// and that setting has no validation floor.
+fn heartbeat_due(
+    sent: Option<Instant>,
+    attempt: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    let landed_due = match sent {
+        None => true,
+        Some(last) => now.duration_since(last) >= interval,
+    };
+
+    // An attempt later than the last success is one that failed, and an attempt
+    // with no success behind it is the same thing on a peer never reached.
+    let retry_due = match (attempt, sent) {
+        (Some(last), Some(landed)) if last > landed => {
+            now.duration_since(last) >= HEARTBEAT_RETRY_INTERVAL
+        }
+        (Some(last), None) => now.duration_since(last) >= HEARTBEAT_RETRY_INTERVAL,
+        _ => true,
+    };
+
+    landed_due && retry_due
+}
+
 /// Emit the operator `trace!` point for a processed ReceiverReport outcome.
 ///
 /// These log points used to live inside `MmpMetrics::process_receiver_report`;
@@ -488,42 +524,19 @@ impl Node {
                     && peer.rekey_msg1_resend_count() < max_resends
                     && peer.rekey_msg1().is_some();
 
-                // Check if heartbeat is due. Two gates, not one. The first is
-                // the interval since a heartbeat last *landed*; a send that
-                // failed does not satisfy it, so a peer that has heard nothing
-                // stays due instead of being suppressed for a full interval by
-                // an attempt that went nowhere.
-                //
-                // The second spaces the retries out. Without it a peer whose
-                // send keeps failing would be retried on every tick, and the
-                // send behind this is not always cheap: on a connection-oriented
-                // transport it awaits an unbounded `write_all` on the rx loop.
-                // Until that is bounded, retrying a failing peer once a second
-                // would turn a stranded stream into a stalled node.
-                let heartbeat_landed_due = match peer.last_heartbeat_sent() {
-                    None => true,
-                    Some(last) => now.duration_since(last) >= heartbeat_interval,
-                };
-                // The retry gate applies only after a *failure*. A successful
-                // send stamps both timestamps with the same instant, so on a
-                // healthy peer an unconditional gate would floor the configured
-                // interval at HEARTBEAT_RETRY_INTERVAL — silently turning a
-                // configured `heartbeat_interval_secs` of 1 into 2, with no
-                // validation refusing the value and nothing saying why. An
-                // attempt strictly newer than the last success is the only
-                // state that means "the last one did not land".
-                let last_attempt_failed =
-                    match (peer.last_heartbeat_attempt(), peer.last_heartbeat_sent()) {
-                        (Some(attempt), Some(sent)) => attempt > sent,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                let retry_due = !last_attempt_failed
-                    || match peer.last_heartbeat_attempt() {
-                        None => true,
-                        Some(last) => now.duration_since(last) >= HEARTBEAT_RETRY_INTERVAL,
-                    };
-                let heartbeat_due = heartbeat_landed_due && retry_due;
+                // Check if heartbeat is due. Two gates, not one: a send that
+                // failed does not satisfy the interval, so a peer that has
+                // heard nothing stays due instead of being suppressed by an
+                // attempt that went nowhere, and the retry gap keeps a peer
+                // whose send keeps failing from being tried on every tick.
+                // Both are decided by `heartbeat_due`, which is a pure
+                // function so it can be tested without driving a send.
+                let heartbeat_due = heartbeat_due(
+                    peer.last_heartbeat_sent(),
+                    peer.last_heartbeat_attempt(),
+                    now,
+                    heartbeat_interval,
+                );
 
                 PeerLivenessSnapshot {
                     peer: *node_addr,
@@ -643,5 +656,99 @@ impl Node {
             now_ms,
             is_outbound: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HEARTBEAT_RETRY_INTERVAL, heartbeat_due};
+    use std::time::{Duration, Instant};
+
+    const INTERVAL: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_peer_never_heartbeated_is_due_immediately() {
+        let now = Instant::now();
+        assert!(heartbeat_due(None, None, now, INTERVAL));
+    }
+
+    #[test]
+    fn a_peer_whose_heartbeat_landed_waits_the_configured_interval() {
+        let landed = Instant::now();
+        assert!(!heartbeat_due(
+            Some(landed),
+            Some(landed),
+            landed + INTERVAL - Duration::from_millis(1),
+            INTERVAL
+        ));
+        assert!(heartbeat_due(
+            Some(landed),
+            Some(landed),
+            landed + INTERVAL,
+            INTERVAL
+        ));
+    }
+
+    #[test]
+    fn a_healthy_peer_is_paced_by_the_configured_interval_and_not_by_the_retry_floor() {
+        // The interval a peer configures can be shorter than the retry floor.
+        // Consulting the retry gate on the healthy path would clamp it, and
+        // `heartbeat_interval_secs` has no validation floor to prevent that.
+        let short = Duration::from_secs(1);
+        assert!(short < HEARTBEAT_RETRY_INTERVAL);
+        let landed = Instant::now();
+        assert!(heartbeat_due(
+            Some(landed),
+            Some(landed),
+            landed + short,
+            short
+        ));
+    }
+
+    #[test]
+    fn a_failed_attempt_does_not_suppress_the_next_heartbeat_for_a_full_interval() {
+        // A heartbeat landed at t0 and the next attempt, at t0 + INTERVAL,
+        // failed. Once the retry interval has passed the peer is due again,
+        // rather than waiting another whole interval on a send that never
+        // reached it.
+        let landed = Instant::now();
+        let failed = landed + INTERVAL;
+        assert!(heartbeat_due(
+            Some(landed),
+            Some(failed),
+            failed + HEARTBEAT_RETRY_INTERVAL,
+            INTERVAL
+        ));
+    }
+
+    #[test]
+    fn a_failed_attempt_is_not_retried_before_the_retry_interval() {
+        let landed = Instant::now();
+        let failed = landed + INTERVAL;
+        assert!(!heartbeat_due(
+            Some(landed),
+            Some(failed),
+            failed + HEARTBEAT_RETRY_INTERVAL - Duration::from_millis(1),
+            INTERVAL
+        ));
+    }
+
+    #[test]
+    fn a_peer_never_reached_is_retried_on_the_retry_interval_not_the_heartbeat_interval() {
+        // No heartbeat has ever landed, so there is no interval to pace by.
+        // The attempt alone spaces the retries.
+        let failed = Instant::now();
+        assert!(!heartbeat_due(
+            None,
+            Some(failed),
+            failed + Duration::from_millis(1),
+            INTERVAL
+        ));
+        assert!(heartbeat_due(
+            None,
+            Some(failed),
+            failed + HEARTBEAT_RETRY_INTERVAL,
+            INTERVAL
+        ));
     }
 }
