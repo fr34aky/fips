@@ -102,7 +102,7 @@ async fn a_medium_change_drops_connected_sockets_pinned_to_the_old_path() {
 
     nodes[0]
         .node
-        .handle_net_change(NetChange::for_test(1))
+        .handle_net_change(NetChange::for_test_moved(1, &[addr_1]))
         .await;
 
     assert!(
@@ -114,6 +114,69 @@ async fn a_medium_change_drops_connected_sockets_pinned_to_the_old_path() {
             .is_none(),
         "a socket pinned to the old source address must not survive the change"
     );
+}
+
+/// **A peer the change did not name keeps its socket.**
+///
+/// The reaction is scoped to `change.summary.moved`, and that is not an
+/// optimisation. Keying the sample on peers put the trigger within reach of a
+/// remote party: `probe_target` is the observed source of every authentic
+/// packet, updated with no throttle, so a peer alternating between two
+/// addresses can move the fingerprint at will. Node-wide, that peer could tear
+/// down every other peering's send path on repeat. If this test starts failing
+/// because the untouched peer lost its socket, that lever is back.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_peer_the_change_did_not_name_keeps_its_socket() {
+    let mut nodes = run_tree_test(3, &[(0, 1), (0, 2)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let moved = *nodes[1].node.node_addr();
+    let untouched = *nodes[2].node.node_addr();
+    let transport_id = nodes[0].transport_id;
+    install_connected_udp(&mut nodes[0].node, &moved, transport_id);
+    install_connected_udp(&mut nodes[0].node, &untouched, transport_id);
+
+    let heartbeat_before = nodes[0]
+        .node
+        .get_peer(&untouched)
+        .unwrap()
+        .last_heartbeat_sent();
+
+    nodes[0]
+        .node
+        .handle_net_change(NetChange::for_test_moved(1, &[moved]))
+        .await;
+
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&moved)
+            .unwrap()
+            .connected_udp()
+            .is_none(),
+        "the peer that moved must lose its pinned socket"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&untouched)
+            .unwrap()
+            .connected_udp()
+            .is_some(),
+        "a peer whose source address did not move must keep its socket"
+    );
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_peer(&untouched)
+            .unwrap()
+            .last_heartbeat_sent(),
+        heartbeat_before,
+        "and must not be heartbeated for another peer's move"
+    );
+
+    cleanup_nodes(&mut nodes).await;
 }
 
 /// The rebind must not cost the peering. Everything above the socket — the
@@ -132,7 +195,7 @@ async fn a_medium_change_keeps_every_peering_intact() {
 
     nodes[0]
         .node
-        .handle_net_change(NetChange::for_test(1))
+        .handle_net_change(NetChange::for_test_moved(1, &[addr_1]))
         .await;
 
     let peer = nodes[0]
@@ -169,7 +232,7 @@ async fn every_peer_is_heartbeated_so_the_far_side_re_pins() {
 
     nodes[0]
         .node
-        .handle_net_change(NetChange::for_test(1))
+        .handle_net_change(NetChange::for_test_moved(1, &[addr_1]))
         .await;
 
     let after = nodes[0]
@@ -234,7 +297,7 @@ async fn a_peer_on_a_connection_oriented_transport_is_left_to_the_periodic_heart
 
     nodes[0]
         .node
-        .handle_net_change(NetChange::for_test(1))
+        .handle_net_change(NetChange::for_test_moved(1, &[addr_1]))
         .await;
 
     let after = nodes[0]
@@ -443,7 +506,10 @@ async fn a_heartbeat_that_failed_is_not_counted_and_does_not_suppress_the_next()
         .unwrap()
         .last_heartbeat_sent();
 
-    let sent = nodes[0].node.heartbeat_all_peers_after_net_change().await;
+    let sent = nodes[0]
+        .node
+        .heartbeat_moved_peers_after_net_change(&[addr_1])
+        .await;
 
     assert_eq!(
         sent, 0,

@@ -250,6 +250,14 @@ on the same LAN, reached by its subnet route rather than the default route, is
 covered as well as one across the internet, and so is a more specific route
 moving under a single peer.
 
+The converse is the residual. The probe answers for the peer's *current*
+address, and that address is the source of the last authentic packet it sent,
+so a peer that roams between two of its own addresses which leave this host by
+different interfaces is indistinguishable from a local path move. The reaction
+is scoped to the peers named in the change, so such a peer moves nothing but
+its own send path — but it is the peer, not this host, that decided the
+fingerprint changed.
+
 Peers appearing and leaving are ignored on their own — that is ordinary node
 behaviour and says nothing about the medium. A peer seen for the first time is
 the one exception, and it is not judged against history but against its own
