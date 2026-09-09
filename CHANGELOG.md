@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet. Everything previously staged here is folded into
-`[0.5.1]` below.
+### Fixed
+
+#### Peering
+
+- A heartbeat whose send failed no longer counts as one that was delivered. The
+  send was recorded before it was attempted, so a peer whose heartbeat could not
+  go out was treated as heartbeated and was not tried again for a whole
+  `heartbeat_interval_secs`, although it had heard nothing and its own link-dead
+  timer was running. The attempt and the delivery are now recorded separately:
+  the interval that paces a healthy peer advances only on a send that returned
+  cleanly, and a peer whose send failed is retried after a shorter fixed
+  interval instead. That retry interval gates only a peer whose last attempt
+  failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
 
 ## [0.5.1] - 2026-09-06
 

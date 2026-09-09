@@ -39,8 +39,9 @@ pub(crate) struct PeerLivenessSnapshot {
     /// An FMP rekey handshake is genuinely in flight with retransmission budget
     /// left; suppresses teardown of an otherwise-silent rekey link.
     pub rekey_active: bool,
-    /// A heartbeat is due (`last_heartbeat_sent` is none, or elapsed since it is
-    /// >= the heartbeat interval).
+    /// A heartbeat is due: the interval has elapsed since one last *landed*,
+    /// and, on a peer whose last attempt failed, the shorter retry interval has
+    /// elapsed since that attempt. Both gates are resolved shell-side.
     pub heartbeat_due: bool,
 }
 
@@ -169,8 +170,10 @@ pub(crate) enum MmpAction {
     /// Reap a dead peer: the shell runs `remove_active_peer` +
     /// `schedule_reconnect` (with its wall-clock `now_ms`).
     ReapPeer { peer: NodeAddr },
-    /// Send a heartbeat to `peer`: the shell runs `mark_heartbeat_sent` and the
-    /// encrypted link send.
+    /// Send a heartbeat to `peer`: the shell runs `mark_heartbeat_attempt`, then
+    /// the encrypted link send, then `mark_heartbeat_sent` only if that send
+    /// returned cleanly. Marking the send before it happens would let a failed
+    /// heartbeat suppress the next one for a full interval.
     Heartbeat { peer: NodeAddr },
     /// Build (shell: `proto/mmp/` `build_report` + `encode`) and send the given
     /// link report over the encrypted link. The interval-advancing
