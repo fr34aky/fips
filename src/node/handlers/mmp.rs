@@ -20,6 +20,21 @@ use crate::transport::{TransportAddr, TransportId};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
+/// How long a peer whose heartbeat send *failed* waits before the next attempt.
+///
+/// Applies to the failure path only. Gating a healthy peer on it too would
+/// floor `node.heartbeat_interval_secs` at this value without validating or
+/// reporting it, which is a configured knob quietly not doing what it says.
+///
+/// Short against `heartbeat_interval_secs`, because a failed heartbeat means
+/// the peer has heard nothing and the point is to recover well inside
+/// `link_dead_timeout_secs` rather than after another full interval. Not
+/// shorter still, because the send behind it awaits an unbounded `write_all`
+/// on a connection-oriented transport, on the rx loop; retrying that every
+/// tick would make a stranded stream a stalled node. Once that write is
+/// bounded this can come down to the tick.
+const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Emit the operator `trace!` point for a processed ReceiverReport outcome.
 ///
 /// These log points used to live inside `MmpMetrics::process_receiver_report`;
@@ -473,11 +488,42 @@ impl Node {
                     && peer.rekey_msg1_resend_count() < max_resends
                     && peer.rekey_msg1().is_some();
 
-                // Check if heartbeat is due.
-                let heartbeat_due = match peer.last_heartbeat_sent() {
+                // Check if heartbeat is due. Two gates, not one. The first is
+                // the interval since a heartbeat last *landed*; a send that
+                // failed does not satisfy it, so a peer that has heard nothing
+                // stays due instead of being suppressed for a full interval by
+                // an attempt that went nowhere.
+                //
+                // The second spaces the retries out. Without it a peer whose
+                // send keeps failing would be retried on every tick, and the
+                // send behind this is not always cheap: on a connection-oriented
+                // transport it awaits an unbounded `write_all` on the rx loop.
+                // Until that is bounded, retrying a failing peer once a second
+                // would turn a stranded stream into a stalled node.
+                let heartbeat_landed_due = match peer.last_heartbeat_sent() {
                     None => true,
                     Some(last) => now.duration_since(last) >= heartbeat_interval,
                 };
+                // The retry gate applies only after a *failure*. A successful
+                // send stamps both timestamps with the same instant, so on a
+                // healthy peer an unconditional gate would floor the configured
+                // interval at HEARTBEAT_RETRY_INTERVAL — silently turning a
+                // configured `heartbeat_interval_secs` of 1 into 2, with no
+                // validation refusing the value and nothing saying why. An
+                // attempt strictly newer than the last success is the only
+                // state that means "the last one did not land".
+                let last_attempt_failed =
+                    match (peer.last_heartbeat_attempt(), peer.last_heartbeat_sent()) {
+                        (Some(attempt), Some(sent)) => attempt > sent,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                let retry_due = !last_attempt_failed
+                    || match peer.last_heartbeat_attempt() {
+                        None => true,
+                        Some(last) => now.duration_since(last) >= HEARTBEAT_RETRY_INTERVAL,
+                    };
+                let heartbeat_due = heartbeat_landed_due && retry_due;
 
                 PeerLivenessSnapshot {
                     peer: *node_addr,
@@ -513,14 +559,25 @@ impl Node {
                     self.route_link_dead(peer, now_ms).await;
                 }
                 MmpAction::Heartbeat { peer } => {
+                    // Attempt first, success after: the attempt is recorded
+                    // even if the send below fails or never returns, so the
+                    // retry stays spaced; only a send that came back clean
+                    // moves the interval that says the peer has heard from us.
                     if let Some(p) = self.peers.get_mut(&peer) {
-                        p.mark_heartbeat_sent(now);
+                        p.mark_heartbeat_attempt(now);
                     }
-                    if let Err(e) = self
+                    match self
                         .send_encrypted_link_message(&peer, &heartbeat_msg)
                         .await
                     {
-                        trace!(peer = %self.peer_display_name(&peer), error = %e, "Failed to send heartbeat");
+                        Ok(()) => {
+                            if let Some(p) = self.peers.get_mut(&peer) {
+                                p.mark_heartbeat_sent(now);
+                            }
+                        }
+                        Err(e) => {
+                            trace!(peer = %self.peer_display_name(&peer), error = %e, "Failed to send heartbeat");
+                        }
                     }
                 }
                 MmpAction::SendLinkReport { .. }
