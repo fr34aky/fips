@@ -2212,6 +2212,15 @@ impl Node {
                     bound_source: peer.connected_udp().and_then(|s| s.pinned_source()),
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     bound_source: None,
+                    probe_bind: peer
+                        .transport_id()
+                        .and_then(|id| self.transports.get(&id))
+                        .and_then(|t| match t {
+                            TransportHandle::Udp(u) => u.local_addr(),
+                            _ => None,
+                        })
+                        .map(|sa| sa.ip())
+                        .filter(|ip| !ip.is_unspecified()),
                     link_info,
                     tree_depth: peer.coords().map(|c| c.depth()),
                     effective_depth,

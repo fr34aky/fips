@@ -227,7 +227,7 @@ impl NetFingerprint {
                     (
                         t.peer,
                         PeerPath {
-                            current: preferred_source(t.dest),
+                            current: preferred_source(t.dest, t.bind),
                             bound: t.bound,
                         },
                     )
@@ -350,6 +350,18 @@ pub(in crate::node) struct ProbeTarget {
     pub dest: SocketAddr,
     /// The local address its connected UDP socket is bound to, if it has one.
     pub bound: Option<IpAddr>,
+    /// The address to bind the probe to, when the peer's transport binds a
+    /// specific one rather than the wildcard. `None` means bind unspecified
+    /// and let the kernel choose, which is the default posture.
+    ///
+    /// This exists so the probe asks the same question the send path answers.
+    /// `open_connected_fd` binds the transport's configured address verbatim
+    /// and only then connects, so under a non-wildcard `transports.udp.bind_addr`
+    /// the socket's source is that address whatever the routing table says. An
+    /// unconstrained probe would answer with the kernel's choice instead, and
+    /// the two would disagree permanently — reporting a first-sight move, on
+    /// every peer, forever, with nothing having moved.
+    pub bind: Option<IpAddr>,
 }
 
 /// One peer whose local source address changed between two samples.
@@ -617,6 +629,7 @@ pub(in crate::node) fn probe_targets(snapshot: &EntitySnapshot) -> Vec<ProbeTarg
                 peer: row.node_addr,
                 dest,
                 bound: row.bound_source,
+                bind: row.probe_bind,
             })
         })
         .collect()
@@ -766,7 +779,8 @@ where
     }
 }
 
-/// The source address the kernel would use to reach `probe`.
+/// The source address the kernel would use to reach `probe`, from `bind_to` if
+/// the transport constrains it.
 ///
 /// `connect(2)` on a UDP socket is a pure routing-table operation: it resolves
 /// the route, binds a source address, and sends nothing. The socket is dropped
@@ -777,10 +791,18 @@ where
 /// itself a fingerprint value, reported as `None` rather than swallowed. It is
 /// the state a stranded peer is in, so losing it would blind the detector to
 /// the case it most needs to see.
-fn preferred_source(probe: SocketAddr) -> Option<IpAddr> {
-    let bind: SocketAddr = match probe {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+fn preferred_source(probe: SocketAddr, bind_to: Option<IpAddr>) -> Option<IpAddr> {
+    // Port 0 always: the probe wants the transport's *address* constraint, not
+    // its port, and binding the live port would collide with the socket the
+    // transport already holds there. A family mismatch between the configured
+    // bind and this peer is not an error to report — the transport could not
+    // have reached the peer from it either — so fall back to unspecified and
+    // let the connect below fail on its own terms.
+    let bind: SocketAddr = match (probe, bind_to) {
+        (SocketAddr::V4(_), Some(ip @ IpAddr::V4(_))) => SocketAddr::new(ip, 0),
+        (SocketAddr::V6(_), Some(ip @ IpAddr::V6(_))) => SocketAddr::new(ip, 0),
+        (SocketAddr::V4(_), _) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        (SocketAddr::V6(_), _) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
     let socket = UdpSocket::bind(bind).ok()?;
     socket.connect(probe).ok()?;

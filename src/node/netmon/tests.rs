@@ -378,6 +378,7 @@ fn target(p: NodeAddr, dest: SocketAddr) -> ProbeTarget {
         peer: p,
         dest,
         bound: None,
+        bind: None,
     }
 }
 

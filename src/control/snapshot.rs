@@ -654,6 +654,19 @@ pub(crate) struct PeerRow {
     /// declined to name a source, which is not an address and must not be
     /// compared as one.
     pub bound_source: Option<IpAddr>,
+    /// Address this peer's transport is bound to, when that bind is not the
+    /// wildcard. Read by the same detector, which has to put its probe the
+    /// same constrained question the send path answers.
+    ///
+    /// `open_connected_fd` binds the transport's configured address verbatim
+    /// and only then connects, so a non-wildcard `bind_addr` pins the source
+    /// whatever the routing table says, while an unconstrained probe takes the
+    /// kernel's choice. Left unequal, those two answers differ permanently and
+    /// every first-seen peer reports a move that never happened.
+    ///
+    /// `None` for the wildcard bind, which is the default and the case where
+    /// the kernel chooses on both sides.
+    pub probe_bind: Option<IpAddr>,
     pub link_info: Option<PeerLinkInfo>,
     pub tree_depth: Option<usize>,
     /// `effective_depth = tree_depth + link_cost` — the same quantity
