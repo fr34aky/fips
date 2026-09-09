@@ -213,12 +213,18 @@ struct PeerPath {
 impl NetFingerprint {
     /// Probe every target and record the local address the kernel picks.
     ///
-    /// Three non-blocking syscalls per target — a bind, a `connect(2)` that
-    /// sends no packet, and a `getsockname` — with no I/O wait, no name
-    /// resolution and no allocation beyond the map. Bounded by
-    /// `node.limits.max_peers`, so a full table is a few hundred syscalls on a
-    /// multi-second timer; it runs inline in the detector's task rather than
-    /// through `spawn_blocking`.
+    /// Five non-blocking syscalls per target: `socket(2)` and `bind(2)` behind
+    /// `UdpSocket::bind`, a `connect(2)` that sends no packet, a
+    /// `getsockname(2)`, and the `close(2)` the socket takes on drop. No I/O
+    /// wait, no name resolution, and no allocation beyond the map.
+    ///
+    /// The count matters because a debounced handover resamples: up to
+    /// `MAX_DEBOUNCE_ROUNDS` rounds plus the settled sample, times the peers
+    /// held. `node.limits.max_peers` bounds that only where it is set —
+    /// the value 0 means unlimited, and there the cost tracks the live peer
+    /// count instead. It runs inline in the detector's own task rather than
+    /// through `spawn_blocking`, which is what keeps it off every other task
+    /// regardless.
     pub(in crate::node) fn sample(targets: &[ProbeTarget]) -> Self {
         Self {
             sources: targets
@@ -309,16 +315,35 @@ impl NetFingerprint {
     /// a peer joining onto a path that has not moved has `bound == current` and
     /// reports nothing.
     ///
-    /// A new peer with no connected socket (`bound` is `None`) is still
-    /// skipped, and is the residual. It is a much smaller one: with no socket
-    /// there is no pinning to repair, since the wildcard socket resolves a
-    /// route per packet, so the peer is not stranded. It costs only the
-    /// immediate heartbeat that would have told the far side to re-pin, leaving
-    /// it to notice at the next `heartbeat_interval_secs`.
+    /// A first-seen peer with no `bound` is still skipped, and that is the
+    /// residual. It covers three groups, and they are not equally harmless.
+    ///
+    /// Where there is genuinely no connected socket — every platform but Linux
+    /// and macOS, and every peer on a stream or proxied transport on those two
+    /// — nothing is pinned to repair, because the wildcard socket resolves a
+    /// route per packet. Such a peer is not stranded; it loses only the
+    /// immediate heartbeat that would have told the far side to re-pin, and
+    /// notices at its next `heartbeat_interval_secs`.
+    ///
+    /// The third group is a real hole rather than a harmless one, and it is one
+    /// tick wide. The tick publishes the entity snapshot before it installs
+    /// connected sockets (`record_stats_history` then
+    /// `activate_connected_udp_sessions`, in that order), so a socket installed
+    /// on tick N is first visible to this detector in the snapshot published on
+    /// tick N+1. A peer that joins and has its socket installed, and whose path
+    /// then moves before that next publish, is first seen with `bound` still
+    /// `None` and is skipped — and it *does* hold a pinned socket. About one
+    /// `tick_interval_secs` per join against a `poll_interval_secs` five times
+    /// longer, and the peer is recovered by the ordinary diff on the sample
+    /// after, so it is bounded rather than permanent.
+    ///
+    /// A non-wildcard `transports.udp.bind_addr` is not part of the residual;
+    /// see [`ProbeTarget::bind`], which keeps both sides answering the same
+    /// question rather than skipping the peer.
     ///
     /// An empty result means nothing moved; it is the detector's entire
     /// definition of "no change".
-    fn moved(&self, next: &Self) -> Vec<PeerSourceMove> {
+    pub(in crate::node) fn moved(&self, next: &Self) -> Vec<PeerSourceMove> {
         next.sources
             .iter()
             .filter_map(|(peer, now)| {
@@ -403,26 +428,24 @@ impl fmt::Display for NetChangeSummary {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            match (m.before, m.after) {
-                (_, Some(after)) => write!(f, "{} -> {}", short(&m.peer), after)?,
-                (_, None) => write!(f, "{} -> no route", short(&m.peer))?,
-            }
+            // Both ends: the address the stale `connect(2)` had pinned is what
+            // an operator correlates against route history, so a line naming
+            // only the destination leaves out the half being diagnosed.
+            let before = match m.before {
+                Some(ip) => ip.to_string(),
+                None => "no route".to_string(),
+            };
+            let after = match m.after {
+                Some(ip) => ip.to_string(),
+                None => "no route".to_string(),
+            };
+            write!(f, "{} {} -> {}", m.peer.short_hex(), before, after)?;
         }
         if self.moved.len() > NAMED {
             write!(f, ", +{} more", self.moved.len() - NAMED)?;
         }
         Ok(())
     }
-}
-
-/// First four bytes of a `NodeAddr` in hex — enough to pick a peer out of a
-/// log without making the line unreadable.
-fn short(addr: &NodeAddr) -> String {
-    addr.as_bytes()
-        .iter()
-        .take(4)
-        .map(|b| format!("{:02x}", b))
-        .collect()
 }
 
 /// One settled transport-medium change, as delivered to the rx loop.

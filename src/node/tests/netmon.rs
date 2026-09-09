@@ -9,7 +9,7 @@ use super::spanning_tree::*;
 use super::*;
 use crate::config::PeerConfig;
 use crate::config::TcpConfig;
-use crate::node::netmon::NetChange;
+use crate::node::netmon::{NetChange, NetFingerprint, ProbeTarget};
 use crate::transport::tcp::TcpTransport;
 use crate::transport::{TransportAddr, TransportHandle, TransportId, packet_channel};
 
@@ -37,7 +37,7 @@ fn identity_of(nodes: &[TestNode], j: usize) -> PeerIdentity {
 /// The socket is opened against a discard port on loopback: nothing is ever
 /// sent through it, and the test only cares whether the handle survives a
 /// medium change.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn install_connected_udp(node: &mut Node, addr: &NodeAddr, transport_id: TransportId) {
     let local: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let peer_sa: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
@@ -78,7 +78,7 @@ fn install_connected_udp(node: &mut Node, addr: &NodeAddr, transport_id: Transpo
 /// Observed in the field as a peering that carried exactly one packet after a
 /// route change and then stalled until the 30s liveness timeout, reporting
 /// itself connected the whole time.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_medium_change_drops_connected_sockets_pinned_to_the_old_path() {
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
@@ -415,7 +415,7 @@ async fn only_a_peer_with_an_ip_endpoint_reaches_the_probe() {
 /// every peer, so every peer joining would report a medium change: precisely
 /// the "peer churn fires the fan-out" behaviour the intersection rule exists to
 /// prevent. Nothing renders `bound_source`, so no other test would notice.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_peers_connected_socket_publishes_the_source_it_was_pinned_to() {
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
@@ -451,12 +451,55 @@ async fn a_peers_connected_socket_publishes_the_source_it_was_pinned_to() {
     // source — a real address, and demonstrably not the `0.0.0.0` the bind was
     // requested with.
     install_connected_udp(&mut nodes[0].node, &addr_1, transport_id);
+    // The harness peers sit on a synthetic `loopback:1` address, which is
+    // correctly not probeable. Re-pin to a numeric endpoint on the same
+    // transport so the row reaches the probe at all — the pinned source is a
+    // property of the socket, not of the address, and survives this.
+    nodes[0]
+        .node
+        .peers
+        .get_mut(&addr_1)
+        .expect("peer 1 is established")
+        .set_current_addr(transport_id, TransportAddr::from_string("10.0.0.2:2121"));
     nodes[0].node.record_stats_history();
 
     assert_eq!(
         row(&nodes[0].node).bound_source,
         Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         "the published source must be what connect(2) pinned, not the wildcard bind"
+    );
+
+    // Publishing it is only half the wiring. Nothing else asserts that
+    // `probe_targets` carries `bound_source` through to the target, so
+    // substituting `None` there leaves the whole suite green while silently
+    // restoring the bug the first-sight rule exists to fix — the same failure
+    // class as reading the wildcard `local_addr()`, one layer further on.
+    let snapshot = nodes[0].node.entities_snapshot.load_full();
+    let target = crate::node::netmon::probe_targets(&snapshot)
+        .into_iter()
+        .find(|t| t.peer == addr_1)
+        .expect("an established UDP peer must be probeable");
+    assert_eq!(
+        target.bound,
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        "the pinned source must reach the probe target, not stop at the row"
+    );
+
+    // And the last link: `sample()` has to carry it into the fingerprint, or a
+    // first-seen peer is judged against nothing again. An empty previous
+    // fingerprint is exactly the first-sight case, and the peer's socket is
+    // pinned to loopback while the probe answers for a routable destination,
+    // so the two disagree and a move must be reported.
+    let sampled = NetFingerprint::sample(&[ProbeTarget {
+        peer: addr_1,
+        dest: "192.0.2.1:9".parse().unwrap(),
+        bound: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        bind: None,
+    }]);
+    assert!(
+        !NetFingerprint::default().moved(&sampled).is_empty(),
+        "sample() must carry the pinned source into the fingerprint, or first \
+         sight has nothing to judge against"
     );
 
     cleanup_nodes(&mut nodes).await;

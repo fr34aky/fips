@@ -400,6 +400,25 @@ fn sampling_the_live_host_is_self_consistent() {
     );
 }
 
+/// The live-probe tests above are all satisfied by a `preferred_source` that
+/// returns `None` for everything: two all-`None` samples are self-consistent,
+/// the recorded-keys test never inspects a value, and the loopback assertion
+/// skips through its `if let`. This one pins that the probe actually answers.
+///
+/// Loopback is the destination because it is routable on any host that can run
+/// this suite, including a container started with `--network none`, and the
+/// source for it is loopback itself.
+#[test]
+fn a_probe_to_loopback_answers_with_loopback() {
+    let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+    let sample = NetFingerprint::sample(&[target(peer(1), dest)]);
+    assert_eq!(
+        sample.sources.get(&peer(1)).map(|p| p.current),
+        Some(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+        "the probe must return the kernel's source address, not None"
+    );
+}
+
 #[test]
 fn every_target_is_recorded_whether_or_not_it_has_a_route() {
     // A peer with no route must stay in the map as `None` rather than dropping
@@ -450,7 +469,13 @@ fn summary_names_the_peer_and_its_new_source() {
     };
     let rendered = summary.to_string();
     assert!(rendered.contains("1/1 peers"), "{}", rendered);
-    assert!(rendered.contains("abababab -> 10.40.0.7"), "{}", rendered);
+    // Both ends, and the peer id in the same shape every other operator
+    // surface prints, so a line found in `show_peers` matches here.
+    assert!(
+        rendered.contains("abababab... 192.168.1.10 -> 10.40.0.7"),
+        "{}",
+        rendered
+    );
 }
 
 #[test]
@@ -683,7 +708,11 @@ async fn reports_are_spaced_out_under_clean_flapping() {
     let (tx, mut rx) = mpsc::channel(1);
 
     // Poll far faster than the pacing floor, so only the floor can space these.
-    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+    // Not `timer_wake(1)`: a one-second poll against a one-second floor makes
+    // the two indistinguishable, and deleting the pacing block would still
+    // produce one-second spacing and still pass.
+    let wake = WakeSource::timer_only(Duration::from_millis(100));
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, wake));
 
     let first = expect_change(&mut rx).await;
     let started = tokio::time::Instant::now();
