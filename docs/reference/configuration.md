@@ -218,7 +218,6 @@ keys in different blocks: **shortening `link_dead_timeout_secs` for fast
 failover can make an untouched `debounce_ms` illegal.** The refusal names both
 values and the multiplier.
 
-
 Established UDP peers use a per-peer `connect()`-ed socket for the send fast
 path. `connect(2)` makes the kernel resolve the route once and pin the local
 source address to whichever interface carried it then; it never re-evaluates.
@@ -227,14 +226,15 @@ from an abandoned address while the peer answers where it last heard the node �
 the peering reports itself connected and carries nothing until
 `link_dead_timeout_secs` tears it down, typically 60–90s per switch.
 
-On a detected change the node drops those sockets (the wildcard listen socket
-resolves a route per packet, so sends keep working, and a correctly bound
-connected socket is reinstalled on a later tick) and heartbeats every peer on a
-connectionless transport at once so the far side re-pins to the new source
-address. A peer reached over TCP, Tor, Nym or BLE is left to its periodic
-heartbeat, since sending to it here would block the node's receive loop on a
-stream the medium change has very likely just stranded. No peering is torn
-down: sessions, tree positions and routes survive the switch.
+On a detected change the node drops the sockets of the peers the change names
+(the wildcard listen socket resolves a route per packet, so sends keep working,
+and a correctly bound connected socket is reinstalled on a later tick) and
+heartbeats those of them on a connectionless transport at once so the far side
+re-pins to the new source address. A peer reached over TCP, Tor, Nym or BLE is
+left to its periodic heartbeat, since sending to it here would block the node's
+receive loop on a stream the medium change has very likely just stranded. A peer
+the change does not name is left alone entirely. No peering is torn down:
+sessions, tree positions and routes survive the switch.
 
 **What counts as a change.** For each peer whose transport address is a numeric
 IP endpoint, the node asks the kernel which local address it would use to reach
@@ -275,8 +275,13 @@ one would put a DNS lookup on the sample path; the address becomes numeric as
 soon as an authenticated packet arrives from the peer). A node holding no peers
 detects nothing, which is correct — it has nothing bound to the old path.
 
-The cost is three syscalls per peer per sample, bounded by
-`node.limits.max_peers`, with no packets sent and no name resolution.
+The cost is five non-blocking syscalls per peer per sample, read from the
+probe's own code rather than measured: `socket(2)` and `bind(2)`, a `connect(2)`
+that sends no packet, a `getsockname(2)`, and the `close(2)` the socket takes on
+drop. Nothing goes on the wire and no name is resolved.
+`node.limits.max_peers` bounds the per-sample total only where it is set: at
+`max_peers: 0`, which means unlimited, there is no bound and the cost tracks the
+live peer count instead.
 
 Detection uses the best backend the platform has:
 

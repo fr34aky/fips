@@ -169,11 +169,14 @@ pub(crate) const MAX_DEBOUNCE_ROUNDS: u32 = 8;
 
 /// Minimum spacing between two reported changes.
 ///
-/// The reaction is not free: it drops every peer's connected UDP socket (each
-/// carrying a drain thread) and sends a heartbeat per peer. An interface that
-/// flaps cleanly — settling between each transition, so the debounce reports
-/// each one — could otherwise drive that several times a second across up to
-/// `node.limits.max_peers` peers, which is thread churn rather than recovery.
+/// The reaction is not free: it drops the connected UDP socket of each peer
+/// the change names (each carrying a drain thread) and sends that peer a
+/// heartbeat. An interface flapping cleanly is the worst case for that, because
+/// a medium change moves the whole table at once, so the set the reaction is
+/// scoped to is every peer: settling between each transition, so the debounce
+/// reports each one, could otherwise drive it several times a second across up
+/// to `node.limits.max_peers` peers, which is thread churn rather than
+/// recovery.
 ///
 /// A genuine change is delayed by at most this long, against a
 /// `link_dead_timeout_secs` measured in tens of seconds, so the trade is

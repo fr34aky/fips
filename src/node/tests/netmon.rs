@@ -255,11 +255,23 @@ async fn every_peer_is_heartbeated_so_the_far_side_re_pins() {
 /// A peer on a connection-oriented transport is deliberately left out of the
 /// immediate fan-out.
 ///
-/// Its send would await `write_all` on a stream the medium change has very
-/// likely just stranded — unbounded, and on the rx loop, where it would hold
-/// every other arm of the select behind it. Such a peer keeps the periodic
-/// heartbeat it had before this detector existed. If this ever starts passing
-/// because the peer *was* heartbeated, the rx loop has a new way to stall.
+/// The hazard the filter was written for is gone: every connection-oriented
+/// send now enqueues onto its connection's bounded queue and returns, so none
+/// of them can await the wire from the rx loop any more. The exclusion is kept
+/// anyway, so that widening the fan-out is its own change with its own
+/// evidence rather than a side effect of the one that bounded the write. Such
+/// a peer keeps the periodic heartbeat it had before this detector existed.
+///
+/// **So this test guards a deliberate boundary, not a stall.** If the fan-out
+/// is widened on purpose, this test is the thing to change, and changing it is
+/// how that decision gets recorded.
+///
+/// The attempt stamp is the observation that sees the exclusion. The fan-out
+/// records it for every peer it picks, before the send, and records the sent
+/// stamp only for a send that returned. A connection-oriented send fails at
+/// the readiness gate, so the sent stamp would sit still either way — whether
+/// the peer was excluded or picked and failed — and on its own it cannot tell
+/// the two apart.
 #[tokio::test]
 async fn a_peer_on_a_connection_oriented_transport_is_left_to_the_periodic_heartbeat() {
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
@@ -308,6 +320,15 @@ async fn a_peer_on_a_connection_oriented_transport_is_left_to_the_periodic_heart
     assert_eq!(
         before, after,
         "a connection-oriented peer must not be heartbeated from the rx loop"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&addr_1)
+            .unwrap()
+            .last_heartbeat_attempt()
+            .is_none(),
+        "a connection-oriented peer must not even be attempted from the rx loop"
     );
 
     cleanup_nodes(&mut nodes).await;
@@ -568,6 +589,77 @@ async fn a_heartbeat_that_failed_is_not_counted_and_does_not_suppress_the_next()
     assert!(
         peer.last_heartbeat_attempt().is_some(),
         "the attempt is still recorded, or a failing peer would be retried every tick"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The transport's bind address has to reach the probe, or the detector asks
+/// the routing table a different question than the send path answers.
+///
+/// `open_connected_fd` binds `transports.udp.bind_addr` verbatim before it
+/// connects, so under a non-wildcard bind the source is pinned to that address
+/// whatever the route says. A probe left unconstrained takes the kernel's
+/// choice instead, the two answers differ permanently, and every first-seen
+/// peer reports a move that never happened. Nothing renders the field, so
+/// substituting `None` at either the publish or the read leaves the rest of
+/// the suite green.
+///
+/// The transport is started on `127.0.0.1:0`: `start_async` fills `local_addr`
+/// from the socket the kernel actually bound, which is what the publish reads
+/// and what the `!is_unspecified()` filter admits. No privileges are needed.
+#[tokio::test]
+async fn a_transports_bind_address_reaches_the_probe_target() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+
+    let bound_id = TransportId::new(99);
+    let (tx, _rx) = packet_channel(64);
+    let mut udp = crate::transport::udp::UdpTransport::new(
+        bound_id,
+        None,
+        crate::config::UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        tx,
+    );
+    udp.start_async()
+        .await
+        .expect("bind a UDP socket on loopback");
+    assert_eq!(
+        udp.local_addr().map(|sa| sa.ip()),
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        "precondition: the transport is bound to a real address, not the wildcard"
+    );
+    nodes[0]
+        .node
+        .transports
+        .insert(bound_id, TransportHandle::Udp(udp));
+
+    // The harness peers sit on a synthetic `loopback:1` address, which is
+    // correctly not probeable. Re-pin onto the bound transport with a numeric
+    // endpoint so the row reaches the probe at all.
+    nodes[0]
+        .node
+        .peers
+        .get_mut(&addr_1)
+        .expect("peer 1 is established")
+        .set_current_addr(bound_id, TransportAddr::from_string("10.0.0.2:2121"));
+
+    // The snapshot is published from the tick, which is its only writer.
+    nodes[0].node.record_stats_history();
+    let snapshot = nodes[0].node.entities_snapshot.load_full();
+    let target = crate::node::netmon::probe_targets(&snapshot)
+        .into_iter()
+        .find(|t| t.peer == addr_1)
+        .expect("a peer with a numeric endpoint must be probeable");
+    assert_eq!(
+        target.bind,
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        "the transport's bind address must reach the probe target, not stop at the row"
     );
 
     cleanup_nodes(&mut nodes).await;

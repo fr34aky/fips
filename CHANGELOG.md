@@ -69,15 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   medium-change detection added below, which is exactly that missing signal.
   Dropping the sockets is self-healing rather than disruptive: the wildcard
   listen socket resolves a route per packet, so sends keep working immediately,
-  and a correctly-bound connected socket is reinstalled on a later tick. Every
-  peer on a connectionless transport is also heartbeated at once, so the far
-  side re-pins to the new source address rather than waiting out its own
-  heartbeat interval. A peer on a connection-oriented transport keeps the
-  periodic heartbeat instead. That was because such a send awaited an unbounded
-  `write_all` on a stream the medium change had very likely just stranded, and
-  this reaction runs on the rx loop; the writer-task change below removes that
-  hazard, so widening the fan-out to those transports is now open work rather
-  than something the design forbids. Measured on a live
+  and a correctly-bound connected socket is reinstalled on a later tick. The
+  reaction is scoped to the peers the change names: only their sockets are
+  dropped, and each of those on a connectionless transport is heartbeated at
+  once, so the far side re-pins to the new source address rather than waiting
+  out its own heartbeat interval. A peer on a connection-oriented transport
+  keeps the periodic heartbeat instead. That was because such a send awaited an
+  unbounded `write_all` on a stream the medium change had very likely just
+  stranded, and this reaction runs on the rx loop; the writer-task change below
+  removes that hazard, so widening the fan-out to those transports is now open
+  work rather than something the design forbids. Measured on a live
   node, a WLAN/LAN switch in either direction now costs no reconnection at all —
   the Noise session, tree position and routes survive it. Linux and macOS (the
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
@@ -128,6 +129,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebind described under Fixed above.
   Bluetooth is not covered: an adapter's state is not an IP attachment and is
   invisible to this detector.
+  **Upgrade note: this couples a new key to one that has already shipped.** A
+  handover is ridden out for up to eight settling rounds of
+  `node.netmon.debounce_ms` before a change is reported, and if that worst case
+  reaches `node.link_dead_timeout_secs` the reaper tears the peering down
+  before the change is ever acted on, so the node refuses to start rather than
+  run in that shape. At the shipped defaults the margin is wide (8 × 250ms = 2s
+  against 30s), but detection is on by default, so **a node that shortened
+  `node.link_dead_timeout_secs` to 1 or 2 seconds for fast failover will be
+  refused at startup after the upgrade**, naming a `node.netmon.*` key its
+  operator never set. Raise the timeout, lower `debounce_ms` so eight rounds
+  stay under it, or set `node.netmon.enabled: false`. A
+  `node.link_dead_timeout_secs` of 0 is exempt from the check.
 
 ## [0.5.1] - 2026-09-06
 

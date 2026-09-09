@@ -36,14 +36,14 @@
 //!    wildcard listen socket resolves a route per packet, so sends keep working
 //!    immediately, and `activate_connected_udp_sessions` reinstalls a
 //!    correctly-bound connected socket on a later tick.
-//! 2. **Heartbeat every peer whose send path cannot block.** The frame leaves
-//!    over the new path and carries the node's new source address, so the far
-//!    side re-pins on receipt instead of waiting out its own
+//! 2. **Heartbeat each moved peer whose send path cannot block.** The frame
+//!    leaves over the new path and carries the node's new source address, so
+//!    the far side re-pins on receipt instead of waiting out its own
 //!    `heartbeat_interval_secs`. Without it the forward direction is fixed but
 //!    the reverse still points at the old address until the node next happens
 //!    to send. This runs on the rx loop, and it covers the connectionless
 //!    transports only — see
-//!    [`Node::heartbeat_all_peers_after_net_change`] for what a peer on a
+//!    [`Node::heartbeat_moved_peers_after_net_change`] for what a peer on a
 //!    connection-oriented transport gets instead, and for why that filter has
 //!    outlived the reason it was written for.
 //!
@@ -65,10 +65,19 @@
 //! Scoped, the only peer in the set is the roamer itself — whose connected
 //! socket `dataplane::encrypted` has already cleared on the address change.
 //!
-//! Nothing is left stranded by the narrowing, because a peer absent from the
-//! set is one whose local source address the kernel still resolves to the same
-//! place. That is the whole content of the fingerprint: a peer that did not
-//! move is a peer whose socket is not stale.
+//! A peer is absent from that set for one of two reasons. The first is the
+//! one the narrowing rests on: its local source address still resolves to the
+//! same place, which is the whole content of the fingerprint — a peer that did
+//! not move is a peer whose socket is not stale. The second is that it never
+//! reached the sample. `PeerRow::probe_target` parses the peer's current
+//! address, so a peer still carrying the hostname it was configured with is
+//! `None` there and is skipped while any `connect()`-ed socket it holds stays
+//! pinned; the node-wide reaction repaired that peer as collateral and this one
+//! does not. Where the node dialled out, that is transient —
+//! `set_current_addr` replaces the configured string with the observed numeric
+//! source on the first authentic frame. Which side supplies `current_addr` on
+//! an inbound peering is not established here, so the second group is not
+//! claimed to be empty in general.
 
 use std::time::Instant;
 
@@ -101,8 +110,8 @@ impl Node {
         );
     }
 
-    /// Drop every per-peer `connect()`-ed UDP socket, returning how many were
-    /// released.
+    /// Drop the per-peer `connect()`-ed UDP socket of each peer that moved,
+    /// returning how many were released.
     ///
     /// See the module docs for why they are stale: `connect(2)` pins the local
     /// source address to the interface that carried the route at connect time,
@@ -130,11 +139,11 @@ impl Node {
         0
     }
 
-    /// Send one heartbeat to every peer whose send path cannot block, so each
-    /// learns the node's new source address in one RTT rather than at the next
-    /// due interval. Returns how many sends actually succeeded, which is what
-    /// the operator log reports — a count of peers *selected* would read the
-    /// same whether every frame left or none did, and a medium change is
+    /// Send one heartbeat to each moved peer whose send path cannot block, so
+    /// each learns the node's new source address in one RTT rather than at the
+    /// next due interval. Returns how many sends actually succeeded, which is
+    /// what the operator log reports — a count of peers *selected* would read
+    /// the same whether every frame left or none did, and a medium change is
     /// exactly when sends start failing.
     ///
     /// The filter was written for a hazard that no longer exists, and it is

@@ -720,10 +720,11 @@ async fn a_route_change_alone_reaches_the_watcher() {
         .expect("a route change must reach the watcher well inside 5s");
 }
 
-/// Reactions are paced. Dropping every peer's connected socket and heartbeating
-/// each of them is not free, so an interface that flaps cleanly — settling
-/// between transitions, which defeats the debounce — must not drive that
-/// several times a second across the whole peer set.
+/// Reactions are paced. Dropping a moved peer's connected socket and
+/// heartbeating it is not free, and an interface flapping cleanly is the worst
+/// case for that, because a medium change moves the whole table at once. So an
+/// interface settling between transitions, which defeats the debounce, must not
+/// drive that several times a second across the whole peer set.
 #[tokio::test(start_paused = true)]
 async fn reports_are_spaced_out_under_clean_flapping() {
     let a = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
