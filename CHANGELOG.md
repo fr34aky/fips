@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
 
+### Changed
+
+- The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
+  It arrives through `rand`, a direct dependency,
+  so it sits on the built path rather than off to one side. The requirement in
+  `Cargo.toml` already admitted 0.10.2, so this is a lockfile change and no code
+  changed with it. **This is not a security fix**: `cargo audit` reports nothing
+  against `chacha20` at either version, and 0.10.1 was withdrawn by its
+  maintainer rather than flagged by an advisory. What it buys is that a fresh
+  checkout can resolve the lockfile without reaching for a yanked version.
+
 ## [0.5.1] - 2026-09-06
 
 ### Fixed
