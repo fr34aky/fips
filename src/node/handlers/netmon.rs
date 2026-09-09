@@ -130,7 +130,10 @@ impl Node {
 
     /// Send one heartbeat to every peer whose send path cannot block, so each
     /// learns the node's new source address in one RTT rather than at the next
-    /// due interval. Returns how many went out.
+    /// due interval. Returns how many sends actually succeeded, which is what
+    /// the operator log reports — a count of peers *selected* would read the
+    /// same whether every frame left or none did, and a medium change is
+    /// exactly when sends start failing.
     ///
     /// The filter was written for a hazard that no longer exists, and it is
     /// kept deliberately rather than by oversight. It was this: a
@@ -161,7 +164,7 @@ impl Node {
     /// dropping the stale connection
     /// rather than writing into it, which is a different change with a real
     /// cost behind it — a Tor peer pays a fresh circuit — and is not this one.
-    async fn heartbeat_all_peers_after_net_change(&mut self) -> usize {
+    pub(in crate::node) async fn heartbeat_all_peers_after_net_change(&mut self) -> usize {
         let now = Instant::now();
         let heartbeat = [LinkMessageType::Heartbeat.to_byte()];
         let targets: Vec<NodeAddr> = self
@@ -175,17 +178,25 @@ impl Node {
             .map(|(addr, _)| *addr)
             .collect();
 
-        let sent = targets.len();
+        let mut sent = 0usize;
         for addr in targets {
             if let Some(peer) = self.peers.get_mut(&addr) {
-                peer.mark_heartbeat_sent(now);
+                peer.mark_heartbeat_attempt(now);
             }
-            if let Err(e) = self.send_encrypted_link_message(&addr, &heartbeat).await {
-                debug!(
-                    peer = %self.peer_display_name(&addr),
-                    error = %e,
-                    "Failed to send post-medium-change heartbeat"
-                );
+            match self.send_encrypted_link_message(&addr, &heartbeat).await {
+                Ok(()) => {
+                    if let Some(peer) = self.peers.get_mut(&addr) {
+                        peer.mark_heartbeat_sent(now);
+                    }
+                    sent += 1;
+                }
+                Err(e) => {
+                    debug!(
+                        peer = %self.peer_display_name(&addr),
+                        error = %e,
+                        "Failed to send post-medium-change heartbeat"
+                    );
+                }
             }
         }
         sent

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Node lifecycle
+
+- A heartbeat whose send failed no longer counts as one that was delivered.
+  The peer's "last heartbeat" timestamp was stamped before the send and left
+  alone whatever came back, so a failure suppressed the next attempt for a
+  full `node.heartbeat_interval_secs` even though the peer had heard nothing —
+  on a 10s interval against a 30s `link_dead_timeout_secs`, three failures in
+  a row were the whole budget. The timestamp now moves only on a send that
+  returned cleanly, and a separate record of the *attempt* spaces the retries
+  so a peer that keeps failing is retried in seconds rather than either
+  hammered every tick or left for a full interval. That retry spacing
+  applies to the failure path only: gating a healthy peer on it as well
+  would have floored `node.heartbeat_interval_secs` at two seconds, so a
+  configured value below that would silently not have been honoured.
+
 #### Data plane
 
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and

@@ -441,3 +441,68 @@ async fn a_peers_connected_socket_publishes_the_source_it_was_pinned_to() {
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// A heartbeat that did not go out must not be counted as one that did — in
+/// the operator log, or in the peer's own idea of when it was last heard from.
+///
+/// A medium change is exactly the condition under which sends start failing,
+/// so a count of peers *selected* would read identically whether every frame
+/// left or none did, and the peer would then be suppressed for a full
+/// `heartbeat_interval_secs` on the strength of a send that never landed.
+///
+/// The peer is re-pinned onto a UDP transport that was never started, which is
+/// connectionless — so the fan-out selects it — and fails its send with
+/// `NotStarted` before touching a socket.
+#[tokio::test]
+async fn a_heartbeat_that_failed_is_not_counted_and_does_not_suppress_the_next() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+
+    let addr_1 = *nodes[1].node.node_addr();
+    let peer_1 = identity_of(&nodes, 1);
+    configure_auto_peer(&mut nodes[0].node, &peer_1);
+
+    let dead_id = TransportId::new(88);
+    let (tx, _rx) = packet_channel(64);
+    nodes[0].node.transports.insert(
+        dead_id,
+        TransportHandle::Udp(crate::transport::udp::UdpTransport::new(
+            dead_id,
+            None,
+            crate::config::UdpConfig::default(),
+            tx,
+        )),
+    );
+    nodes[0]
+        .node
+        .peers
+        .get_mut(&addr_1)
+        .expect("peer 1 is established")
+        .set_current_addr(dead_id, TransportAddr::from_string("10.0.0.2:2121"));
+
+    let before = nodes[0]
+        .node
+        .get_peer(&addr_1)
+        .unwrap()
+        .last_heartbeat_sent();
+
+    let sent = nodes[0].node.heartbeat_all_peers_after_net_change().await;
+
+    assert_eq!(
+        sent, 0,
+        "the count reports sends that succeeded, not peers picked out"
+    );
+
+    let peer = nodes[0].node.get_peer(&addr_1).unwrap();
+    assert_eq!(
+        peer.last_heartbeat_sent(),
+        before,
+        "a failed heartbeat must not move the interval that says the peer has heard from us"
+    );
+    assert!(
+        peer.last_heartbeat_attempt().is_some(),
+        "the attempt is still recorded, or a failing peer would be retried every tick"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
