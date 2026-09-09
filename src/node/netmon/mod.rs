@@ -159,7 +159,7 @@ use crate::identity::NodeAddr;
 /// change again; riding it out coalesces the burst into one event. Bounded so
 /// an interface that flaps continuously still produces events rather than
 /// starving the handler forever.
-const MAX_DEBOUNCE_ROUNDS: u32 = 8;
+pub(crate) const MAX_DEBOUNCE_ROUNDS: u32 = 8;
 
 /// Minimum spacing between two reported changes.
 ///

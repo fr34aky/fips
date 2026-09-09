@@ -202,8 +202,22 @@ an interface arriving or leaving — and rebinds the send path immediately.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `node.netmon.enabled` | bool | `true` | Whether medium-change detection runs |
-| `node.netmon.poll_interval_secs` | u64 | `5` | How often the path to each peer is sampled (backstop period where an event-driven backend exists) |
-| `node.netmon.debounce_ms` | u64 | `250` | How long to wait for the picture to settle before acting (`0` disables) |
+| `node.netmon.poll_interval_secs` | u64 | `5` | How often the path to each peer is sampled (backstop period where an event-driven backend exists). **Must be at least 1 while `enabled`; `0` is refused at startup.** |
+| `node.netmon.debounce_ms` | u64 | `250` | How long to wait for the picture to settle before acting (`0` disables). **Refused at startup when `debounce_ms × 8` reaches `node.link_dead_timeout_secs`** — see below. |
+
+Both refusals stop the node rather than degrade it, so they are worth knowing
+before they are met.
+
+A handover is ridden out for up to **8** settling rounds (`MAX_DEBOUNCE_ROUNDS`)
+of `debounce_ms` each before a change is reported. If that worst case reaches
+`node.link_dead_timeout_secs`, the liveness reaper tears the peering down before
+the detector ever reports, so the machinery runs and cannot help — the node
+refuses to start rather than run in that shape. At the shipped defaults the
+margin is wide (8 × 250 ms = 2 s against 30 s), but the constraint couples two
+keys in different blocks: **shortening `link_dead_timeout_secs` for fast
+failover can make an untouched `debounce_ms` illegal.** The refusal names both
+values and the multiplier.
+
 
 Established UDP peers use a per-peer `connect()`-ed socket for the send fast
 path. `connect(2)` makes the kernel resolve the route once and pin the local
