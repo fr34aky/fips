@@ -760,6 +760,8 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
     // namespace, so the routes the netlink test above installs are still there
     // and a shared prefix collides with EEXIST depending on the order they run.
     const NET: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 0);
+    const CARRIER: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 1);
+    const BRIDGE: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 1);
     const DEST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), 9);
 
     /// Bring up a dummy interface carrying `addr/24`, returning its index.
@@ -801,7 +803,7 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
 
     // The medium the peer is actually reached over: an interface plus the
     // default route out of it.
-    let carrier = dummy_up(&handle, "mc-carrier", Ipv4Addr::new(10, 99, 0, 1)).await;
+    let carrier = dummy_up(&handle, "mc-carrier", CARRIER).await;
     handle
         .route()
         .add(
@@ -818,7 +820,7 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
     let before = NetFingerprint::sample(&targets);
     assert_eq!(
         before.sources.get(&peer(1)).map(|p| p.current),
-        Some(Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)))),
+        Some(Some(IpAddr::V4(CARRIER))),
         "the peer must be reached over the carrier before anything else appears, \
          or this test proves nothing about what happens next"
     );
@@ -827,7 +829,7 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
     // what `docker compose up` leaves behind. It is up, it is not loopback, and
     // it carries an address — every property the old host-wide set keyed on —
     // but no peer is reached through it.
-    dummy_up(&handle, "mc-bridge", Ipv4Addr::new(172, 30, 0, 1)).await;
+    dummy_up(&handle, "mc-bridge", BRIDGE).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let after = NetFingerprint::sample(&targets);
@@ -835,6 +837,39 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
         before.moved(&after),
         Vec::new(),
         "an interface carrying no route to any peer must not be a medium change"
+    );
+
+    // While two addresses exist here, measure the reason the probe carries a
+    // bind constraint at all.
+    //
+    // `open_connected_fd` binds the transport's configured address verbatim
+    // and only then connects, so under a non-wildcard `transports.udp.bind_addr`
+    // the socket's source is that address whatever the routing table says. An
+    // unconstrained probe answers with the kernel's choice instead. Where the
+    // two differ, the first-sight rule would compare them and report a move on
+    // every peer, permanently, with nothing having moved.
+    //
+    // The interloper's address is reachable-from but is not what the route to
+    // DEST would pick, so it is exactly that disagreement, made concrete: the
+    // unconstrained probe answers with the carrier, the constrained one with
+    // what it was told to bind.
+    let unconstrained = preferred_source(DEST, None);
+    let constrained = preferred_source(DEST, Some(IpAddr::V4(BRIDGE)));
+    assert_eq!(
+        unconstrained,
+        Some(IpAddr::V4(CARRIER)),
+        "an unconstrained probe follows the route"
+    );
+    assert_eq!(
+        constrained,
+        Some(IpAddr::V4(BRIDGE)),
+        "a constrained probe answers from the address it was told to bind, which \
+         is what a non-wildcard bind_addr makes the send path do"
+    );
+    assert_ne!(
+        unconstrained, constrained,
+        "if these agreed the constraint would be untested, and the phantom-move \
+         case it exists for could not arise"
     );
 
     // The other half, in the same namespace and against the same live sampler:
