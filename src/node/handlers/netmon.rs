@@ -52,6 +52,23 @@
 //! position and the routes all survive the switch. `link_dead_timeout_secs`
 //! remains the backstop for a peer that genuinely cannot be reached on the new
 //! medium.
+//!
+//! # Why the reaction is still node-wide
+//!
+//! [`NetChange`] now names the peers whose local source address moved, because
+//! the fingerprint is keyed on them. The reaction deliberately does not use
+//! that yet: it drops every connected socket and heartbeats every
+//! connectionless peer, exactly as it did when the detector could only say
+//! "something about this host moved".
+//!
+//! That is over-broad and known to be. It is left node-wide here because
+//! narrowing it is a behavioural change with its own failure mode — a peer
+//! left un-rebound because it was absent from the moved set is stranded for
+//! `link_dead_timeout_secs`, which is the bug this subsystem exists to close —
+//! and it wants its own tests rather than a free ride on a change to the
+//! fingerprint. The cost of staying broad is now small: a change is only
+//! reported when a peering's own path moved, so the fan-out no longer fires
+//! for a container bridge appearing.
 
 use std::time::Instant;
 
@@ -64,6 +81,9 @@ use crate::proto::link::LinkMessageType;
 
 impl Node {
     /// React to a settled transport-medium change.
+    ///
+    /// `change.summary` names the peers that moved; see the module docs for
+    /// why the reaction is node-wide regardless.
     pub(in crate::node) async fn handle_net_change(&mut self, change: NetChange) {
         let peers = self.peers.len();
         // Before the heartbeats: they must go out over a socket that resolves
@@ -132,9 +152,13 @@ impl Node {
     /// the session counter and the MMP sender record.
     ///
     /// So a peer on TCP, Tor, Nym or BLE keeps the periodic heartbeat it had
-    /// before this detector existed. It is not stranded by the omission: those
-    /// transports re-dial on send, and `link_dead_timeout_secs` remains the
-    /// backstop. Doing better for them means dropping the stale connection
+    /// before this detector existed, and `link_dead_timeout_secs` remains the
+    /// backstop. Note that it does *not* recover by redialling: `send_async`
+    /// only dials when the pool holds no connection for the address, and a
+    /// connection stranded by a medium change is still in the pool. It is
+    /// evicted after a write to it fails, so the redial happens on the send
+    /// after the failure, not on the first one. Doing better for them means
+    /// dropping the stale connection
     /// rather than writing into it, which is a different change with a real
     /// cost behind it — a Tor peer pays a fresh circuit — and is not this one.
     async fn heartbeat_all_peers_after_net_change(&mut self) -> usize {
