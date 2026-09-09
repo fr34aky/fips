@@ -1044,3 +1044,58 @@ async fn an_interface_going_down_is_reported_only_when_a_peer_was_reached_over_i
         "losing every path this test installed is a medium change"
     );
 }
+
+/// The group mask the detector actually ends up subscribed to, read back from
+/// the kernel.
+///
+/// This is the one property of the netlink backend that CI could not check.
+/// `a_route_change_alone_reaches_the_watcher` discriminates a wrong mask by
+/// provoking a real route change, but it needs `CAP_NET_ADMIN` and is skipped
+/// everywhere CI runs — so a regression to link-events-only would have passed
+/// every gate while the detector silently stopped seeing the default route
+/// move, which is the change it exists to catch.
+///
+/// A wrong mask cannot be caught by watching the bind: subscribing to the
+/// wrong groups succeeds exactly like subscribing to the right ones, and only
+/// differs in what never arrives afterwards. So this asks the kernel what the
+/// socket is subscribed to instead, which needs no privileges at all.
+///
+/// It goes through `build_wake_source` rather than constructing a watcher
+/// directly, so it is the production path being asserted on and not a second
+/// copy of the same constant.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn the_detector_subscribes_to_the_route_groups_not_just_link() {
+    use crate::transport::watcher::groups;
+
+    let wake = build_wake_source(&cfg(5, 250));
+    // Asserted, not skipped. An early return here would make this test green in
+    // exactly the environment that differs from a real check — a sandbox where
+    // the bind is refused — so a mask regression would pass everywhere the
+    // subscription could not be inspected. `the_egress_path_mask_opens_a_source`
+    // already holds the same line: the bind is expected to work on Linux.
+    let subscribed = wake.subscribed_groups().expect(
+        "the detector must have a live netlink subscription to inspect; without one \
+         this test cannot say anything about the group mask",
+    );
+
+    assert_eq!(
+        subscribed,
+        groups::EGRESS_PATH,
+        "the detector must be subscribed to the egress-path groups it asked for"
+    );
+    for (name, group) in [
+        ("IPV4_ROUTE", groups::IPV4_ROUTE),
+        ("IPV6_ROUTE", groups::IPV6_ROUTE),
+        ("IPV4_IFADDR", groups::IPV4_IFADDR),
+        ("IPV6_IFADDR", groups::IPV6_IFADDR),
+    ] {
+        assert_ne!(
+            subscribed & group,
+            0,
+            "{name} is missing: a default route moving between two interfaces that both \
+             stay up emits nothing in the link group, so without this the detector would \
+             never fire for the change it exists to catch"
+        );
+    }
+}

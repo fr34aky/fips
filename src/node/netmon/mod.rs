@@ -526,6 +526,17 @@ impl WakeSource {
         timer
     }
 
+    /// The netlink groups this wake source is subscribed to, or `None` if it
+    /// is not a live netlink source. For the group-mask assertion in the
+    /// tests — see `the_detector_subscribes_to_the_route_groups_not_just_link`.
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    fn subscribed_groups(&self) -> Option<u32> {
+        match &self.source {
+            Wake::Kernel(watcher) => watcher.subscribed_groups(),
+            _ => None,
+        }
+    }
+
     /// Wait until it is worth sampling again.
     async fn wait(&mut self) {
         let WakeSource { source, timer } = self;
