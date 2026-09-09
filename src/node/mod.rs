@@ -2506,7 +2506,11 @@ impl Node {
 
         // --- LAN-seen (show_lan_peers) --- newest sighting first.
         let mut lan_rows: Vec<snap::LanSeenRow> = self.lan_seen.values().cloned().collect();
-        lan_rows.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms).then(a.npub.cmp(&b.npub)));
+        lan_rows.sort_by(|a, b| {
+            b.last_seen_ms
+                .cmp(&a.last_seen_ms)
+                .then(a.npub.cmp(&b.npub))
+        });
 
         let snapshot = snap::EntitySnapshot {
             peers: snap::reconcile_rows(&prev.peers, peer_rows, |r| r.node_addr),

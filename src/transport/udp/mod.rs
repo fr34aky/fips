@@ -62,11 +62,19 @@ impl DialPrefix {
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.net, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = if self.len == 0 { 0 } else { u32::MAX << (32 - self.len as u32) };
+                let mask = if self.len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.len as u32)
+                };
                 (u32::from(net) & mask) == (u32::from(ip) & mask)
             }
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = if self.len == 0 { 0 } else { u128::MAX << (128 - self.len as u32) };
+                let mask = if self.len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.len as u32)
+                };
                 (u128::from(net) & mask) == (u128::from(ip) & mask)
             }
             _ => false,
@@ -930,9 +938,15 @@ mod tests {
     fn dial_prefix_parse() {
         assert!(DialPrefix::parse("192.168.49.0/24").is_some());
         assert!(DialPrefix::parse("fd00::/8").is_some());
-        assert!(DialPrefix::parse(" 10.0.0.0/8 ").is_some(), "trims whitespace");
+        assert!(
+            DialPrefix::parse(" 10.0.0.0/8 ").is_some(),
+            "trims whitespace"
+        );
         assert!(DialPrefix::parse("192.168.49.0").is_none(), "missing /len");
-        assert!(DialPrefix::parse("192.168.49.0/33").is_none(), "v4 len > 32");
+        assert!(
+            DialPrefix::parse("192.168.49.0/33").is_none(),
+            "v4 len > 32"
+        );
         assert!(DialPrefix::parse("fd00::/129").is_none(), "v6 len > 128");
         assert!(DialPrefix::parse("not-an-ip/24").is_none());
         assert!(DialPrefix::parse("192.168.49.0/abc").is_none());
@@ -953,7 +967,10 @@ mod tests {
 
         let all4 = DialPrefix::parse("0.0.0.0/0").unwrap();
         assert!(all4.contains("203.0.113.9".parse().unwrap()));
-        assert!(!all4.contains("::1".parse().unwrap()), "v4 /0 is still v4-only");
+        assert!(
+            !all4.contains("::1".parse().unwrap()),
+            "v4 /0 is still v4-only"
+        );
     }
 
     /// Transport-level scoping: malformed entries dropped, longest
@@ -971,13 +988,22 @@ mod tests {
         };
         let t = UdpTransport::new(TransportId::new(1), None, config, tx.clone());
         assert!(t.dial_scoped());
-        assert_eq!(t.dial_prefix_match("192.168.49.7".parse().unwrap()), Some(24));
-        assert_eq!(t.dial_prefix_match("192.168.2.7".parse().unwrap()), Some(16));
+        assert_eq!(
+            t.dial_prefix_match("192.168.49.7".parse().unwrap()),
+            Some(24)
+        );
+        assert_eq!(
+            t.dial_prefix_match("192.168.2.7".parse().unwrap()),
+            Some(16)
+        );
         assert_eq!(t.dial_prefix_match("10.0.0.1".parse().unwrap()), None);
 
         let unscoped = UdpTransport::new(TransportId::new(2), None, UdpConfig::default(), tx);
         assert!(!unscoped.dial_scoped());
-        assert_eq!(unscoped.dial_prefix_match("192.168.49.7".parse().unwrap()), None);
+        assert_eq!(
+            unscoped.dial_prefix_match("192.168.49.7".parse().unwrap()),
+            None
+        );
     }
 
     #[tokio::test]
