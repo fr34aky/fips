@@ -453,6 +453,41 @@ fn a_probe_to_loopback_answers_with_loopback() {
     );
 }
 
+/// The embedder's socket-protect hook must see every probe socket, and see
+/// it before the route lookup happens. An Android `VpnService` that captures
+/// its own package routes an unprotected socket into the tunnel, so an
+/// unprotected probe would answer with the tunnel address for every peer
+/// and the fingerprint could never move. The hook fires once per target;
+/// a probe the hook never saw is the bug this pins.
+#[test]
+fn the_protect_hook_sees_every_probe_socket() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::clone(&seen);
+    let hook: crate::transport::SocketProtect = Arc::new(move |_fd| {
+        sink.fetch_add(1, Ordering::SeqCst);
+    });
+    let targets = [
+        target(peer(1), SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
+        target(peer(2), OFF_LINK),
+    ];
+    let sample = NetFingerprint::sample_protected(&targets, Some(&hook));
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        2,
+        "one protect call per probed target"
+    );
+    assert_eq!(
+        sample.sources.get(&peer(1)).map(|p| p.current),
+        Some(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+        "protecting the probe must not change what it answers"
+    );
+    assert_eq!(
+        NetFingerprint::sample(&targets).sources.len(),
+        2,
+        "the unprotected path still records every target"
+    );
+}
+
 #[test]
 fn every_target_is_recorded_whether_or_not_it_has_a_route() {
     // A peer with no route must stay in the map as `None` rather than dropping
@@ -888,8 +923,8 @@ async fn an_interface_no_peer_is_reached_through_does_not_move_the_fingerprint()
     // DEST would pick, so it is exactly that disagreement, made concrete: the
     // unconstrained probe answers with the carrier, the constrained one with
     // what it was told to bind.
-    let unconstrained = preferred_source(DEST, None);
-    let constrained = preferred_source(DEST, Some(IpAddr::V4(BRIDGE)));
+    let unconstrained = preferred_source(DEST, None, None);
+    let constrained = preferred_source(DEST, Some(IpAddr::V4(BRIDGE)), None);
     assert_eq!(
         unconstrained,
         Some(IpAddr::V4(CARRIER)),

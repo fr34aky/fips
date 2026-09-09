@@ -234,7 +234,26 @@ impl NetFingerprint {
     /// count instead. It runs inline in the detector's own task rather than
     /// through `spawn_blocking`, which is what keeps it off every other task
     /// regardless.
+    #[cfg(test)]
     pub(in crate::node) fn sample(targets: &[ProbeTarget]) -> Self {
+        Self::sample_protected(targets, None)
+    }
+
+    /// [`Self::sample`] with the embedder's socket-protect hook applied to
+    /// each probe socket between `bind(2)` and `connect(2)`.
+    ///
+    /// The probe never sends, so on most hosts the hook is irrelevant to it.
+    /// It matters where a socket's *route lookup* is what the hook changes:
+    /// an Android `VpnService` that captures its own package routes every
+    /// unprotected socket into the tunnel, so an unprotected probe answers
+    /// with the tunnel's own address for every peer — a fingerprint that
+    /// never moves, and a detector that never fires. Protected, the probe
+    /// asks the same routing question the transport's protected sockets are
+    /// answered by.
+    pub(in crate::node) fn sample_protected(
+        targets: &[ProbeTarget],
+        protect: Option<&crate::transport::SocketProtect>,
+    ) -> Self {
         Self {
             sources: targets
                 .iter()
@@ -242,7 +261,7 @@ impl NetFingerprint {
                     (
                         t.peer,
                         PeerPath {
-                            current: preferred_source(t.dest, t.bind),
+                            current: preferred_source(t.dest, t.bind, protect),
                             bound: t.bound,
                         },
                     )
@@ -680,11 +699,14 @@ impl WakeSource {
 pub(crate) fn spawn_detector(
     cfg: NetmonConfig,
     peers: Arc<arc_swap::ArcSwap<EntitySnapshot>>,
+    socket_protect: Option<crate::transport::SocketProtect>,
 ) -> (NetChangeRx, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
     let handle = tokio::spawn(async move {
         let wake = build_wake_source(&cfg);
-        let sample = move || NetFingerprint::sample(&probe_targets(&peers.load()));
+        let sample = move || {
+            NetFingerprint::sample_protected(&probe_targets(&peers.load()), socket_protect.as_ref())
+        };
         run_detector(tx, cfg, sample, wake).await;
     });
     (rx, handle)
@@ -873,7 +895,11 @@ where
 /// itself a fingerprint value, reported as `None` rather than swallowed. It is
 /// the state a stranded peer is in, so losing it would blind the detector to
 /// the case it most needs to see.
-fn preferred_source(probe: SocketAddr, bind_to: Option<IpAddr>) -> Option<IpAddr> {
+fn preferred_source(
+    probe: SocketAddr,
+    bind_to: Option<IpAddr>,
+    protect: Option<&crate::transport::SocketProtect>,
+) -> Option<IpAddr> {
     // Port 0 always: the probe wants the transport's *address* constraint, not
     // its port, and binding the live port would collide with the socket the
     // transport already holds there. A family mismatch between the configured
@@ -887,6 +913,9 @@ fn preferred_source(probe: SocketAddr, bind_to: Option<IpAddr>) -> Option<IpAddr
         (SocketAddr::V6(_), _) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
     let socket = UdpSocket::bind(bind).ok()?;
+    // Before the connect: the hook changes which routing table the lookup
+    // consults (see `sample_protected`), and `connect(2)` is the lookup.
+    crate::transport::apply_socket_protect(protect, &socket);
     socket.connect(probe).ok()?;
     let local = socket.local_addr().ok()?.ip();
     // An unspecified local address means the kernel deferred the choice, which
