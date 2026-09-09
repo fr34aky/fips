@@ -264,6 +264,7 @@ impl Node {
         let ce_flag = header.flags & FLAG_CE != 0;
         let sp_flag = header.flags & FLAG_SP != 0;
 
+        let mut address_changed = false;
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             if let Some(mmp) = peer.mmp_mut() {
                 mmp.receiver.record_recv(
@@ -275,10 +276,26 @@ impl Node {
                 );
                 let _spin_rtt = mmp.spin_bit.rx_observe(sp_flag, header.counter, now_ms);
             }
-            peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
+            address_changed =
+                peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet.data.len(), packet.timestamp_ms);
             peer.touch(packet.timestamp_ms);
+        }
+
+        // Address rotation invalidates the per-peer connect()-ed UDP
+        // socket. Drop the connected socket + drain so the wildcard
+        // listen socket takes over until the new 5-tuple settles. The
+        // decrypt-worker completion path in
+        // `process_authentic_fmp_plaintext` does the same thing with
+        // the same flag; this is the in-line decrypt twin of it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if address_changed {
+            self.clear_connected_udp_for_peer(&node_addr);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = address_changed;
         }
 
         // Dispatch to link message handler

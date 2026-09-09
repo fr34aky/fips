@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Data-plane / transports
+
+- A peer that moves to a new address now loses the per-peer `connect(2)`-ed UDP
+  socket pinned to the address it left. `set_current_addr` returns whether the
+  address actually changed so the caller can drop the stale socket, and the
+  decrypt-worker completion path already acted on that return; the in-line
+  decrypt path discarded it, so the socket stayed installed and the send path
+  kept preferring it over the wildcard listen socket.
+
 #### Peering
 
 - A heartbeat whose send failed no longer counts as one that was delivered. The
