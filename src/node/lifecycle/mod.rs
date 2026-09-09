@@ -2010,6 +2010,7 @@ impl Node {
                 netmon_cfg,
                 self.entities_snapshot.clone(),
                 self.socket_protect.clone(),
+                Some(self.netmon_trigger.notify()),
             );
             self.supervisor.netmon_rx = Some(rx);
             self.supervisor.netmon_task = Some(task);

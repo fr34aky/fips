@@ -36,15 +36,18 @@
 //! to catch. `PF_ROUTE` has no group selection and delivers everything
 //! regardless.
 //!
-//! Still to come, behind the same seam and without touching the handler:
-//! `NotifyIpInterfaceChange` on Windows, and an embedder push on iOS. Android
-//! takes the netlink source above, which is the right backend when the policy
-//! allows the group bind and degrades to the timer when it does not; a
-//! `ConnectivityManager` push belongs there too, because a timer is not
-//! reliable under Doze. Every platform runs the
-//! timer regardless — as the only signal where there is no backend, and as a
-//! backstop where there is one, since a kernel event stream can drop messages
-//! or stop.
+//! An embedder can push a wake-up of its own through [`NetmonTrigger`]
+//! ([`Node::netmon_trigger`](crate::Node::netmon_trigger)), which sits
+//! *beside* whatever backend the platform has rather than replacing it. That
+//! is the Android path: the policy there refuses the netlink group bind for
+//! an app, so the kernel source degrades to the timer, while the app's
+//! `ConnectivityManager` callback knows the exact moment the default network
+//! moved — and a timer is not reliable under Doze. iOS would use the same
+//! seam from its path monitor. Still to come, behind the same seam and
+//! without touching the handler: `NotifyIpInterfaceChange` on Windows. Every
+//! platform runs the timer regardless — as the only signal where there is no
+//! backend, and as a backstop where there is one, since a kernel event stream
+//! can drop messages or stop.
 //!
 //! # What the fingerprint captures
 //!
@@ -562,6 +565,42 @@ struct WakeSource {
     /// backend a strict latency improvement rather than a replacement that can
     /// regress, for the cost of a few syscalls per period.
     timer: tokio::time::Interval,
+    /// An embedder's push ([`NetmonTrigger`]), beside the source above rather
+    /// than instead of it. `None` when nothing armed one, which costs no
+    /// `select!` arm.
+    push: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// An embedder's handle for waking the medium-change detector now, rather
+/// than at its next poll.
+///
+/// Obtained from [`Node::netmon_trigger`](crate::Node::netmon_trigger).
+/// [`poke`](Self::poke) is synchronous, cheap, and safe from any thread — it
+/// is meant to be called straight from a platform network callback (an
+/// Android `ConnectivityManager` one, say). A poke while the detector is
+/// mid-sample is not lost: one wake-up is held until the detector next waits,
+/// and a burst of pokes coalesces into that one. Poking a node whose detector
+/// is disabled or not running does nothing.
+#[derive(Clone, Debug)]
+pub struct NetmonTrigger {
+    inner: Arc<tokio::sync::Notify>,
+}
+
+impl NetmonTrigger {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Wake the detector: sample the path to every peer now.
+    pub fn poke(&self) {
+        self.inner.notify_one();
+    }
+
+    pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.inner)
+    }
 }
 
 /// Where a wake-up can come from, besides the timer.
@@ -591,6 +630,7 @@ impl WakeSource {
         Self {
             source: Wake::Timer,
             timer: Self::make_timer(period),
+            push: None,
         }
     }
 
@@ -600,6 +640,7 @@ impl WakeSource {
         Self {
             source: Wake::Kernel(watcher),
             timer: Self::make_timer(period),
+            push: None,
         }
     }
 
@@ -609,6 +650,7 @@ impl WakeSource {
         Self {
             source: Wake::Injected(pings),
             timer: Self::make_timer(period),
+            push: None,
         }
     }
 
@@ -628,6 +670,12 @@ impl WakeSource {
         timer
     }
 
+    /// Add an embedder push beside the existing source. See [`NetmonTrigger`].
+    fn with_push(mut self, push: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.push = push;
+        self
+    }
+
     /// The netlink groups this wake source is subscribed to, or `None` if it
     /// is not a live netlink source. For the group-mask assertion in the
     /// tests — see `the_detector_subscribes_to_the_route_groups_not_just_link`.
@@ -641,7 +689,24 @@ impl WakeSource {
 
     /// Wait until it is worth sampling again.
     async fn wait(&mut self) {
-        let WakeSource { source, timer } = self;
+        // The push is selected beside the platform source, never instead of
+        // it: an embedder that pokes is a latency improvement on top of the
+        // timer backstop, and a `Notify` holds one permit for a poke that
+        // lands while the detector is busy sampling, so it cannot be missed.
+        match self.push.clone() {
+            None => self.wait_source().await,
+            Some(push) => {
+                tokio::select! {
+                    _ = push.notified() => {}
+                    _ = self.wait_source() => {}
+                }
+            }
+        }
+    }
+
+    /// Wait on the platform source and the timer alone.
+    async fn wait_source(&mut self) {
+        let WakeSource { source, timer, .. } = self;
         // Only the injected source can stop: [`LinkWatcher`] parks forever
         // once it gives up, so a kernel source that dies simply stops firing
         // and the timer carries on underneath it with nothing to unwind here.
@@ -700,10 +765,11 @@ pub(crate) fn spawn_detector(
     cfg: NetmonConfig,
     peers: Arc<arc_swap::ArcSwap<EntitySnapshot>>,
     socket_protect: Option<crate::transport::SocketProtect>,
+    push: Option<Arc<tokio::sync::Notify>>,
 ) -> (NetChangeRx, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
     let handle = tokio::spawn(async move {
-        let wake = build_wake_source(&cfg);
+        let wake = build_wake_source(&cfg).with_push(push);
         let sample = move || {
             NetFingerprint::sample_protected(&probe_targets(&peers.load()), socket_protect.as_ref())
         };

@@ -18,6 +18,7 @@ mod handlers;
 mod lifecycle;
 pub(crate) mod metrics;
 pub(crate) mod netmon;
+pub use netmon::NetmonTrigger;
 mod peer_error_budget;
 mod peering;
 mod rate_limit;
@@ -396,6 +397,10 @@ pub struct Node {
     /// via [`Node::set_socket_protect`] before `start()` and handed to every
     /// transport / runtime-created underlay socket.
     socket_protect: Option<crate::transport::SocketProtect>,
+    /// The embedder's wake-up for the medium-change detector, handed out by
+    /// [`Node::netmon_trigger`] and into the detector at `start()`. Always
+    /// allocated so the trigger works whenever it is fetched.
+    netmon_trigger: netmon::NetmonTrigger,
 
     // === Transports & Links ===
     /// Active transports (owned by Node).
@@ -914,6 +919,7 @@ impl Node {
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             socket_protect: None,
+            netmon_trigger: netmon::NetmonTrigger::new(),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -1086,6 +1092,7 @@ impl Node {
             path_mtu_lookup: Arc::new(std::sync::RwLock::new(HashMap::new())),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             socket_protect: None,
+            netmon_trigger: netmon::NetmonTrigger::new(),
             #[cfg(unix)]
             decrypt_registered_sessions: std::collections::HashSet::new(),
             #[cfg(unix)]
@@ -3593,6 +3600,23 @@ impl Node {
     /// underlying socket more than once (adopted fds are re-announced).
     pub fn set_socket_protect(&mut self, hook: crate::transport::SocketProtect) {
         self.socket_protect = Some(hook);
+    }
+
+    /// A handle that wakes the medium-change detector (`node.netmon.*`) now
+    /// rather than at its next poll — see [`NetmonTrigger`].
+    ///
+    /// For an embedder whose platform tells it when the network moved but
+    /// refuses the node its kernel event source: an Android `VpnService` gets
+    /// a `ConnectivityManager` callback the moment the default network
+    /// changes, while the netlink group bind the detector would otherwise use
+    /// is denied to apps, leaving the detector on its poll timer. Poking from
+    /// the callback turns a poll-period latency into a debounce-period one.
+    /// Callable before or after [`Self::start`], from any thread; the handle
+    /// survives the node and simply does nothing once it is stopped. A new
+    /// `Node` has a new trigger — an embedder that rebuilds the node must
+    /// fetch it again.
+    pub fn netmon_trigger(&self) -> NetmonTrigger {
+        self.netmon_trigger.clone()
     }
 
     /// Build the per-packet outbound processor an app-owned TUN pump
