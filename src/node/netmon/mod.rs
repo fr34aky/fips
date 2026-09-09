@@ -460,10 +460,9 @@ pub(crate) struct NetChange {
 }
 
 impl NetChange {
-    /// A synthetic change, for tests that exercise the node's *reaction* to a
-    /// medium change rather than its detection. The summary is empty because
-    /// the handler does not read it — it re-evaluates every peer regardless of
-    /// which peer's source address moved.
+    /// A synthetic change naming no peers, for tests that assert the node does
+    /// *nothing* — the reaction is scoped to the peers the summary names, so an
+    /// empty summary must move nothing.
     #[cfg(test)]
     pub(crate) fn for_test(generation: u64) -> Self {
         Self {
@@ -471,6 +470,30 @@ impl NetChange {
             summary: NetChangeSummary {
                 moved: Vec::new(),
                 probed: 0,
+            },
+        }
+    }
+
+    /// A synthetic change naming `peers` as having moved, for tests that
+    /// exercise the node's *reaction* rather than its detection.
+    ///
+    /// The addresses are placeholders: the handler reads only which peers
+    /// moved, not where from or to.
+    #[cfg(test)]
+    pub(crate) fn for_test_moved(generation: u64, peers: &[NodeAddr]) -> Self {
+        let moved: Vec<PeerSourceMove> = peers
+            .iter()
+            .map(|peer| PeerSourceMove {
+                peer: *peer,
+                before: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
+                after: Some(IpAddr::V4(Ipv4Addr::new(10, 40, 0, 7))),
+            })
+            .collect();
+        Self {
+            generation,
+            summary: NetChangeSummary {
+                probed: moved.len(),
+                moved,
             },
         }
     }

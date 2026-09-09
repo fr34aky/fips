@@ -53,22 +53,22 @@
 //! remains the backstop for a peer that genuinely cannot be reached on the new
 //! medium.
 //!
-//! # Why the reaction is still node-wide
+//! # Why the reaction is scoped to the peers that moved
 //!
-//! [`NetChange`] now names the peers whose local source address moved, because
-//! the fingerprint is keyed on them. The reaction deliberately does not use
-//! that yet: it drops every connected socket and heartbeats every
-//! connectionless peer, exactly as it did when the detector could only say
-//! "something about this host moved".
+//! [`NetChange`] names them, and the reaction acts on exactly that set. It is
+//! not an optimisation: keying the sample on peers put the trigger within
+//! reach of a remote party for the first time. `probe_target` is the observed
+//! source address of every authentic packet, updated with no throttle, so a
+//! peer alternating between two addresses that resolve to different local
+//! sources can move the fingerprint at will. Node-wide, that peer could drive
+//! every other peering's socket teardown, bounded only by the poll interval.
+//! Scoped, the only peer in the set is the roamer itself — whose connected
+//! socket `dataplane::encrypted` has already cleared on the address change.
 //!
-//! That is over-broad and known to be. It is left node-wide here because
-//! narrowing it is a behavioural change with its own failure mode — a peer
-//! left un-rebound because it was absent from the moved set is stranded for
-//! `link_dead_timeout_secs`, which is the bug this subsystem exists to close —
-//! and it wants its own tests rather than a free ride on a change to the
-//! fingerprint. The cost of staying broad is now small: a change is only
-//! reported when a peering's own path moved, so the fan-out no longer fires
-//! for a container bridge appearing.
+//! Nothing is left stranded by the narrowing, because a peer absent from the
+//! set is one whose local source address the kernel still resolves to the same
+//! place. That is the whole content of the fingerprint: a peer that did not
+//! move is a peer whose socket is not stale.
 
 use std::time::Instant;
 
@@ -80,22 +80,21 @@ use crate::node::netmon::NetChange;
 use crate::proto::link::LinkMessageType;
 
 impl Node {
-    /// React to a settled transport-medium change.
-    ///
-    /// `change.summary` names the peers that moved; see the module docs for
-    /// why the reaction is node-wide regardless.
+    /// React to a settled transport-medium change, on the peers it names.
     pub(in crate::node) async fn handle_net_change(&mut self, change: NetChange) {
+        let moved: Vec<NodeAddr> = change.summary.moved.iter().map(|m| m.peer).collect();
         let peers = self.peers.len();
         // Before the heartbeats: they must go out over a socket that resolves
         // the route now, not one still pinned to the interface just left.
-        let sockets_rebound = self.drop_connected_sockets_after_net_change();
+        let sockets_rebound = self.drop_connected_sockets_after_net_change(&moved);
 
-        let heartbeated = self.heartbeat_all_peers_after_net_change().await;
+        let heartbeated = self.heartbeat_moved_peers_after_net_change(&moved).await;
 
         info!(
             generation = change.generation,
             change = %change.summary,
             peers,
+            moved = moved.len(),
             sockets_rebound,
             heartbeated,
             "Transport medium changed; rebinding sends and re-pinning peers"
@@ -109,12 +108,15 @@ impl Node {
     /// source address to the interface that carried the route at connect time,
     /// and never re-evaluates it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn drop_connected_sockets_after_net_change(&mut self) -> usize {
-        let pinned: Vec<NodeAddr> = self
-            .peers
+    fn drop_connected_sockets_after_net_change(&mut self, moved: &[NodeAddr]) -> usize {
+        let pinned: Vec<NodeAddr> = moved
             .iter()
-            .filter(|(_, peer)| peer.connected_udp().is_some())
-            .map(|(addr, _)| *addr)
+            .filter(|addr| {
+                self.peers
+                    .get(*addr)
+                    .is_some_and(|peer| peer.connected_udp().is_some())
+            })
+            .copied()
             .collect();
         for addr in &pinned {
             self.clear_connected_udp_for_peer(addr);
@@ -124,7 +126,7 @@ impl Node {
 
     /// No per-peer connected sockets on this platform, so nothing to rebind.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn drop_connected_sockets_after_net_change(&mut self) -> usize {
+    fn drop_connected_sockets_after_net_change(&mut self, _moved: &[NodeAddr]) -> usize {
         0
     }
 
@@ -164,18 +166,22 @@ impl Node {
     /// dropping the stale connection
     /// rather than writing into it, which is a different change with a real
     /// cost behind it — a Tor peer pays a fresh circuit — and is not this one.
-    pub(in crate::node) async fn heartbeat_all_peers_after_net_change(&mut self) -> usize {
+    pub(in crate::node) async fn heartbeat_moved_peers_after_net_change(
+        &mut self,
+        moved: &[NodeAddr],
+    ) -> usize {
         let now = Instant::now();
         let heartbeat = [LinkMessageType::Heartbeat.to_byte()];
-        let targets: Vec<NodeAddr> = self
-            .peers
+        let targets: Vec<NodeAddr> = moved
             .iter()
-            .filter(|(_, peer)| {
-                peer.transport_id()
-                    .and_then(|id| self.transports.get(&id))
-                    .is_some_and(|t| !t.transport_type().connection_oriented)
+            .filter(|addr| {
+                self.peers.get(*addr).is_some_and(|peer| {
+                    peer.transport_id()
+                        .and_then(|id| self.transports.get(&id))
+                        .is_some_and(|t| !t.transport_type().connection_oriented)
+                })
             })
-            .map(|(addr, _)| *addr)
+            .copied()
             .collect();
 
         let mut sent = 0usize;
