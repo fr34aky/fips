@@ -51,9 +51,15 @@
 //! One local source address per peer: for every peer whose transport address is
 //! a numeric IP endpoint, the address the kernel would pick to reach *that
 //! peer*. A connected-but-never-sending UDP socket makes the kernel run its
-//! route lookup and bind the source address it would use; three syscalls, no
-//! packets, no name resolution, and it works identically on every platform std
-//! supports.
+//! route lookup and bind the source address it would use; five syscalls, read
+//! off [`NetFingerprint::sample`] rather than measured, no packets, no name
+//! resolution, and it works identically on every platform std supports.
+//!
+//! Keying on peers bounds the *reaction* — only the peers a change names are
+//! acted on — and does not bound the *sampling*. One roaming peer still makes
+//! the detector re-probe every target, up to [`MAX_DEBOUNCE_ROUNDS`] extra
+//! times per wake, and the only limit on how often that can start is
+//! `node.netmon.poll_interval_secs`.
 //!
 //! That set is exactly the quantity the reaction cares about. The stale
 //! `connect(2)` this whole subsystem exists to repair pinned a *local source
@@ -122,7 +128,7 @@
 //! is reported when some peer present in both samples is now reached from a
 //! different local address. Peers joining and leaving is ordinary node
 //! behaviour and says nothing about the medium, so on its own it must not fire
-//! a reaction that drops every connected socket. A peer whose probe stops
+//! a reaction that tears down a working send path. A peer whose probe stops
 //! answering entirely — the route to it is gone — is a move to "no source
 //! address" and does count, because that peer is exactly the one now stranded.
 //!
@@ -292,9 +298,9 @@ impl NetFingerprint {
     /// The comparison is over the *intersection* of the two peer sets, never
     /// the union: a peer that has only just been authenticated, or one that has
     /// just been reaped, differs between the samples for reasons that have
-    /// nothing to do with the host's attachment, and the reaction — drop every
-    /// connected socket, heartbeat every peer — is far too blunt to fire on
-    /// ordinary peer churn.
+    /// nothing to do with the host's attachment, and the reaction — drop the
+    /// peer's connected socket and heartbeat it — is pure churn on a peer whose
+    /// send path was never stale.
     ///
     /// **A peer only in the newer sample** has no previous probe answer to be
     /// compared against, and skipping it outright leaves a hole this detector
@@ -332,10 +338,16 @@ impl NetFingerprint {
     /// on tick N is first visible to this detector in the snapshot published on
     /// tick N+1. A peer that joins and has its socket installed, and whose path
     /// then moves before that next publish, is first seen with `bound` still
-    /// `None` and is skipped — and it *does* hold a pinned socket. About one
-    /// `tick_interval_secs` per join against a `poll_interval_secs` five times
-    /// longer, and the peer is recovered by the ordinary diff on the sample
-    /// after, so it is bounded rather than permanent.
+    /// `None` and is skipped — and it *does* hold a pinned socket. The window
+    /// in which it can be missed is about one `tick_interval_secs` per join,
+    /// against a `poll_interval_secs` five times longer, but the *consequence*
+    /// is not so short: the ordinary diff does not recover the peer. Once it is
+    /// in both samples it is judged on its probe answer alone, and `bound` is
+    /// consulted only on the first-sight arm, so the socket stays pinned where
+    /// it was. While the reaction was node-wide such a peer was repaired as
+    /// collateral the next time any other peer moved; scoping the reaction to
+    /// the peers a change names removed that. What bounds it now is
+    /// `node.link_dead_timeout_secs` reaping the peering.
     ///
     /// A non-wildcard `transports.udp.bind_addr` is not part of the residual;
     /// see [`ProbeTarget::bind`], which keeps both sides answering the same
@@ -386,6 +398,16 @@ pub(in crate::node) struct ProbeTarget {
     /// unconstrained probe would answer with the kernel's choice instead, and
     /// the two would disagree permanently — reporting a first-sight move, on
     /// every peer, forever, with nothing having moved.
+    ///
+    /// It does not preserve per-peer detection under such a bind, and should
+    /// not be read as if it did. [`preferred_source`] returns the configured
+    /// address for every destination, which is the same value the pinned socket
+    /// already holds, so a route moving under one peer while that address stays
+    /// configured on the host is invisible here. What is still reported is the
+    /// bind address itself going away, which moves every peer at once. That is
+    /// a trade rather than a loss: the send path is pinned to the configured
+    /// address whatever the routing table says, so there is no per-peer pinning
+    /// left to repair.
     pub bind: Option<IpAddr>,
 }
 
@@ -403,9 +425,9 @@ pub(crate) struct PeerSourceMove {
 /// What moved between two fingerprints.
 ///
 /// Operator-facing, and — unlike the host-wide summary this replaced — it now
-/// names the peers affected, because the fingerprint is keyed on them. The
-/// handler still re-evaluates every peer regardless; narrowing the reaction to
-/// exactly [`Self::moved`] is a separate change.
+/// names the peers affected, because the fingerprint is keyed on them. It is
+/// also the reaction's whole input: the handler acts on exactly the peers in
+/// [`Self::moved`] and touches no others.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NetChangeSummary {
     /// Every peer whose local source address changed, in `NodeAddr` order.
@@ -640,11 +662,18 @@ impl WakeSource {
 /// Spawn the medium-change detector, using the best backend this platform has.
 ///
 /// Returns the receiver the rx loop drains and the task handle the supervisor
-/// aborts at teardown. The channel holds a single slot: a change already queued
-/// and not yet handled makes a newer one redundant, because the handler's
-/// reaction is "re-evaluate every peer and every backoff", which subsumes any
-/// number of coalesced changes. A full channel therefore drops rather than
-/// queues, and never applies backpressure to the detector.
+/// aborts at teardown. The channel holds a single slot, and a full channel
+/// drops rather than queues: the detector must never apply backpressure to
+/// itself, and the node must never work through a backlog of network states
+/// the host has already left.
+///
+/// Dropping is only safe because the dropped change is not the last word on
+/// the peers it named. The handler acts on exactly those peers, so discarding
+/// one would strand them if the detector had already adopted the sample it was
+/// derived from. It has not: the baseline in [`run_detector`] advances only on
+/// a successful send, so the next sample re-derives the move against the same
+/// baseline and reports it again once the queue drains. Repairing a peer is
+/// idempotent, which is what makes re-reporting cheap rather than a loop.
 pub(crate) fn spawn_detector(
     cfg: NetmonConfig,
     peers: Arc<arc_swap::ArcSwap<EntitySnapshot>>,
@@ -807,10 +836,14 @@ where
                 probed: candidate.sources.len(),
             },
         };
-        last = candidate;
-
         match tx.try_send(change) {
-            Ok(()) => {}
+            // The baseline advances only here. A dropped change is a peer set
+            // nobody will act on, and the reaction is scoped to the peers a
+            // change names, so adopting `candidate` regardless would leave
+            // those peers unrepaired for good: the next diff would compare the
+            // post-change sample against itself and report nothing. Holding
+            // `last` where it was makes the next sample re-derive the move.
+            Ok(()) => last = candidate,
             Err(mpsc::error::TrySendError::Full(dropped)) => {
                 debug!(
                     generation = dropped.generation,

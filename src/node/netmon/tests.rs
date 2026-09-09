@@ -48,6 +48,11 @@ fn all_from(peers: &[NodeAddr], source: Option<IpAddr>) -> NetFingerprint {
     NetFingerprint::for_test(&sources)
 }
 
+/// The peers a change names, in the order its summary carries them.
+fn moved_peers(change: &NetChange) -> Vec<NodeAddr> {
+    change.summary.moved.iter().map(|m| m.peer).collect()
+}
+
 /// A timer-only wake source at the config's poll period — the portable
 /// backend's behaviour, and the baseline the netlink tests compare against.
 fn timer_wake(poll_secs: u64) -> WakeSource {
@@ -129,9 +134,9 @@ async fn a_peer_losing_its_route_is_reported() {
 #[tokio::test(start_paused = true)]
 async fn a_peer_joining_is_absorbed_rather_than_reported() {
     // Peer churn is ordinary node behaviour and says nothing about the medium.
-    // The reaction is to drop every connected socket and heartbeat every peer,
-    // so firing it every time a peer authenticates would make a busy node
-    // continuously tear down its own send fast path.
+    // The reaction drops the named peers' connected sockets and heartbeats
+    // them, so firing it every time a peer authenticates would make a busy node
+    // continuously tear down a send fast path that was never stale.
     let one = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
     let two = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
     let (sampler, _) = scripted(vec![one, two]);
@@ -312,14 +317,25 @@ async fn a_flap_that_settles_back_reports_nothing() {
 
 #[tokio::test(start_paused = true)]
 async fn an_unread_change_coalesces_rather_than_queues() {
-    // The handler's reaction is "re-evaluate every peer and every backoff",
-    // which subsumes any number of changes. A second change arriving before the
-    // first is drained must therefore drop, not queue: the node must never work
-    // through a backlog of stale network states.
-    let a = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
-    let b = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
-    let c = all_from(&[peer(1)], Some(v4(172, 16, 3, 2)));
-    let (sampler, _) = scripted(vec![a, b, c]);
+    // Two changes over disjoint peer sets: the first moves peer(1) alone, the
+    // second moves peer(2) alone. A second change arriving before the first is
+    // drained must not queue — the node must never work through a backlog of
+    // stale network states — and it must not be silently lost either, because
+    // the reaction is scoped to the peers a change names and nothing else
+    // would ever repair peer(2).
+    let start = NetFingerprint::for_test(&[
+        (peer(1), Some(v4(192, 168, 1, 10))),
+        (peer(2), Some(v4(192, 168, 1, 11))),
+    ]);
+    let first = NetFingerprint::for_test(&[
+        (peer(1), Some(v4(10, 40, 0, 7))),
+        (peer(2), Some(v4(192, 168, 1, 11))),
+    ]);
+    let second = NetFingerprint::for_test(&[
+        (peer(1), Some(v4(10, 40, 0, 7))),
+        (peer(2), Some(v4(10, 40, 0, 8))),
+    ]);
+    let (sampler, _) = scripted(vec![start, first, second]);
     let (tx, mut rx) = mpsc::channel(1);
 
     tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
@@ -328,10 +344,28 @@ async fn an_unread_change_coalesces_rather_than_queues() {
     // is draining, so the second meets a full channel.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    assert!(rx.try_recv().is_ok(), "the first change is delivered");
+    let queued = rx.try_recv().expect("the first change is delivered");
+    assert_eq!(
+        moved_peers(&queued),
+        vec![peer(1)],
+        "the queued change is the first one, which named only peer(1)"
+    );
     assert!(
         rx.try_recv().is_err(),
         "the second must have coalesced into the undrained first, not queued behind it"
+    );
+
+    // Draining frees the slot. The dropped change named peer(2) and nobody
+    // acted on it, so the detector's baseline must not have advanced past it:
+    // the next sample has to re-derive that move and deliver it.
+    let recovered = tokio::time::timeout(QUIET_WINDOW, rx.recv())
+        .await
+        .expect("a dropped change must be re-derived once the slot frees, not lost with its peers")
+        .expect("the channel must stay open");
+    assert!(
+        moved_peers(&recovered).contains(&peer(2)),
+        "a dropped change must not lose the peers it named; got {:?}",
+        recovered.summary.moved
     );
 }
 
