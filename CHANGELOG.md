@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would have floored `node.heartbeat_interval_secs` at two seconds, so a
   configured value below that would silently not have been honoured.
 
+- A peer that rotates its address no longer keeps sending from a socket
+  aimed where it used to be. The authenticated-frame path updated the
+  peer's address and discarded the flag saying it had changed, so the
+  per-peer `connect()`-ed UDP socket stayed pinned to the old 5-tuple;
+  the sibling path already cleared it.
+
 #### Data plane
 
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and
