@@ -661,6 +661,47 @@ run_static() {
     record "static-$topology" $rc
 }
 
+# Lines kept from each node's log when a red scenario's results are printed.
+CHAOS_DUMP_LINES=300
+
+# Print a red chaos scenario's results into the run log.
+#
+# A CI worker that runs each job in a worktree it deletes afterwards, under a
+# private /tmp, loses the results directory when the run ends, and the log is
+# the only record that survives. Without this such a red cannot be traced node
+# by node. The runner's own log is not repeated here: it already reached the run
+# log as the scenario's output. Each node log is capped, so the total grows with
+# node count; the largest CI scenario has ten nodes.
+chaos_dump() {
+    local name="$1" base="$2" dir f
+    dir="$(find "$base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)"
+    if [[ -z "$dir" ]]; then
+        echo "[chaos/$name] no results directory under $base"
+        return 0
+    fi
+    echo "===== chaos-$name results from $dir ====="
+    for f in status.txt assertions.txt; do
+        [[ -f "$dir/$f" ]] || continue
+        echo "----- $f -----"
+        cat "$dir/$f"
+    done
+    if [[ -f "$dir/tree-snapshot-final.json" ]]; then
+        echo "----- final tree: node, root, parent -----"
+        python3 -c '
+import json, sys
+for node, tree in sorted(json.load(open(sys.argv[1])).items()):
+    print(node, tree.get("root"), tree.get("parent"))
+' "$dir/tree-snapshot-final.json" || true
+    fi
+    for f in "$dir"/fips-node-*.log; do
+        [[ -f "$f" ]] || continue
+        echo "----- $(basename "$f"), last $CHAOS_DUMP_LINES lines -----"
+        tail -n "$CHAOS_DUMP_LINES" "$f"
+    done
+    echo "===== end of chaos-$name results ====="
+    return 0
+}
+
 # Run a chaos scenario
 run_chaos() {
     local name="$1"
@@ -678,11 +719,17 @@ run_chaos() {
     suffix="$(ci_chaos_suffix "$name")"
     local -x FIPS_CI_NAME_SUFFIX="$suffix"
 
+    # The same scoping for the results, so a red can find the directory this
+    # run wrote rather than guess among earlier runs' timestamps.
+    local results="$SCRIPT_DIR/chaos/sim-results/ci$suffix"
+    local -x FIPS_SIM_OUTPUT="$results"
+
     info "[chaos/$name] Running simulation"
     if bash testing/chaos/scripts/chaos.sh "$@" 2>&1; then
         rc=0
     else
         rc=1
+        chaos_dump "$name" "$results"
     fi
 
     record "chaos-$name" $rc
@@ -1345,9 +1392,12 @@ run_integration() {
                 record "chaos-$scenario" 0
             else
                 record "chaos-$scenario" 1
-                # Show tail of failure log
-                echo "--- chaos-$scenario output (last 20 lines) ---"
-                tail -20 "$logfile" 2>/dev/null || true
+                # The whole log, not its tail: the child printed the results
+                # directory into it, and this is the only place that reaches
+                # the run log. The sed keeps the last frame of each line the
+                # progress display redraws with carriage returns.
+                echo "--- chaos-$scenario output ---"
+                sed 's/.*\r//' "$logfile" 2>/dev/null || true
                 echo "---"
             fi
             rm -f "$logfile"

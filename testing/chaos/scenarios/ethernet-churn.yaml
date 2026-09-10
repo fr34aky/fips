@@ -79,35 +79,34 @@ node_churn:
   protect_connectivity: true
 
 assertions:
-  # The mesh re-forms after each interface comes back.
+  # The mesh re-forms after each interface comes back, fully.
   #
-  # Calibrated 2026-09-02 against four runs, all at this file's fixed seed 42
-  # and therefore an identical churn schedule, so the spread is container
-  # timing rather than differing scenarios:
+  # Calibrated 2026-09-10 against sixteen runs, eight on master-line code and
+  # eight on next-line code, on a harness that fails a veth restore it cannot
+  # complete and waits for the tree to settle before the final snapshot. Twelve
+  # ran beside the other five CI chaos scenarios and four CPU busy loops; seeds
+  # 42 (twelve runs), 7 and 1234:
   #
-  #   nodes answering  4 in all four runs
-  #   distinct roots   2 in all four runs
-  #   nodes parented   2 in all four runs
-  #   traffic          3-5 sessions, 206-388 MB
+  #   nodes answering  4 in all sixteen
+  #   distinct roots   1 in all sixteen
+  #   nodes parented   3 in all sixteen
+  #   settle           11-22 s
+  #   traffic          4-11 sessions per run, 3.8-11.7 GB
   #
-  # `max_roots: 1` was wrong and failed every run: the harness restores
-  # stopped nodes immediately before the final snapshot, so a node that has
-  # just restarted has not re-parented yet and is briefly its own root. That
-  # is the scenario working, not failing.
+  # So the thresholds are full convergence: every node answers, one root, three
+  # parented. A red here is a mesh that did not re-form.
   #
-  # The ceiling is 3, one step beyond the observed maximum of 2, with the
-  # parented floor at its complement. A mesh that genuinely collapsed — every
-  # node islanded — still fails, which is all this assertion is for. Do not
-  # read a pass as convergence.
-  #
-  # READ BEFORE RETUNING: four runs is a thin sample. `churn-mixed` documents
-  # what happens when a threshold is set one step outside a small one — it
-  # ends up inside the real distribution and reddens runs whatever the daemon
-  # does. Widen on evidence; tighten only against a much larger sample.
+  # READ BEFORE RETUNING: the 2026-09-02 calibration recorded 2 roots and 2
+  # parented in all four of its runs, and that was not the daemon. The veth
+  # restore then failed silently whenever a stopped node's namespace outlived
+  # the stop, and in every later run that was inspected, the node islanded at
+  # the snapshot was one whose links the harness had left down. Before widening these, read the red run's runner.log for a
+  # harness fault; a failed restore now aborts the run rather than reaching
+  # this assertion.
   baseline:
-    min_nodes_reporting: 3
-    max_roots: 3
-    min_nodes_parented: 2
+    min_nodes_reporting: 4
+    max_roots: 1
+    min_nodes_parented: 3
 
   # The point of the scenario. Traffic must actually have crossed Ethernet
   # links while interfaces were being taken away underneath it — a green tree

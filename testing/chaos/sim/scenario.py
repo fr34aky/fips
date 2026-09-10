@@ -880,14 +880,21 @@ def load_scenario(path: str) -> Scenario:
                 + ", ".join(sorted(_ASSERTION_KEYS["baseline"]))
                 + "; a block with none asserts nothing"
             )
-        if vals.get("min_nodes_parented", 0) > 0 or vals.get("max_roots"):
+        if vals.get("min_nodes_parented", 0) > 0:
+            # Every root is its own parent, so a mesh with R roots has at most
+            # n - R nodes parented. Checked against the roots ceiling rather
+            # than against one root: a floor above n - max_roots reds a run
+            # that sits exactly at the ceiling the file itself allows, so the
+            # two thresholds contradict each other there.
             n = s.topology.num_nodes
-            if vals.get("min_nodes_parented", 0) > n - 1:
+            roots = vals.get("max_roots", 1)
+            floor = vals["min_nodes_parented"]
+            if floor > n - roots:
                 raise ValueError(
-                    f"assertions.baseline.min_nodes_parented: "
-                    f"{vals['min_nodes_parented']} exceeds {n - 1}, the most a "
-                    f"{n}-node mesh can reach — the root is its own parent, so "
-                    f"this could never pass"
+                    f"assertions.baseline.min_nodes_parented: {floor} exceeds "
+                    f"{n - roots}, the most a {n}-node mesh with {roots} "
+                    f"root(s) can reach — each root is its own parent, so a "
+                    f"run at the max_roots ceiling could never pass"
                 )
         s.assertions.baseline = BaselineAssertion(**vals)
 

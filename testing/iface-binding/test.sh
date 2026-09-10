@@ -46,10 +46,30 @@ BOOT_IFACE="ve-boot0"
 # Host-side veth names, scoped per run: these live in the host (or Docker VM)
 # namespace for the moment between creation and the move into the containers,
 # where two concurrent runs would otherwise collide on one name.
-HOST_VETH_A="vhifb${FIPS_CI_NAME_SUFFIX:-0}a"
-HOST_VETH_B="vhifb${FIPS_CI_NAME_SUFFIX:-0}b"
-HOST_VETH_C="vhifb${FIPS_CI_NAME_SUFFIX:-0}c"
-HOST_VETH_D="vhifb${FIPS_CI_NAME_SUFFIX:-0}d"
+#
+# The scope comes from a four-hex hash of the run suffix, not from the suffix
+# itself. An interface name gets 15 characters and the suffix alone can spend
+# 24 of them (`-20260910t025205-2802512`), so interpolating it produced
+# `vhifb-20260910t025205-2802512b` and ip(8) refused the name outright. The
+# chaos simulation had already met this and answers it in `sim.naming`, which
+# the NAT topology script also calls; this uses the same token so the reaper
+# in `ci-cleanup.sh` can match these interfaces by the same rule.
+#
+# Empty for an empty suffix, so a bare run keeps short unscoped names.
+veth_token() {
+    local suffix="${FIPS_CI_NAME_SUFFIX:-}"
+    if [ -z "$suffix" ]; then
+        echo ""
+        return 0
+    fi
+    PYTHONPATH="$TESTING_DIR/chaos" python3 -m sim.naming "$suffix"
+}
+
+VETH_TOKEN="$(veth_token)"
+HOST_VETH_A="vhifb${VETH_TOKEN}a"
+HOST_VETH_B="vhifb${VETH_TOKEN}b"
+HOST_VETH_C="vhifb${VETH_TOKEN}c"
+HOST_VETH_D="vhifb${VETH_TOKEN}d"
 
 SKIP_BUILD=false
 KEEP_UP=false
