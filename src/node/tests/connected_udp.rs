@@ -107,36 +107,6 @@ fn far_side_frame(session: &mut NoiseSession, receiver_idx: SessionIndex) -> Vec
     build_encrypted(&header, &ciphertext)
 }
 
-/// Install a real `connect()`-ed UDP socket on a peer, the way the
-/// tick-driven activation in `dataplane::connected_udp` does.
-///
-/// The socket is opened against the loopback discard port: nothing is
-/// ever sent through it, and the tests only care whether the handle is
-/// still installed afterwards.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn install_connected_udp(node: &mut Node, addr: &NodeAddr, transport_id: TransportId) {
-    let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let peer_sa: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
-
-    let owned = crate::transport::udp::open_connected_fd(local, peer_sa, 65_536, 65_536)
-        .expect("open a connected UDP socket");
-    let socket = std::sync::Arc::new(crate::transport::udp::ConnectedPeerSocket::from_fd(
-        owned, peer_sa, local,
-    ));
-    let (packet_tx, _packet_rx) = packet_channel(8);
-    let drain = crate::transport::udp::PeerRecvDrain::spawn(
-        socket.clone(),
-        transport_id,
-        peer_sa,
-        packet_tx,
-    )
-    .expect("spawn the peer recv drain");
-
-    node.get_peer_mut(addr)
-        .expect("peer present")
-        .set_connected_udp(socket, drain);
-}
-
 /// **The defect.**
 ///
 /// The in-line decrypt path called `set_current_addr` as a bare
