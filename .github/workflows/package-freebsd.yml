@@ -290,6 +290,10 @@ jobs:
             PKG=$(ls deploy/fips-*-pfsense-*.pkg)
             testing/check-pfsense-pkg.sh "$PKG"
             php -l packaging/pfsense/fips-unbound-custom.php
+            # Install it and run the daemon through the boot script's life on
+            # this FreeBSD 15 kernel; see the script header for what that does
+            # and does not prove about pfSense itself.
+            testing/pfsense-install-smoke.sh "$PKG"
 
             ( cd deploy && sha256 -q "$(basename "$PKG")" \
                 | { read -r h; printf '%s  %s\n' "$h" "$(basename "$PKG")"; } \
@@ -361,15 +365,16 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Lint the VM scripts
-        # Same arrangement as package-openwrt.yml's install-nak.sh lint: the
-        # scripts run on the runner, not in the package, and they are bash
-        # and python, so the guards for shipped sh scripts do not apply.
+      - name: Lint the scripts this job runs
+        # Same arrangement as package-openwrt.yml's install-nak.sh lint: none
+        # of these ship in the package, and they are bash and python, so the
+        # guards for shipped sh scripts do not apply.
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends shellcheck
           fi
           shellcheck --shell=bash .github/scripts/freebsd16-vm.sh
+          shellcheck --shell=sh testing/pfsense-install-smoke.sh
           python3 -m py_compile .github/scripts/freebsd16-console.py
 
       - name: Boot the FreeBSD 16.0-CURRENT VM
@@ -403,6 +408,10 @@ jobs:
           PKG=$(ls deploy/fips-*-pfsense-*.pkg)
           testing/check-pfsense-pkg.sh "$PKG"
           php -l packaging/pfsense/fips-unbound-custom.php
+          # Install it and run the daemon through the boot script's life on
+          # this FreeBSD 16 kernel; see the script header for what that does
+          # and does not prove about pfSense itself.
+          testing/pfsense-install-smoke.sh "$PKG"
 
           ( cd deploy && sha256 -q "$(basename "$PKG")" \
               | { read -r h; printf '%s  %s\n' "$h" "$(basename "$PKG")"; } \
