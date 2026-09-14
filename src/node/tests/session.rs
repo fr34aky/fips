@@ -1222,6 +1222,233 @@ async fn rekey_cutover_preserves_data_plane() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A forged rekey msg2 that carries the initiator's live rekey index must not
+/// split the link.
+///
+/// An on-path observer sees the rekey msg1 go out, reads the initiator's
+/// cleartext rekey index from it, and delivers a msg2 of the right size under
+/// that index ahead of the responder's real reply. Under IK the forgery cannot
+/// authenticate: only the responder's static key produces a msg2 the initiator
+/// can read. The IK responder has already committed its new session when it
+/// answered msg1 and cuts over on its own next rekey tick, so the initiator has
+/// to keep the cycle through the forgery and complete it on the real msg2. An
+/// initiator that gives the cycle up instead holds no session matching the one
+/// the responder now sends on.
+///
+/// Deterministic, no wall-clock wait: both sessions are backdated past node 0's
+/// time trigger and node 1's rekey-acceptance floor, node 1 never initiates,
+/// and every handshake message is delivered by hand.
+#[tokio::test]
+async fn forged_rekey_msg2_does_not_split_the_link() {
+    use crate::noise::HANDSHAKE_MSG2_SIZE;
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2, build_msg2};
+    use crate::transport::ReceivedPacket;
+    use crate::utils::index::SessionIndex;
+
+    const REKEY_AFTER_SECS: u64 = 60;
+
+    // node 0 rekeys on time; node 1 only ever responds.
+    let mut cfg0 = crate::config::Config::new();
+    cfg0.node.rekey.enabled = true;
+    cfg0.node.rekey.after_secs = REKEY_AFTER_SECS;
+    cfg0.node.rekey.after_messages = u64::MAX;
+    let mut cfg1 = crate::config::Config::new();
+    cfg1.node.rekey.enabled = true;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    cfg1.node.rekey.after_messages = u64::MAX;
+
+    let mut nodes = vec![
+        make_test_node_with_config(cfg0, 1280).await,
+        make_test_node_with_config(cfg1, 1280).await,
+    ];
+
+    // FMP peering + FSP session between the two loopback nodes.
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    assert!(nodes[0].node.get_peer(&node1_addr).is_some());
+    assert!(nodes[1].node.get_peer(&node0_addr).is_some());
+    populate_all_coord_caches(&mut nodes);
+
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    for (i, remote) in [(0, node1_addr), (1, node0_addr)] {
+        assert!(
+            nodes[i]
+                .node
+                .get_session(&remote)
+                .is_some_and(|s| s.state().is_established()),
+            "node {i} session established"
+        );
+    }
+
+    // Each node's TUN receiver observes the plaintext the other one sent.
+    let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun0_tx);
+    let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
+    nodes[1].node.supervisor.tun_tx = Some(tun1_tx);
+    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
+    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+
+    // Baseline: both directions decode before the rekey, so a failure below
+    // is the rekey's and not the harness's.
+    let pre_fwd = build_ipv6_packet(&fips0, &fips1, b"pre-rekey 0 to 1");
+    let pre_rev = build_ipv6_packet(&fips1, &fips0, b"pre-rekey 1 to 0");
+    nodes[0].node.handle_tun_outbound(pre_fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(pre_rev.clone()).await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![pre_fwd], "baseline node 0 to node 1 must decode");
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![pre_rev], "baseline node 1 to node 0 must decode");
+
+    // Age both sessions past both rekey gates: node 0's jittered time trigger,
+    // and node 1's 30 s floor below which a msg1 is a duplicate, not a rekey.
+    let age = Duration::from_secs(REKEY_AFTER_SECS + crate::node::REKEY_JITTER_SECS as u64 + 1);
+    nodes[0]
+        .node
+        .get_peer_mut(&node1_addr)
+        .unwrap()
+        .test_backdate_session_established(age);
+    nodes[1]
+        .node
+        .get_peer_mut(&node0_addr)
+        .unwrap()
+        .test_backdate_session_established(age);
+    let node0_idx_before = nodes[0].node.get_peer(&node1_addr).unwrap().our_index();
+    let node1_idx_before = nodes[1].node.get_peer(&node0_addr).unwrap().our_index();
+
+    // node 0 starts the rekey; its msg1 lands in node 1's queue.
+    nodes[0].node.check_rekey().await;
+    let rekey_idx = nodes[0]
+        .node
+        .get_peer(&node1_addr)
+        .unwrap()
+        .rekey_our_index()
+        .expect("node 0 must have started a rekey");
+
+    // Deliver the msg1 to node 1 only. node 1 answers as the rekey responder
+    // and commits its new session at once.
+    assert_eq!(
+        process_available_packets(&mut nodes[1..]).await,
+        1,
+        "node 1 must have exactly node 0's rekey msg1 queued"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_peer(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 1 must answer the msg1 as a rekey and hold its new session"
+    );
+
+    // Hold node 1's real msg2 back.
+    let mut held: Vec<ReceivedPacket> =
+        std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
+    assert_eq!(held.len(), 1, "node 0 must have only node 1's msg2 queued");
+    let real_msg2 = held.remove(0);
+    assert_eq!(
+        CommonPrefix::parse(&real_msg2.data).map(|p| p.phase),
+        Some(PHASE_MSG2),
+        "the held packet must be node 1's msg2"
+    );
+
+    // The forgery: a well-formed header naming node 0's live rekey index, a
+    // valid curve point as the ephemeral so the read gets as far as mixing it
+    // into the handshake, and an epoch ciphertext that cannot authenticate.
+    // The source is node 1's address, as a spoofed UDP source would be.
+    let mut forged_noise = Identity::generate().pubkey_full().serialize().to_vec();
+    forged_noise.resize(HANDSHAKE_MSG2_SIZE, 0xA5);
+    let forged = ReceivedPacket::new(
+        nodes[0].transport_id,
+        nodes[1].addr.clone(),
+        build_msg2(SessionIndex::new(0x5EED_F00D), rekey_idx, &forged_noise),
+    );
+    nodes[0].node.handle_msg2(forged).await;
+
+    // Release the real msg2, then run one rekey tick on each node.
+    nodes[0].node.handle_msg2(real_msg2).await;
+    nodes[0].node.check_rekey().await;
+    nodes[1].node.check_rekey().await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+
+    // node 1 cut over to the session it committed at msg1. Without this the
+    // delivery checks below could pass because no rekey happened at all.
+    assert_ne!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must have cut over to its new session"
+    );
+
+    let post_fwd = build_ipv6_packet(&fips0, &fips1, b"post-rekey 0 to 1");
+    let post_rev = build_ipv6_packet(&fips1, &fips0, b"post-rekey 1 to 0");
+    nodes[0].node.handle_tun_outbound(post_fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(post_rev.clone()).await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![post_fwd],
+        "node 0 to node 1 must decode after the forged msg2"
+    );
+
+    // This is the assertion that tells the two outcomes apart; keep it. node 0
+    // to node 1 passes either way inside this test, because node 1 keeps its
+    // previous session through the drain window and still decrypts node 0's
+    // old-session frames. node 1 to node 0 fails exactly when node 0 lost the
+    // cycle to the forgery: node 1 now sends on its new session, addressed to
+    // node 0's rekey index, and node 0 has no session registered under it.
+    let handshake = &nodes[0].node.stats().handshake;
+    let (bad_state, unknown) = (handshake.bad_state, handshake.unknown_connection);
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![post_rev],
+        "node 1 to node 0 must decode after the forged msg2 \
+         (node 0 handshake rejects: bad_state={bad_state}, unknown_connection={unknown})"
+    );
+
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    assert_ne!(
+        peer.our_index(),
+        node0_idx_before,
+        "node 0 must have completed the rekey on the real msg2 and cut over"
+    );
+    assert!(
+        !peer.rekey_in_progress(),
+        "node 0 must not be left mid-rekey"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 #[tokio::test]
 async fn test_tun_outbound_triggers_session_initiation() {
     // Two connected nodes, no session yet.

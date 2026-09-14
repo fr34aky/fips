@@ -431,6 +431,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
 
+- A peer reached by NAT traversal now gets its per-peer connected UDP socket.
+  The adopted traversal socket carried no address-reuse flags, so the connected
+  socket's bind to the same port was refused with `EADDRINUSE` on every tick and
+  the peer never left the unconnected path. The flags are now set when the
+  socket is adopted, after its bind, so the traversal bind still receives a
+  port no other socket holds.
+
+#### Link rekey
+
+- A forged rekey msg2 no longer takes the link down. The rekey initiator gave
+  up its handshake before reading msg2 and abandoned the cycle when the read
+  failed, although nothing authenticates a msg2 ahead of that read. Anyone on
+  the path who saw the rekey msg1 go out could answer first with a msg2 of the
+  right size under the index msg1 carries in cleartext. The responder has
+  already committed its new session by then and cuts over on its next tick, so
+  the two ends were left on different keys: frames from the responder were
+  dropped at once, frames to it failed once its drain window closed, and each
+  end removed the other on the link-dead timeout about 30 s later. A msg2 that
+  fails the read now leaves the handshake as it was before the read, along
+  with the msg1 resend schedule and the msg2 dispatch entry, so the
+  responder's genuine msg2 still completes the rekey. In exchange, every such
+  forgery now costs the initiator the msg2 key agreement until the cycle ends,
+  where before only the first one did; the msg1 resend budget bounds that. The
+  wire format is unchanged.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has

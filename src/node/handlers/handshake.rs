@@ -1199,6 +1199,7 @@ impl Node {
 
                 // Complete the rekey handshake on the ActivePeer
                 let mut rekey_completed = false;
+                let mut cycle_kept = false;
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                     match peer.complete_rekey_msg2(noise_msg2) {
                         Ok((session, remote_epoch)) => {
@@ -1238,6 +1239,26 @@ impl Node {
                             );
                             rekey_completed = true;
                         }
+                        // Nothing authenticated this msg2 before the read, and the
+                        // index it names travels in cleartext in our msg1, so it
+                        // may be a forgery. The responder committed its new
+                        // session when it answered that msg1 and cuts over on its
+                        // own tick, so abandoning here would leave the two ends on
+                        // different keys. The read rolled the handshake back:
+                        // keep the cycle and its dispatch entry so the genuine
+                        // msg2 can still complete it. If no readable msg2 ever
+                        // arrives, the msg1 resend budget abandons the cycle as
+                        // it would for a lost one.
+                        Err(e) if peer.awaits_msg2() => {
+                            debug!(
+                                peer = %display_name,
+                                error = %e,
+                                "Rekey msg2 did not authenticate, keeping the rekey cycle"
+                            );
+                            cycle_kept = true;
+                            self.stats_mut()
+                                .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                        }
                         Err(e) => {
                             warn!(
                                 peer = %display_name,
@@ -1258,14 +1279,16 @@ impl Node {
 
                 // Feed the control machine the completed-rekey observation so its
                 // shadow index and rekey phase stay coherent. Only on success —
-                // the failure path above reverts the rekey and leaves the machine
-                // untouched. The crypto effect already ran inline; this emits no
-                // action.
+                // the failure paths above either keep the cycle as it was or
+                // revert it, and leave the machine untouched. The crypto effect
+                // already ran inline; this emits no action.
                 if rekey_completed {
                     self.observe_rekey_msg2(&peer_node_addr, header.sender_idx);
                 }
 
-                self.pending_outbound.remove(&key);
+                if !cycle_kept {
+                    self.pending_outbound.remove(&key);
+                }
                 return;
             }
 
