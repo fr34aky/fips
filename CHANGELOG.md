@@ -285,6 +285,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binder tearing down and rebinding every second while teardown silently
   declined to abort anything.
 
+### Removed
+
+- **Source-breaking for consumers of the library crate**: `ActivePeer` no
+  longer stores a connectivity state. `ActivePeer::connectivity`, `can_send`,
+  `is_healthy`, `mark_stale`, `mark_reconnecting`, `mark_disconnected` and
+  `mark_connected` are gone. `ConnectivityState` stays public with only
+  `Connected` and `Stale`, the values `show_peers` reports, and loses
+  `can_send` and `is_healthy`. `ConnectivityState::is_terminal`,
+  `ActivePeer::is_disconnected`, `Node::sendable_peers` and
+  `Node::sendable_peer_count` keep their signatures and the results they
+  always had in the daemon: the first two return `false`, and the last two
+  cover every peer. Nothing in the daemon changed the stored state after a
+  peer was promoted, so every removed check was already true and the shipped
+  binaries behave as before. The peer wire and the control-socket response
+  shape are unchanged.
+
 ### Fixed
 
 #### Node lifecycle
