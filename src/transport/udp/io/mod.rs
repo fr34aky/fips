@@ -99,6 +99,50 @@ mod tests {
         );
     }
 
+    /// The traversal path binds its socket plainly on port zero, so the
+    /// socket reaches `adopt` carrying neither reuse flag. Adoption has to
+    /// add them after the fact, or the per-peer connected socket's bind to
+    /// the same address is refused with `EADDRINUSE`. Either flag on the
+    /// holder admits that bind on Linux, so the successful open cannot tell
+    /// whether both were set; each flag is also read back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_plain_socket_carries_both_reuse_flags_and_admits_a_connected_socket_on_its_port()
+    {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("failed to bind the peer");
+        let peer_addr = peer.local_addr().expect("peer local address");
+
+        let plain = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("failed to bind the holder");
+        {
+            let probe = socket2::SockRef::from(&plain);
+            assert!(
+                !probe.reuse_address().expect("read SO_REUSEADDR"),
+                "precondition: a plain bind must arrive without SO_REUSEADDR",
+            );
+            assert!(
+                !probe.reuse_port().expect("read SO_REUSEPORT"),
+                "precondition: a plain bind must arrive without SO_REUSEPORT",
+            );
+        }
+
+        let adopted = UdpRawSocket::adopt(plain, 65536, 65536).expect("failed to adopt the holder");
+
+        let joined = super::open_connected_fd(adopted.local_addr(), peer_addr, 65536, 65536);
+        // SAFETY: `adopted` owns this fd and outlives every use of the borrow.
+        let fd = unsafe { BorrowedFd::borrow_raw(adopted.as_raw_fd()) };
+        let flags = socket2::SockRef::from(&fd);
+        let reuse_address = flags.reuse_address().expect("read SO_REUSEADDR");
+        let reuse_port = flags.reuse_port().expect("read SO_REUSEPORT");
+
+        if let Err(err) = &joined {
+            panic!("a connected socket must be able to bind the adopted socket's port: {err}");
+        }
+        assert!(reuse_address, "the adopted socket must carry SO_REUSEADDR");
+        assert!(reuse_port, "the adopted socket must carry SO_REUSEPORT");
+    }
+
     #[tokio::test]
     async fn test_async_udp_socket_send_recv() {
         let sock1 = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 65536, 65536)

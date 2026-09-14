@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decrypt-worker completion path already acted on that return; the in-line
   decrypt path discarded it, so the socket stayed installed and the send path
   kept preferring it over the wildcard listen socket.
+- A peer reached by NAT traversal now gets its per-peer connected UDP socket.
+  The adopted traversal socket carried no address-reuse flags, so the connected
+  socket's bind to the same port was refused with `EADDRINUSE` on every tick and
+  the peer never left the unconnected path. The flags are now set when the
+  socket is adopted, after its bind, so the traversal bind still receives a
+  port no other socket holds.
 
 #### Peering
 
