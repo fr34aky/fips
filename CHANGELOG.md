@@ -399,7 +399,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receive loop act only on their own connection: one that outlives its
   connection can no longer tear down a newer connection that has taken the
   same address, and a receive loop that ends stops its writer rather than
-  leaving it writing to a peer that has gone.
+  leaving it writing to a peer that has gone. Closing one of their connections
+  on purpose, as a control-API disconnect does, now lets the writer finish the
+  frames already queued, within five seconds, instead of discarding them, so a
+  Disconnect sent just before the close reaches the peer. Stopping the
+  transport, or a connection that has failed, still discards them.
 
 - A per-peer `connect()`-ed UDP socket is no longer left pinned to an interface
   the host has moved off. Established UDP peers get their own socket for the

@@ -32,7 +32,9 @@ use super::{
 };
 use crate::config::TcpConfig;
 use crate::transport::framing::read_fmp_packet;
-use crate::transport::stream::{ConnId, next_conn_id, remove_own};
+use crate::transport::stream::{
+    ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id, remove_own,
+};
 use pool::{ConnectingEntry, ConnectingPool, ConnectionPool, Direction, TcpConnection};
 use stats::TcpStats;
 
@@ -486,21 +488,35 @@ impl TcpTransport {
 
     /// Close a specific connection asynchronously.
     ///
-    /// Removes the connection from the pool, aborts its receive task,
-    /// and drops the write half (sends FIN to remote).
+    /// Removes the connection from the pool and aborts its receive task. The
+    /// writer is not aborted: dropping the queue lets it finish writing the
+    /// frames already queued, such as a Disconnect sent just before this close,
+    /// and then exit, which drops the write half and sends FIN. A detached
+    /// timer aborts it if it is still writing after [`WRITER_DRAIN_TIMEOUT`],
+    /// so this call never waits on the peer. Stopping the transport, and every
+    /// teardown after a connection has failed, abort the writer instead and
+    /// discard what it had queued.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            match conn.direction {
+            let TcpConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                direction,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            match direction {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
             }
             debug!(
                 transport_id = %self.transport_id,
                 remote_addr = %addr,
-                direction = ?conn.direction,
+                direction = ?direction,
                 "TCP connection closed (close_connection)"
             );
         }
@@ -2830,5 +2846,89 @@ mod tests {
         );
 
         transport.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still be
+    /// written.
+    ///
+    /// Sending only queues the frame for the connection's writer task. A close
+    /// that aborts that task before it has run discards the frame, which is
+    /// how a Disconnect sent just before a close, or a handshake message sent
+    /// just before the losing side of a crossed connection is closed, never
+    /// reaches the peer. The second half checks the close still closes: the
+    /// peer sees FIN and releases its inbound slot, so a writer that never
+    /// exits cannot pass.
+    #[tokio::test]
+    async fn a_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+        let frame = build_msg1_frame();
+
+        // Pool the connection and let its writer go idle.
+        t1.send_async(&remote, &frame).await.unwrap();
+        let first = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("packet channel closed");
+        assert_eq!(first.data, frame);
+
+        // Queue, then close with nothing in between.
+        t1.send_async(&remote, &frame).await.unwrap();
+        t1.close_connection_async(&remote).await;
+
+        let second = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("packet channel closed");
+        assert_eq!(second.data, frame);
+
+        assert!(
+            wait_until(
+                || t2.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// A deliberate close must return at once even when the writer cannot
+    /// finish, because the peer has stopped reading. Draining happens after
+    /// the close returns, never inside it.
+    #[tokio::test]
+    async fn close_does_not_wait_for_a_writer_parked_on_a_deaf_peer() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = capped_deaf_listener();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = vec![0xAB; 1400];
+
+        park_tcp_writer(&t1, &remote, &frame).await;
+        let (_peer, _) = listener.accept().await.unwrap();
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                t1.close_connection_async(&remote)
+            )
+            .await
+            .is_ok(),
+            "close waited on a writer that cannot finish"
+        );
+
+        t1.stop_async().await.unwrap();
     }
 }

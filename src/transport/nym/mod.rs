@@ -24,7 +24,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
-use crate::transport::stream::{ConnId, next_conn_id};
+use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
 use stats::NymStats;
 
 use std::collections::HashMap;
@@ -585,11 +585,22 @@ impl NymTransport {
     }
 
     /// Close a specific connection asynchronously.
+    ///
+    /// Aborts the receive task and lets the writer finish the frames already
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
+    /// mirrors `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
+            let ProxiedConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
             debug!(
                 transport_id = %self.transport_id,
                 remote_addr = %addr,
@@ -1187,5 +1198,45 @@ mod tests {
         );
 
         nym.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still reach
+    /// the peer through the proxy, and the close must still end the
+    /// connection at the far side.
+    #[tokio::test]
+    async fn nym_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (mut dest, mut dest_rx, mut nym, target) = nym_via_mock_proxy().await;
+
+        let frame = build_msg1_frame();
+        nym.send_async(&target, &frame).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("channel closed");
+        assert_eq!(first.data, frame);
+
+        nym.send_async(&target, &frame).await.unwrap();
+        nym.close_connection_async(&target).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("channel closed");
+        assert_eq!(second.data, frame);
+        assert!(
+            wait_until(
+                || dest.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
+
+        nym.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
     }
 }

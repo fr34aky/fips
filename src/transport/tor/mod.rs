@@ -34,7 +34,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
-use crate::transport::stream::{ConnId, next_conn_id};
+use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
 use crate::transport::tcp::INBOUND_FIRST_FRAME_TIMEOUT;
 use control::{ControlAuth, TorControlClient, TorMonitoringInfo};
 use stats::TorStats;
@@ -1016,12 +1016,24 @@ impl TorTransport {
     }
 
     /// Close a specific connection asynchronously.
+    ///
+    /// Aborts the receive task and lets the writer finish the frames already
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
+    /// mirrors `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            match conn.meta {
+            let ProxiedConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                meta,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            match meta {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
             }
@@ -2555,5 +2567,65 @@ mod tests {
 
         accept.abort();
         drop(sock);
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still reach
+    /// the peer through the proxy, and the close must still end the
+    /// connection at the far side.
+    #[tokio::test]
+    async fn tor_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (dest_tx, mut dest_rx) = packet_channel(32);
+        let dest_config = TcpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        };
+        let mut dest = TcpTransport::new(TransportId::new(100), None, dest_config, dest_tx);
+        dest.start_async().await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let mock = MockSocks5Server::new(dest_addr).await.unwrap();
+        let proxy_addr = mock.addr();
+        let _proxy_handle = mock.spawn();
+
+        let (tor_tx, _tor_rx) = packet_channel(32);
+        let tor_config = TorConfig {
+            socks5_addr: Some(proxy_addr.to_string()),
+            ..Default::default()
+        };
+        let mut tor = TorTransport::new(TransportId::new(200), None, tor_config, tor_tx);
+        tor.start_async().await.unwrap();
+
+        let target = TransportAddr::from_string(&dest_addr.to_string());
+        let frame = build_msg1_frame();
+        tor.send_async(&target, &frame).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("channel closed");
+        assert_eq!(first.data, frame);
+
+        tor.send_async(&target, &frame).await.unwrap();
+        tor.close_connection_async(&target).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("channel closed");
+        assert_eq!(second.data, frame);
+        assert!(
+            wait_until(
+                || dest.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
+
+        tor.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
     }
 }
