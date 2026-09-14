@@ -395,7 +395,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resynchronise from. BLE was the worst of the four: it awaited the L2CAP
   write while holding the connection-pool mutex, so one unresponsive peer
   froze every other BLE operation as well — connects, evictions, and each
-  receive loop's teardown.
+  receive loop's teardown. On TCP, Tor and Nym, a connection's writer and
+  receive loop act only on their own connection: one that outlives its
+  connection can no longer tear down a newer connection that has taken the
+  same address, and a receive loop that ends stops its writer rather than
+  leaving it writing to a peer that has gone.
 
 - A per-peer `connect()`-ed UDP socket is no longer left pinned to an interface
   the host has moved off. Established UDP peers get their own socket for the
