@@ -6,12 +6,11 @@ use crate::testutil::make_node_addr;
 use crate::{NodeAddr, TreeCoordinate};
 
 /// A mock peer for the candidate-assembly seam: the set of destinations its
-/// bloom filter reaches, its send state, link cost, and tree coordinates.
+/// bloom filter reaches, its link cost, and tree coordinates.
 #[derive(Clone)]
 pub(super) struct MockPeer {
     pub(super) addr: NodeAddr,
     pub(super) reach: Vec<NodeAddr>,
-    pub(super) can_send: bool,
     pub(super) link_cost: f64,
     pub(super) coords: Option<TreeCoordinate>,
 }
@@ -59,9 +58,6 @@ impl RoutingView for MockRoutingView {
     }
     fn peer_may_reach<'a>(&'a self, peer: Self::Peer<'a>, dest: &NodeAddr) -> bool {
         peer.reach.contains(dest)
-    }
-    fn peer_can_send<'a>(&'a self, peer: Self::Peer<'a>) -> bool {
-        peer.can_send
     }
     fn peer_link_cost<'a>(&'a self, peer: Self::Peer<'a>) -> f64 {
         peer.link_cost

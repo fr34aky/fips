@@ -2489,7 +2489,7 @@ impl Node {
         let peer_addrs: Vec<NodeAddr> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.can_send() && peer.has_session())
+            .filter(|(_, peer)| peer.has_session())
             .map(|(addr, _)| *addr)
             .collect();
 

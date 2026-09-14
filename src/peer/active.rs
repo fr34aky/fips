@@ -38,14 +38,6 @@ pub enum ConnectivityState {
 }
 
 impl ConnectivityState {
-    /// Check if the peer is usable for sending traffic.
-    pub fn can_send(&self) -> bool {
-        matches!(
-            self,
-            ConnectivityState::Connected | ConnectivityState::Stale
-        )
-    }
-
     /// Check if this is a terminal state requiring cleanup.
     pub fn is_terminal(&self) -> bool {
         matches!(self, ConnectivityState::Disconnected)
@@ -504,11 +496,6 @@ impl ActivePeer {
     /// Get the connectivity state.
     pub fn connectivity(&self) -> ConnectivityState {
         self.connectivity
-    }
-
-    /// Check if peer can receive traffic.
-    pub fn can_send(&self) -> bool {
-        self.connectivity.can_send()
     }
 
     /// Check if peer is fully healthy.
@@ -1325,11 +1312,6 @@ mod tests {
 
     #[test]
     fn test_connectivity_state_properties() {
-        assert!(ConnectivityState::Connected.can_send());
-        assert!(ConnectivityState::Stale.can_send());
-        assert!(!ConnectivityState::Reconnecting.can_send());
-        assert!(!ConnectivityState::Disconnected.can_send());
-
         assert!(ConnectivityState::Connected.is_healthy());
         assert!(!ConnectivityState::Stale.is_healthy());
 
@@ -1345,7 +1327,6 @@ mod tests {
         assert_eq!(peer.identity().node_addr(), identity.node_addr());
         assert_eq!(peer.link_id(), LinkId::new(1));
         assert!(peer.is_healthy());
-        assert!(peer.can_send());
         assert_eq!(peer.authenticated_at(), 1000);
         assert!(peer.needs_filter_update()); // New peers need filter
     }
@@ -1413,21 +1394,18 @@ mod tests {
 
         peer.mark_stale();
         assert_eq!(peer.connectivity(), ConnectivityState::Stale);
-        assert!(peer.can_send()); // Stale can still send
 
         // Traffic received brings back to connected
         peer.touch(2000);
         assert!(peer.is_healthy());
 
         peer.mark_reconnecting();
-        assert!(!peer.can_send());
 
         peer.mark_connected(3000);
         assert!(peer.is_healthy());
 
         peer.mark_disconnected();
         assert!(peer.is_disconnected());
-        assert!(!peer.can_send());
     }
 
     #[test]

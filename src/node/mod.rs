@@ -3046,14 +3046,15 @@ impl Node {
         self.peers.keys()
     }
 
-    /// Iterate over peers that can send traffic.
+    /// Iterate over peers that can send traffic: every active peer, the same
+    /// peers as [`Self::peers`].
     pub fn sendable_peers(&self) -> impl Iterator<Item = &ActivePeer> {
-        self.peers.values().filter(|p| p.can_send())
+        self.peers.values()
     }
 
-    /// Number of peers that can send traffic.
+    /// Number of peers that can send traffic, the same as [`Self::peer_count`].
     pub fn sendable_peer_count(&self) -> usize {
-        self.peers.values().filter(|p| p.can_send()).count()
+        self.peers.len()
     }
 
     // === End-to-End Sessions ===
@@ -3407,9 +3408,7 @@ impl Node {
         }
 
         // 2. Direct peer
-        if let Some(peer) = self.peers.get(dest_node_addr)
-            && peer.can_send()
-        {
+        if let Some(peer) = self.peers.get(dest_node_addr) {
             return Some(peer);
         }
 
@@ -3426,7 +3425,7 @@ impl Node {
         // 3. Bloom filter candidates — requires dest_coords for loop-free selection.
         //    If no candidate is strictly closer, fall through to tree routing.
         //    The sans-IO core enumerates borrowed peers over the `RoutingView`
-        //    seam, applies the bloom/send/progress filters, and tracks the
+        //    seam, applies the bloom/progress filters, and tracks the
         //    winner inline; the shell supplies only raw per-peer reads.
         let next_hop = {
             let view = NodeRoutingView {
@@ -3452,7 +3451,7 @@ impl Node {
             .tree_state
             .find_next_hop(&dest_coords, &BTreeSet::new())?;
 
-        self.peers.get(&next_hop_id).filter(|p| p.can_send())
+        self.peers.get(&next_hop_id)
     }
 
     /// Classify a transit forward by route class from tree coordinates.
@@ -3935,7 +3934,7 @@ impl Node {
 
 /// Shell-side [`routing::RoutingView`] seam over live `Node` state — the sole
 /// routing read adapter the shell retains. It hands the sans-IO routing core
-/// borrowed peers plus raw `may_reach` / `can_send` / `link_cost` / `coords`
+/// borrowed peers plus raw `may_reach` / `link_cost` / `coords`
 /// reads so selection and error synthesis live in `proto::routing::core`; no
 /// routing decision logic remains here.
 ///
@@ -3982,10 +3981,6 @@ impl routing::RoutingView for NodeRoutingView<'_> {
 
     fn peer_may_reach<'a>(&'a self, peer: Self::Peer<'a>, dest: &NodeAddr) -> bool {
         peer.1.may_reach(dest)
-    }
-
-    fn peer_can_send<'a>(&'a self, peer: Self::Peer<'a>) -> bool {
-        peer.1.can_send()
     }
 
     fn peer_link_cost<'a>(&'a self, peer: Self::Peer<'a>) -> f64 {

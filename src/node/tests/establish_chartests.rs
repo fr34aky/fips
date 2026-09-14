@@ -656,11 +656,9 @@ async fn chartest_cross_connection_tiebreak_winner_and_loser() {
         );
     }
 
-    // Both remain single, sendable peers after resolution.
+    // Both remain single peers after resolution.
     assert_eq!(node_a.peer_count(), 1);
     assert_eq!(node_b.peer_count(), 1);
-    assert!(node_a.get_peer(&node_b_addr).unwrap().can_send());
-    assert!(node_b.get_peer(&node_a_addr).unwrap().can_send());
 
     for (_, t) in node_a.transports.iter_mut() {
         t.stop().await.ok();

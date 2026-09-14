@@ -663,8 +663,6 @@ async fn test_cross_connection_both_initiate() {
 
     assert!(peer_b_on_a.has_session(), "Peer B on A should have session");
     assert!(peer_a_on_b.has_session(), "Peer A on B should have session");
-    assert!(peer_b_on_a.can_send(), "Peer B on A should be sendable");
-    assert!(peer_a_on_b.can_send(), "Peer A on B should be sendable");
 
     // Clean up transports
     for (_, t) in node_a.transports.iter_mut() {
