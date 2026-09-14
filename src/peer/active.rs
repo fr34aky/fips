@@ -1246,11 +1246,27 @@ impl ActivePeer {
         self.rekey_our_index
     }
 
+    /// Whether this peer still holds its rekey initiator handshake, waiting
+    /// on msg2.
+    ///
+    /// [`complete_rekey_msg2`](Self::complete_rekey_msg2) keeps the handshake
+    /// when a msg2 fails to authenticate, so after a failed call this tells
+    /// the caller the cycle is still intact.
+    pub fn awaits_msg2(&self) -> bool {
+        self.rekey_handshake.is_some()
+    }
+
     /// Complete the rekey by processing msg2 (initiator side).
     ///
-    /// Takes the stored handshake state, reads msg2, and returns the
+    /// Reads msg2 against the stored handshake state and returns the
     /// completed NoiseSession. Clears the handshake-related fields but
     /// leaves rekey_our_index for set_pending_session to use.
+    ///
+    /// A msg2 that fails the read changes nothing: the handshake goes back
+    /// in its pre-read state, and the msg1 resend schedule stays as it was.
+    /// Nothing authenticates a msg2 before this read, so the message may be a
+    /// forgery naming our rekey index, and the responder's genuine msg2 has
+    /// to remain readable when it arrives.
     pub fn complete_rekey_msg2(
         &mut self,
         msg2_bytes: &[u8],
@@ -1263,7 +1279,10 @@ impl ActivePeer {
                 got: "no handshake state".to_string(),
             })?;
 
-        hs.read_message_2(msg2_bytes)?;
+        if let Err(e) = hs.try_read_message_2(msg2_bytes) {
+            self.rekey_handshake = Some(hs);
+            return Err(e);
+        }
         let remote_epoch = hs.remote_epoch();
         let session = hs.into_session()?;
 

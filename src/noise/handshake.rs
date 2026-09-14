@@ -15,9 +15,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// Maintains the chaining key (ck), handshake hash (h), and current cipher.
 ///
-/// `Clone` exists for [`HandshakeState::try_read_xk_message_2`], which has to
-/// put the pre-read state back after a message that mixed material in before
-/// failing to authenticate.
+/// `Clone` exists for [`HandshakeState::try_read_message_2`] and
+/// [`HandshakeState::try_read_xk_message_2`], which have to put the pre-read
+/// state back after a message that mixed material in before failing to
+/// authenticate.
 ///
 /// `ck` and `h` are cleared on drop, including on the clone above once it
 /// goes out of scope. `cipher` is skipped because [`CipherState`] clears its
@@ -634,6 +635,41 @@ impl HandshakeState {
         self.progress = HandshakeProgress::Complete;
 
         Ok(())
+    }
+
+    /// Read message 2, leaving the handshake untouched when the message
+    /// does not authenticate.
+    ///
+    /// `read_message_2` mixes the sender's ephemeral into the symmetric state,
+    /// and both DH results into the key, before it authenticates the encrypted
+    /// epoch, so a message that fails partway leaves a handshake that can
+    /// never read the genuine msg2 afterwards. A caller that keeps its rekey
+    /// cycle across a failed read — because the message may be a forgery
+    /// rather than the responder's corrupt reply — needs the pre-read state
+    /// back.
+    ///
+    /// The saved set is exactly what `read_message_2` writes: `symmetric`,
+    /// `remote_ephemeral`, `remote_epoch` and `progress`. `remote_static` is
+    /// not in it, because IK pins the responder's static before msg1 and the
+    /// read only uses it. **That mirror is manual.** A later edit that adds a
+    /// write to `read_message_2` without adding it here silently reintroduces
+    /// the poisoning, and no caller can detect it.
+    pub fn try_read_message_2(&mut self, message: &[u8]) -> Result<(), NoiseError> {
+        let symmetric = self.symmetric.clone();
+        let remote_ephemeral = self.remote_ephemeral;
+        let remote_epoch = self.remote_epoch;
+        let progress = self.progress;
+
+        match self.read_message_2(message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.symmetric = symmetric;
+                self.remote_ephemeral = remote_ephemeral;
+                self.remote_epoch = remote_epoch;
+                self.progress = progress;
+                Err(e)
+            }
+        }
     }
 
     // ========================================================================
