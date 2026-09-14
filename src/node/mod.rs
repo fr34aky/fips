@@ -44,8 +44,8 @@ use self::reloadable::Reloadable;
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::CoordCache;
 use crate::node::session::SessionEntry;
-use crate::peer::ActivePeer;
 use crate::peer::machine::{PeerMachine, TimerKind};
+use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
 use crate::proto::fmp::Fmp;
 use crate::proto::fmp::wire::{
@@ -2271,6 +2271,7 @@ impl Node {
         // SRTT) every peer falls back to the default link cost of 1.0.
         let any_peer_has_srtt = self.peers().any(|p| p.has_srtt());
 
+        let now_ms = Self::now_ms();
         let peer_rows: Vec<snap::PeerRow> = self
             .peers()
             .map(|peer| {
@@ -2323,7 +2324,7 @@ impl Node {
                     npub: peer.npub(),
                     display_name: self.peer_display_name(&node_addr),
                     ipv6_addr: format!("{}", peer.address()),
-                    connectivity: format!("{}", peer.connectivity()),
+                    connectivity: format!("{}", self.peer_connectivity(peer, now_ms)),
                     link_id: peer.link_id().as_u64(),
                     authenticated_at_ms: peer.authenticated_at(),
                     last_seen_ms: peer.last_seen(),
@@ -3000,6 +3001,37 @@ impl Node {
     /// Iterate over all peers.
     pub fn peers(&self) -> impl Iterator<Item = &ActivePeer> {
         self.peers.values()
+    }
+
+    /// Whether an active peer has been silent at `now_ms` for longer than the
+    /// configured heartbeat interval, floored at one second.
+    ///
+    /// The one idle-time liveness rule: the control socket reports such a peer
+    /// as `stale`, the discovery dial gate
+    /// [`Self::active_peer_link_is_live`] no longer holds its link as live, and
+    /// discovery re-dials it on the path it already has.
+    pub(in crate::node) fn peer_link_is_stale(&self, peer: &ActivePeer, now_ms: u64) -> bool {
+        let stale_after_ms = self
+            .config()
+            .node
+            .heartbeat_interval_secs
+            .saturating_mul(1000)
+            .max(1000);
+        peer.idle_time(now_ms) > stale_after_ms
+    }
+
+    /// Connectivity of an active peer as the control socket reports it:
+    /// `Stale` when [`Self::peer_link_is_stale`] holds at `now_ms`, otherwise
+    /// `Connected`.
+    ///
+    /// Derived from idle time rather than read from the state stored on the
+    /// peer, which nothing in production changes after promotion.
+    pub(crate) fn peer_connectivity(&self, peer: &ActivePeer, now_ms: u64) -> ConnectivityState {
+        if self.peer_link_is_stale(peer, now_ms) {
+            ConnectivityState::Stale
+        } else {
+            ConnectivityState::Connected
+        }
     }
 
     /// Reference to the Nostr discovery handle if discovery is enabled.

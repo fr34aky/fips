@@ -429,6 +429,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link was created with. The counters cover authenticated link frames only, so
   they are not expected to match the transport totals in `show_transports`.
   The response shape is unchanged.
+- `show_peers` (`fipsctl show peers`) now reports a peer that has gone quiet
+  as `stale`. Its `connectivity` was read from a state that nothing outside
+  the tests ever changed, so every peer read `connected` until it was
+  removed, including one that had stopped answering tens of seconds earlier.
+  The value is now derived from how long the peer has been silent: `connected`
+  while its idle time is at or below `heartbeat_interval_secs`, and `stale`
+  above it, the same rule that decides whether discovery re-dials an active
+  peer on the path it already has. The `reconnecting` and `disconnected`
+  values the open-discovery tutorial described never occurred, and the
+  tutorial no longer lists them. The response shape is unchanged.
 
 ### Changed
 
