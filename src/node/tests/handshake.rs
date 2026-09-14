@@ -192,13 +192,6 @@ async fn test_two_node_handshake_udp() {
 
     node_b.handle_encrypted_frame(encrypted_packet_b).await;
 
-    // Verify B's peer was touched (last_seen updated)
-    let peer_a = node_b.get_peer(&peer_a_node_addr).unwrap();
-    assert!(
-        peer_a.is_healthy(),
-        "Peer A on B should still be healthy after receiving encrypted frame"
-    );
-
     // === Phase 5: Encrypted frame B → A ===
 
     // Prepend inner header (timestamp + msg_type) as the real send path does
@@ -225,13 +218,6 @@ async fn test_two_node_handshake_udp() {
         .expect("Channel closed");
 
     node_a.handle_encrypted_frame(encrypted_packet_a).await;
-
-    // Verify A's peer was touched
-    let peer_b = node_a.get_peer(&peer_b_node_addr).unwrap();
-    assert!(
-        peer_b.is_healthy(),
-        "Peer B on A should still be healthy after receiving encrypted frame"
-    );
 
     // Clean up transports
     for (_, t) in node_a.transports.iter_mut() {

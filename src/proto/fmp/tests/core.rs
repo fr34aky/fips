@@ -407,7 +407,6 @@ fn establish_inbound_same_epoch_young_session_resends() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 5;
     snap.existing_msg2 = Some(vec![0x01, 0x02, 0x03]);
     let wire = wire_outcome(Some([7u8; 8]));
@@ -426,7 +425,6 @@ fn establish_inbound_aged_session_rekey_responds() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     let wire = wire_outcome(Some([7u8; 8]));
     let peer = *wire.peer_identity.node_addr();
@@ -438,14 +436,13 @@ fn establish_inbound_aged_session_rekey_responds() {
 
 #[test]
 fn establish_inbound_rekey_gate_requires_enabled() {
-    // Aged healthy session but rekey disabled → same-epoch msg1 is a duplicate,
+    // Aged session but rekey disabled → same-epoch msg1 is a duplicate,
     // not a rekey.
     let fmp = Fmp::new();
     let mut snap = establish_snapshot();
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     snap.rekey_enabled = false;
     let wire = wire_outcome(Some([7u8; 8]));
@@ -463,7 +460,6 @@ fn establish_inbound_rekey_gate_boundary_at_30s() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     let wire = wire_outcome(Some([7u8; 8]));
 
     snap.existing_session_age_secs = 30;
@@ -486,7 +482,6 @@ fn establish_inbound_pending_session_rejects() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     snap.pending_new_session = true;
     let wire = wire_outcome(Some([7u8; 8]));
@@ -507,7 +502,6 @@ fn establish_inbound_dual_init_we_win_rejects() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     snap.rekey_in_progress = true;
     snap.our_node_addr = make_node_addr(0x00); // minimal → strictly smaller
@@ -529,7 +523,6 @@ fn establish_inbound_dual_init_we_lose_responds_with_abandon() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
-    snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     snap.rekey_in_progress = true;
     snap.our_node_addr = max_node_addr(); // strictly larger than any peer addr

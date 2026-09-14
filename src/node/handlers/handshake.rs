@@ -79,7 +79,6 @@ impl EstablishView for Node {
                 .map(|p| p.session_established_at().elapsed().as_secs())
                 .unwrap_or(0),
             has_session: existing.map(|p| p.has_session()).unwrap_or(false),
-            is_healthy: existing.map(|p| p.is_healthy()).unwrap_or(false),
             pending_new_session: existing
                 .map(|p| p.pending_new_session().is_some())
                 .unwrap_or(false),

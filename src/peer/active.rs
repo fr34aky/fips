@@ -42,11 +42,6 @@ impl ConnectivityState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, ConnectivityState::Disconnected)
     }
-
-    /// Check if peer is fully healthy.
-    pub fn is_healthy(&self) -> bool {
-        matches!(self, ConnectivityState::Connected)
-    }
 }
 
 impl fmt::Display for ConnectivityState {
@@ -496,11 +491,6 @@ impl ActivePeer {
     /// Get the connectivity state.
     pub fn connectivity(&self) -> ConnectivityState {
         self.connectivity
-    }
-
-    /// Check if peer is fully healthy.
-    pub fn is_healthy(&self) -> bool {
-        self.connectivity.is_healthy()
     }
 
     /// Check if peer is disconnected.
@@ -1312,9 +1302,6 @@ mod tests {
 
     #[test]
     fn test_connectivity_state_properties() {
-        assert!(ConnectivityState::Connected.is_healthy());
-        assert!(!ConnectivityState::Stale.is_healthy());
-
         assert!(ConnectivityState::Disconnected.is_terminal());
         assert!(!ConnectivityState::Connected.is_terminal());
     }
@@ -1326,7 +1313,6 @@ mod tests {
 
         assert_eq!(peer.identity().node_addr(), identity.node_addr());
         assert_eq!(peer.link_id(), LinkId::new(1));
-        assert!(peer.is_healthy());
         assert_eq!(peer.authenticated_at(), 1000);
         assert!(peer.needs_filter_update()); // New peers need filter
     }
@@ -1390,19 +1376,15 @@ mod tests {
         let identity = make_peer_identity();
         let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
 
-        assert!(peer.is_healthy());
-
         peer.mark_stale();
         assert_eq!(peer.connectivity(), ConnectivityState::Stale);
 
         // Traffic received brings back to connected
         peer.touch(2000);
-        assert!(peer.is_healthy());
 
         peer.mark_reconnecting();
 
         peer.mark_connected(3000);
-        assert!(peer.is_healthy());
 
         peer.mark_disconnected();
         assert!(peer.is_disconnected());

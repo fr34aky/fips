@@ -775,7 +775,6 @@ async fn chartest_msg1_rekey_responder_stores_pending_session() {
     let old_index = {
         let p = node.get_peer(&sender_addr).expect("peer established");
         assert!(p.has_session());
-        assert!(p.is_healthy());
         assert_eq!(p.remote_epoch(), Some(epoch));
         assert!(!p.rekey_in_progress());
         assert!(p.pending_new_session().is_none());

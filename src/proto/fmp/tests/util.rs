@@ -24,7 +24,7 @@ pub(super) fn rekey_resend_snapshot(
     }
 }
 
-/// Build a quiescent `PeerSnapshot` for `addr`: session-healthy but with no
+/// Build a quiescent `PeerSnapshot` for `addr`, with no
 /// pending cutover, no drain, no dampening, zero ages/counter/jitter. Tests set
 /// only the fields the case exercises.
 pub(super) fn peer_snapshot(addr_byte: u8) -> PeerSnapshot {
@@ -80,7 +80,6 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
         existing_peer_epoch: None,
         existing_session_age_secs: 0,
         has_session: false,
-        is_healthy: false,
         pending_new_session: false,
         rekey_in_progress: false,
         existing_msg2: None,

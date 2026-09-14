@@ -225,8 +225,6 @@ pub(crate) struct EstablishSnapshot {
     pub existing_session_age_secs: u64,
     /// The existing peer has an established Noise session.
     pub has_session: bool,
-    /// The existing peer's session is healthy.
-    pub is_healthy: bool,
     /// The existing peer already holds a pending post-rekey session awaiting
     /// K-bit cutover.
     pub pending_new_session: bool,
@@ -330,7 +328,7 @@ pub(crate) trait LifecycleView {
     /// timeout/failed predicate; the core decides retry-then-teardown.
     fn stale_connections(&self, now_ms: u64, timeout_ms: u64) -> Vec<ConnSnapshot>;
 
-    /// Snapshot every active peer with a session that is healthy, pre-computing
+    /// Snapshot every active peer with a session, pre-computing
     /// its rekey-relevant ages and timer predicates (see [`PeerSnapshot`]). The
     /// shell resolves every clock read here; the core applies the thresholds.
     fn rekey_peers(&self) -> Vec<PeerSnapshot>;
@@ -364,7 +362,7 @@ pub(crate) enum InboundDecision {
     /// authorize → … → promote sequence as [`Promote`](InboundDecision::Promote).
     /// `peer` is the teardown / reconnect target.
     RestartThenPromote { peer: NodeAddr },
-    /// Same-epoch rekey msg1 on an aged, healthy session: respond as the rekey
+    /// Same-epoch rekey msg1 on an aged session: respond as the rekey
     /// responder. The shell extracts the fresh Noise session from the live
     /// connection, allocates a new index, sends the rekey msg2, and stores the
     /// session as the peer's pending (post-rekey) session. `abandon_first` is set
@@ -500,7 +498,7 @@ impl Fmp {
             .collect()
     }
 
-    /// Decide the per-tick rekey choreography for the healthy peers the shell
+    /// Decide the per-tick rekey choreography for the peers the shell
     /// snapshotted. Reproduces the pre-refactor priority and phase grouping
     /// exactly:
     ///
@@ -619,7 +617,6 @@ impl Fmp {
                     // Same epoch (or no epoch captured on either side).
                     let is_rekey = snap.rekey_enabled
                         && snap.has_session
-                        && snap.is_healthy
                         && snap.existing_session_age_secs >= REKEY_MIN_SESSION_AGE_SECS;
                     if !is_rekey {
                         // Duplicate msg1 — resend the stored msg2.

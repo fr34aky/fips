@@ -1407,7 +1407,7 @@ impl PeerMachine {
     /// the subsequent cadence `Cutover`/`Drain` consume transitions from a
     /// coherent phase. Emits NO action (nothing left to do). No-op unless the peer
     /// is in an established-like state (defensive; the shell only initiates on
-    /// healthy established peers).
+    /// established peers).
     fn on_rekey_initiated(&mut self) -> Vec<PeerAction> {
         let addr = match self.addr() {
             Some(a) => a,
@@ -1898,7 +1898,6 @@ mod tests {
             existing_peer_epoch: None,
             existing_session_age_secs: 0,
             has_session: false,
-            is_healthy: false,
             pending_new_session: false,
             rekey_in_progress: false,
             existing_msg2: None,
@@ -2144,7 +2143,6 @@ mod tests {
             est.has_existing_peer = true;
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
-            est.is_healthy = true;
             est.existing_session_age_secs = 120;
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);
@@ -2183,7 +2181,6 @@ mod tests {
             est.has_existing_peer = true;
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
-            est.is_healthy = true;
             est.existing_session_age_secs = 120;
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);
@@ -2222,7 +2219,6 @@ mod tests {
         est.has_existing_peer = true;
         est.existing_peer_epoch = Some([1u8; 8]);
         est.has_session = true;
-        est.is_healthy = true;
         est.existing_session_age_secs = 5; // young session -> duplicate, not rekey
         est.existing_msg2 = Some(vec![0xC4; 16]);
         let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);

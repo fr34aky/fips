@@ -88,7 +88,7 @@ impl Node {
             after_messages: self.config().node.rekey.after_messages,
         };
 
-        // The shell snapshots each healthy peer's rekey ages/flags (every clock
+        // The shell snapshots each peer's rekey ages/flags (every clock
         // read resolved here); the core decides cutover/drain/trigger with no
         // clock, phase-grouped to preserve the pre-refactor execution order.
         // The batch `poll_rekey` + snapshots STAY SHELL-SIDE and BYTE-UNCHANGED:
@@ -277,7 +277,7 @@ impl Node {
         }
     }
 
-    /// Snapshot every healthy peer with a session for the rekey decision,
+    /// Snapshot every peer with a session for the rekey decision,
     /// pre-computing its monotonic ages and timer predicates so the pure core
     /// applies the thresholds without reading a clock (see [`PeerSnapshot`]).
     ///
@@ -286,7 +286,7 @@ impl Node {
     pub(in crate::node) fn rekey_peer_snapshots(&self) -> Vec<PeerSnapshot> {
         self.peers
             .iter()
-            .filter(|(_, peer)| peer.has_session() && peer.is_healthy())
+            .filter(|(_, peer)| peer.has_session())
             .map(|(node_addr, peer)| PeerSnapshot {
                 addr: *node_addr,
                 has_pending: peer.pending_new_session().is_some(),
