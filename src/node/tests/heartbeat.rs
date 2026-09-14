@@ -37,7 +37,7 @@ fn set_link_dead_timeout(node: &mut crate::node::Node, secs: u64) {
 
 /// Set `heartbeat_interval_secs` on an already-constructed node, the same way
 /// `set_link_dead_timeout` does.
-fn set_heartbeat_interval(node: &mut crate::node::Node, secs: u64) {
+pub(super) fn set_heartbeat_interval(node: &mut crate::node::Node, secs: u64) {
     node.replace_context(|ctx| {
         let mut cfg = (*ctx.config).clone();
         cfg.node.heartbeat_interval_secs = secs;
