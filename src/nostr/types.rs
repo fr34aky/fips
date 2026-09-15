@@ -212,6 +212,20 @@ pub struct NostrPeerFailureView {
     pub last_observed_skew_ms: Option<i64>,
 }
 
+/// One relay of the Nostr client pool with its live connection state: the
+/// embedder-facing row behind `NostrRendezvous::relay_status` (the Android
+/// app lists these on its Overview page).
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayStatusView {
+    /// Relay URL as the pool holds it (`wss://…` / `ws://…`).
+    pub url: String,
+    /// `nostr-sdk`'s `RelayStatus`, rendered by its `Display` impl
+    /// ("Connected", "Connecting", "Disconnected", "Sleeping", …).
+    pub status: String,
+    /// True iff the websocket is up right now (`RelayStatus::Connected`).
+    pub connected: bool,
+}
+
 /// Outcome of `NostrRendezvous::refetch_advert_for_stale_check` (B6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NostrRefetchOutcome {

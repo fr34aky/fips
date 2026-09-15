@@ -36,8 +36,8 @@ use super::traversal_machine::{OfferDisposition, SeenDecision, TraversalMachine}
 use super::types::{
     ADVERT_IDENTIFIER, ADVERT_KIND, ADVERT_VERSION, BootstrapError, BootstrapEvent,
     CachedOverlayAdvert, NostrFailureDecision, NostrPeerFailureView, NostrRefetchOutcome,
-    OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint, SIGNAL_KIND,
-    TraversalAnswer, TraversalOffer,
+    OverlayAdvert, OverlayEndpointAdvert, PROTOCOL_VERSION, PunchHint, RelayStatusView,
+    SIGNAL_KIND, TraversalAnswer, TraversalOffer,
 };
 use crate::PeerIdentity;
 use crate::config::{NostrRendezvousConfig, PeerConfig};
@@ -473,6 +473,30 @@ impl NostrRendezvous {
     }
 
     /// Snapshot of per-npub failure state for `show_peers` rendering.
+    /// Live snapshot of the relay pool: every relay the client was built
+    /// with (the advert ∪ DM set) and its current connection status, sorted
+    /// by URL. Read-only and cheap (one pool read lock, no I/O); meant for
+    /// an embedder's status poll.
+    pub async fn relay_status(&self) -> Vec<RelayStatusView> {
+        let mut rows: Vec<RelayStatusView> = self
+            .client
+            .pool()
+            .all_relays()
+            .await
+            .into_iter()
+            .map(|(url, relay)| {
+                let status = relay.status();
+                RelayStatusView {
+                    url: url.to_string(),
+                    status: status.to_string(),
+                    connected: matches!(status, nostr_sdk::RelayStatus::Connected),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.url.cmp(&b.url));
+        rows
+    }
+
     pub fn failure_state_snapshot(&self) -> Vec<NostrPeerFailureView> {
         self.failure_state
             .snapshot()

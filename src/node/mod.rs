@@ -2935,6 +2935,14 @@ impl Node {
         self.supervisor.nostr_rendezvous.engine()
     }
 
+    /// Shared handle to the Nostr discovery engine (`None` while disabled or
+    /// not yet started). For an embedder that polls it from outside the node
+    /// task once `start()` has moved the node onto its runtime — the Android
+    /// shim's relay-status refresh.
+    pub fn nostr_rendezvous_arc(&self) -> Option<Arc<crate::nostr::NostrRendezvous>> {
+        self.supervisor.nostr_rendezvous.engine_arc()
+    }
+
     /// Iterate over all peer node IDs.
     pub fn peer_ids(&self) -> impl Iterator<Item = &NodeAddr> {
         self.peers.keys()
