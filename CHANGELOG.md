@@ -79,6 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values the open-discovery tutorial described never occurred, and the
   tutorial no longer lists them. The response shape is unchanged.
 
+#### Identity & config
+
+- A persistent node whose identity key path cannot be examined now refuses to
+  start instead of coming up under a new identity. `Path::exists` reports false
+  both for a key that is absent and for one whose metadata cannot be read, so a
+  key symlinked onto a volume that did not mount, or one in a directory the
+  daemon cannot search, read as a first boot: the node generated a fresh
+  identity, failed to store it, and carried on under an npub that every peer
+  whose allowlist names the old one refuses. Only a `NotFound` result is now
+  treated as an absence; any other failure to stat the path aborts the start and
+  names the path. A dangling symlink likewise aborts rather than being replaced.
+  The legacy `/etc/fips/fips.key` lookup follows the same rule.
+
 ### Changed
 
 - The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
