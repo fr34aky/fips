@@ -603,6 +603,20 @@ run_tests() {
     else
         record "unit-tests-profiling" 1
     fi
+
+    # Debug-only helpers (anything behind #[cfg(debug_assertions)]) vanish in a
+    # release build, so a test calling one without the same gate breaks a build
+    # nothing here ever performs: every run above compiles the test target in
+    # debug. Compile it in release too, without running it — the point is that
+    # it builds at all. Mirrored in .github/workflows/ci.yml; check-ci-parity.sh
+    # compares integration suites only and would not catch a stage added to one
+    # runner and not the other.
+    info "cargo test --release --lib --no-run"
+    if cargo test --release --lib --no-run 2>&1; then
+        record "release-test-compile" 0
+    else
+        record "release-test-compile" 1
+    fi
 }
 
 # ── Stage 3: Integration Tests ─────────────────────────────────────────────

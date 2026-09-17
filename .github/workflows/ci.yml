@@ -330,6 +330,14 @@ jobs:
       - name: Run library tests with the tick-body profiler enabled
         run: cargo test --lib --features profiling
 
+      # Debug-only helpers (anything behind #[cfg(debug_assertions)]) vanish in
+      # a release build, so a test calling one without the same gate breaks a
+      # build no other job performs: every run above compiles the test target
+      # in debug. Compile it in release too, without running it — the point is
+      # that it builds at all. Mirrored in testing/ci-local.sh.
+      - name: Compile the library tests in release mode
+        run: cargo test --release --lib --no-run
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2b – Unit tests (macOS)
 # ─────────────────────────────────────────────────────────────────────────────
