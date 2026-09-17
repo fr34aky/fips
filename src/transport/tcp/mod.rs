@@ -12,9 +12,9 @@
 //! ## Architecture
 //!
 //! Unlike UDP (one socket serves all peers), TCP requires one `TcpStream`
-//! per peer. The transport maintains a connection pool mapping
-//! `TransportAddr` to per-connection state, plus an optional `TcpListener`
-//! for inbound connections.
+//! per peer. The transport maintains a connection pool mapping each
+//! connection's four-tuple to its per-connection state, plus an optional
+//! `TcpListener` for inbound connections.
 //!
 //! ## Framing
 //!
@@ -32,7 +32,10 @@ use super::{
 };
 use crate::config::TcpConfig;
 use crate::transport::framing::read_fmp_packet;
-use pool::{ConnectingEntry, ConnectingPool, ConnectionPool, Direction, TcpConnection};
+use pool::{
+    ConnectingEntry, ConnectingPool, ConnectionPool, Direction, PoolKey, TcpConnection,
+    key_for_remote,
+};
 use stats::TcpStats;
 
 use futures::FutureExt;
@@ -57,7 +60,7 @@ use tracing::{debug, info, trace, warn};
 ///
 /// Provides connection-oriented, reliable byte stream delivery over TCP/IP.
 /// Each peer has its own TCP connection; links are managed per-connection
-/// with a connection pool keyed by `TransportAddr`.
+/// with a connection pool keyed by `PoolKey`.
 pub struct TcpTransport {
     /// Unique transport identifier.
     transport_id: TransportId,
@@ -269,7 +272,7 @@ impl TcpTransport {
         // aborting the task skips that path; decrement explicitly here
         // using the direction we stored on the connection record.
         let mut pool = self.pool.lock().await;
-        for (addr, conn) in pool.drain() {
+        for (key, conn) in pool.drain() {
             conn.recv_task.abort();
             let _ = conn.recv_task.await;
             match conn.direction {
@@ -278,7 +281,7 @@ impl TcpTransport {
             }
             debug!(
                 transport_id = %self.transport_id,
-                remote_addr = %addr,
+                remote_addr = %key.remote,
                 direction = ?conn.direction,
                 "TCP connection closed (transport stopping)"
             );
@@ -326,7 +329,7 @@ impl TcpTransport {
         // Get or create connection
         let writer = {
             let pool = self.pool.lock().await;
-            pool.get(addr).map(|c| c.writer.clone())
+            key_for_remote(&pool, addr).and_then(|key| pool.get(&key).map(|c| c.writer.clone()))
         };
 
         let writer = match writer {
@@ -355,7 +358,8 @@ impl TcpTransport {
                 drop(w);
                 // Remove failed connection from pool
                 let mut pool = self.pool.lock().await;
-                if let Some(conn) = pool.remove(addr) {
+                let key = key_for_remote(&pool, addr);
+                if let Some(conn) = key.and_then(|key| pool.remove(&key)) {
                     conn.recv_task.abort();
                     match conn.direction {
                         Direction::Inbound => self.stats.record_pool_inbound_removed(),
@@ -417,14 +421,15 @@ impl TcpTransport {
         let packet_tx = self.packet_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
-        let remote_addr = addr.clone();
+        let key = PoolKey::outbound(addr.clone());
+        let recv_key = key.clone();
         let mtu = mss_mtu;
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
                 read_half,
                 transport_id,
-                remote_addr.clone(),
+                recv_key,
                 packet_tx,
                 pool,
                 mtu,
@@ -447,7 +452,7 @@ impl TcpTransport {
         };
 
         let mut pool = self.pool.lock().await;
-        pool.insert(addr.clone(), conn);
+        pool.insert(key, conn);
 
         self.stats.record_connection_established();
         self.stats.record_pool_outbound_added();
@@ -468,7 +473,8 @@ impl TcpTransport {
     /// and drops the write half (sends FIN to remote).
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
-        if let Some(conn) = pool.remove(addr) {
+        let key = key_for_remote(&pool, addr);
+        if let Some(conn) = key.and_then(|key| pool.remove(&key)) {
             conn.recv_task.abort();
             match conn.direction {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
@@ -498,7 +504,7 @@ impl TcpTransport {
         // Already established?
         {
             let pool = self.pool.lock().await;
-            if pool.contains_key(addr) {
+            if key_for_remote(&pool, addr).is_some() {
                 return Ok(());
             }
         }
@@ -610,7 +616,7 @@ impl TcpTransport {
     pub fn connection_state_sync(&self, addr: &TransportAddr) -> ConnectionState {
         // Check established pool first
         if let Ok(pool) = self.pool.try_lock() {
-            if pool.contains_key(addr) {
+            if key_for_remote(&pool, addr).is_some() {
                 return ConnectionState::Connected;
             }
         } else {
@@ -671,13 +677,14 @@ impl TcpTransport {
         let packet_tx = self.packet_tx.clone();
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
-        let remote_addr = addr.clone();
+        let key = PoolKey::outbound(addr.clone());
+        let recv_key = key.clone();
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
                 read_half,
                 transport_id,
-                remote_addr.clone(),
+                recv_key,
                 packet_tx,
                 pool,
                 mss_mtu,
@@ -702,7 +709,7 @@ impl TcpTransport {
         // Use try_lock since we're in a sync context and the pool
         // should be available (connection_state_sync already checked it)
         if let Ok(mut pool) = self.pool.try_lock() {
-            pool.insert(addr.clone(), conn);
+            pool.insert(key, conn);
             self.stats.record_connection_established();
             self.stats.record_pool_outbound_added();
             debug!(
@@ -829,6 +836,24 @@ async fn accept_loop(
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                // The pool key is the four-tuple, so the local address is
+                // needed before anything else is done with the socket. A
+                // socket whose local address cannot be read is already
+                // broken; drop it rather than pool it under a key that
+                // could collide with another connection.
+                let local_addr = match stream.local_addr() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(
+                            transport_id = %transport_id,
+                            peer_addr = %peer_addr,
+                            error = %e,
+                            "Failed to read local address of accepted socket"
+                        );
+                        continue;
+                    }
+                };
+
                 // Check inbound connection cap. Counts only inbound (accepted)
                 // connections currently held in the pool; outbound (connect-on-send)
                 // connections live in the same pool but are not subject to the
@@ -889,6 +914,7 @@ async fn accept_loop(
                 };
 
                 let remote_addr = TransportAddr::from_string(&peer_addr.to_string());
+                let key = PoolKey::inbound(remote_addr.clone(), local_addr);
 
                 // Split and spawn receive task
                 let (read_half, write_half) = stream.into_split();
@@ -897,7 +923,7 @@ async fn accept_loop(
                 let recv_pool = pool.clone();
                 let recv_packet_tx = packet_tx.clone();
                 let recv_stats = stats.clone();
-                let recv_addr = remote_addr.clone();
+                let recv_key = key.clone();
 
                 // Readiness barrier: the receive task must not reach its
                 // cleanup path before the pool insert and counter bump below,
@@ -909,7 +935,7 @@ async fn accept_loop(
                     tcp_receive_loop(
                         read_half,
                         transport_id,
-                        recv_addr,
+                        recv_key,
                         recv_packet_tx,
                         recv_pool,
                         conn_mtu,
@@ -930,7 +956,7 @@ async fn accept_loop(
                 };
 
                 let mut pool_guard = pool.lock().await;
-                pool_guard.insert(remote_addr.clone(), conn);
+                pool_guard.insert(key, conn);
                 drop(pool_guard);
 
                 stats.record_connection_accepted();
@@ -943,6 +969,7 @@ async fn accept_loop(
                 debug!(
                     transport_id = %transport_id,
                     remote_addr = %remote_addr,
+                    local_addr = %local_addr,
                     mtu = conn_mtu,
                     "Accepted inbound TCP connection"
                 );
@@ -965,8 +992,11 @@ async fn accept_loop(
 /// Per-connection TCP receive loop.
 ///
 /// Reads complete FMP packets using the stream reader, delivers them to
-/// the node via the packet channel. On error or EOF, removes the
-/// connection from the pool and exits. `direction` is captured here so
+/// the node via the packet channel. On error or EOF, removes its own
+/// pool entry and exits. The entry is named by `key`, the connection's
+/// four-tuple, so a loop tears down only the connection it was spawned
+/// for even when another connection shares its peer address.
+/// `direction` is captured here so
 /// the cleanup path can decrement the correct `pool_inbound` /
 /// `pool_outbound` counter regardless of whether the matching pool
 /// entry survived to be removed.
@@ -980,7 +1010,7 @@ async fn accept_loop(
 async fn tcp_receive_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport_id: TransportId,
-    remote_addr: TransportAddr,
+    key: PoolKey,
     packet_tx: PacketTx,
     pool: ConnectionPool,
     mtu: u16,
@@ -989,6 +1019,7 @@ async fn tcp_receive_loop(
     first_frame_timeout: Option<Duration>,
     ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 ) {
+    let remote_addr = &key.remote;
     debug!(
         transport_id = %transport_id,
         remote_addr = %remote_addr,
@@ -1041,7 +1072,7 @@ async fn tcp_receive_loop(
                         "TCP packet received"
                     );
 
-                    let packet = ReceivedPacket::new(transport_id, remote_addr.clone(), data);
+                    let packet = ReceivedPacket::new(transport_id, key.remote.clone(), data);
 
                     if packet_tx.send(packet).await.is_err() {
                         debug!(
@@ -1071,7 +1102,7 @@ async fn tcp_receive_loop(
     // entry actually being removed so a double-cleanup never drives
     // the counter below zero.
     let mut pool_guard = pool.lock().await;
-    let removed = pool_guard.remove(&remote_addr).is_some();
+    let removed = pool_guard.remove(&key).is_some();
     drop(pool_guard);
     if removed {
         match direction {
@@ -1228,6 +1259,16 @@ mod tests {
     fn make_config() -> TcpConfig {
         TcpConfig {
             bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(1400),
+            ..Default::default()
+        }
+    }
+
+    /// Listener on every local address, so that two connections can reach
+    /// it from one source port on two different local addresses.
+    fn wildcard_config() -> TcpConfig {
+        TcpConfig {
+            bind_addr: Some("0.0.0.0:0".to_string()),
             mtu: Some(1400),
             ..Default::default()
         }
@@ -1473,7 +1514,7 @@ mod tests {
         // Connection should exist
         {
             let pool = t1.pool.lock().await;
-            assert!(pool.contains_key(&remote));
+            assert!(pool.contains_key(&PoolKey::outbound(remote.clone())));
         }
 
         // Close it
@@ -1482,7 +1523,7 @@ mod tests {
         // Connection should be gone
         {
             let pool = t1.pool.lock().await;
-            assert!(!pool.contains_key(&remote));
+            assert!(!pool.contains_key(&PoolKey::outbound(remote.clone())));
         }
 
         t1.stop_async().await.unwrap();
@@ -2049,13 +2090,16 @@ mod tests {
         let listen = listener.local_addr().unwrap();
         let client = TcpStream::connect(listen).await.unwrap();
         let (server, peer_addr) = listener.accept().await.unwrap();
-        let remote = TransportAddr::from_string(&peer_addr.to_string());
+        let key = PoolKey::inbound(
+            TransportAddr::from_string(&peer_addr.to_string()),
+            server.local_addr().unwrap(),
+        );
         let (read_half, write_half) = server.into_split();
 
         let pool: ConnectionPool = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(TcpStats::new());
         pool.lock().await.insert(
-            remote.clone(),
+            key.clone(),
             TcpConnection {
                 writer: Arc::new(Mutex::new(write_half)),
                 recv_task: tokio::spawn(async {}),
@@ -2073,7 +2117,7 @@ mod tests {
         tcp_receive_loop(
             read_half,
             TransportId::new(1),
-            remote.clone(),
+            key,
             tx,
             pool.clone(),
             1400,
@@ -2145,6 +2189,175 @@ mod tests {
         );
 
         drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Inbound pool keying
+    // ========================================================================
+
+    /// Connect to `dst` from `src`, leaving the source port shareable.
+    ///
+    /// `SO_REUSEADDR` on both clients is what lets the second one bind the
+    /// source port the first is already using; the four-tuples still
+    /// differ, because the two connect to different local addresses.
+    #[cfg(target_os = "linux")]
+    fn client_from_port(src: SocketAddr, dst: SocketAddr) -> std::net::TcpStream {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("create client socket");
+        socket.set_reuse_address(true).expect("SO_REUSEADDR");
+        socket.bind(&src.into()).expect("bind client socket");
+        socket.connect(&dst.into()).expect("connect client socket");
+        socket.into()
+    }
+
+    /// A reply addressed to an inbound peer goes back over the connection
+    /// that peer opened, rather than dialing its ephemeral port.
+    ///
+    /// An inbound entry is keyed by the four-tuple, but a caller answering
+    /// a received packet knows only the remote address it came from. The
+    /// pool has to resolve that address to the entry; if it does not, the
+    /// send falls through to connect-on-send against the peer's ephemeral
+    /// port and fails.
+    #[tokio::test]
+    async fn a_reply_to_an_inbound_peer_uses_the_connection_it_arrived_on() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut peer = TcpStream::connect(listen).await.unwrap();
+        peer.write_all(&build_msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the inbound frame")
+            .expect("packet channel closed");
+
+        let mut reply = vec![0xBB; 69];
+        reply[0] = 0x02;
+        reply[1] = 0x00;
+        reply[2..4].copy_from_slice(&65u16.to_le_bytes());
+        transport
+            .send_async(&packet.remote_addr, &reply)
+            .await
+            .expect("a reply to an inbound peer should use its connection");
+
+        let mut received = vec![0u8; reply.len()];
+        timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut peer, &mut received),
+        )
+        .await
+        .expect("timeout waiting for the reply")
+        .expect("reply read failed");
+        assert_eq!(received, reply);
+
+        drop(peer);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// Two inbound connections that share a peer address get two pool
+    /// entries, and each one's teardown releases only its own.
+    ///
+    /// The kernel names a connection by its four-tuple, so a wildcard
+    /// listener accepts two connections with the same peer address when
+    /// they arrive on different local addresses. Keyed by the peer address
+    /// alone, the second entry would replace the first while the inbound
+    /// counter counted both, the first connection's teardown would remove
+    /// the second's entry, and the second's teardown would find nothing to
+    /// remove and leave the counter one high for the life of the process.
+    /// The counter gates accepts, so repeating that locks the listener out.
+    ///
+    /// Break-check: with `PoolKey::inbound` ignoring its local address,
+    /// the pool holds one entry instead of two, no entry survives the
+    /// first client's close, and the inbound count never returns to zero.
+    ///
+    /// Linux only: the whole of 127.0.0.0/8 is local there without
+    /// configuration, which is what gives the listener two local addresses
+    /// to accept on.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_inbound_connections_sharing_a_peer_address_get_separate_entries() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, wildcard_config(), tx);
+        transport.start_async().await.unwrap();
+        let port = transport.local_addr().unwrap().port();
+
+        // The first client picks the shared source port; the second binds
+        // the same one and reaches the listener on 127.0.0.2.
+        let first = client_from_port(
+            "127.0.0.1:0".parse().unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        );
+        let source = first.local_addr().unwrap();
+        let second = client_from_port(source, SocketAddr::from(([127, 0, 0, 2], port)));
+
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 2,
+                Duration::from_secs(2)
+            )
+            .await,
+            "both connections should have been accepted"
+        );
+        {
+            let pool = transport.pool.lock().await;
+            assert_eq!(
+                pool.len(),
+                2,
+                "two live connections must not share one pool entry"
+            );
+            let mut locals: Vec<_> = pool
+                .keys()
+                .map(|key| key.local.expect("an inbound key carries a local address"))
+                .collect();
+            locals.sort();
+            assert_eq!(
+                locals,
+                vec![
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    SocketAddr::from(([127, 0, 0, 2], port)),
+                ],
+                "the two entries should be the two four-tuples"
+            );
+        }
+
+        // The first connection's teardown must leave the second alone.
+        drop(first);
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "closing one connection should release one inbound slot"
+        );
+        {
+            let pool = transport.pool.lock().await;
+            let surviving: Vec<_> = pool.keys().map(|key| key.local.unwrap()).collect();
+            assert_eq!(
+                surviving,
+                vec![SocketAddr::from(([127, 0, 0, 2], port))],
+                "the connection that was not closed should keep its entry"
+            );
+        }
+
+        // And the second connection's own teardown releases its slot.
+        drop(second);
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 0,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the inbound count must return to zero, not strand a slot"
+        );
+        assert!(transport.pool.lock().await.is_empty());
+
         transport.stop_async().await.unwrap();
     }
 }

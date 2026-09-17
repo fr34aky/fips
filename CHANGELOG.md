@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data-plane / transports
 
+- Two inbound TCP connections that share a peer address but arrive on different
+  local addresses no longer share one pool entry. The kernel names a connection
+  by its four-tuple, so a listener on a wildcard address, which is what the
+  shipped configuration binds, can accept two connections whose peer `ip:port`
+  is the same on two different local addresses. The pool was keyed by the peer
+  address alone: the second connection's entry replaced the first's while the
+  inbound-connection counter counted both, the first connection's teardown then
+  removed the second's entry, and the second's own teardown found nothing to
+  remove, so the counter ended one above the connections it counts. That counter
+  gates the inbound connection limit, so a host repeating the collision could
+  hold it at the limit and lock out further inbound TCP connections until the
+  daemon restarted. Inbound entries now carry the accepted socket's local
+  address in their pool key as well as the remote one.
 - A peer that moves to a new address now loses the per-peer `connect(2)`-ed UDP
   socket pinned to the address it left. `set_current_addr` returns whether the
   address actually changed so the caller can drop the stale socket, and the
