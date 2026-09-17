@@ -436,6 +436,40 @@ jobs:
           }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 2e – OpenWrt maintainer-script scenarios
+#
+# Runs the package's postinst/prerm and the fips-gateway init script under ash
+# in a busybox container, against stubbed init scripts: a fresh install, an
+# upgrade from a released package, an upgrade from a package carrying these
+# scripts with the gateway enabled and with it disabled, a removal, and the
+# init script's gateway.enabled guard.
+#
+# A job of its own rather than a leg of the integration matrix: it needs no
+# FIPS binary and no shared test image, so as an integration leg it would wait
+# on the build and then download and build both for nothing.
+#
+# The leg keeps `suite:` because testing/check-ci-parity.sh matches it against
+# OPENWRT_SUITES in ci-local.sh; the step below does not read it.
+# ─────────────────────────────────────────────────────────────────────────────
+  openwrt-scripts:
+    name: OpenWrt scripts (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_integration }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: openwrt-scripts
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Run the OpenWrt maintainer-script scenarios
+        timeout-minutes: 5
+        run: bash testing/openwrt/maintainer-scripts-test.sh
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Job 3 – Integration tests (static mesh + chaos simulation)
 #
 # Runs only when both build and test succeed.  Each topology / scenario is a

@@ -192,6 +192,7 @@ CHAOS_SUITES=(
 #     on disk and it remains runnable by hand via
 #     testing/chaos/scripts/chaos.sh bloom-storm.
 GATEWAY_SUITES=(gateway)
+OPENWRT_SUITES=(openwrt-scripts)
 SIDECAR_SUITES=(sidecar)
 FIREWALL_SUITES=(firewall)
 NAT_SUITES=(cone symmetric lan)
@@ -228,6 +229,9 @@ list_suites() {
     echo ""
     echo "  Gateway:"
     for s in "${GATEWAY_SUITES[@]}"; do echo "    $s"; done
+    echo ""
+    echo "  OpenWrt packaging:"
+    for s in "${OPENWRT_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Firewall baseline:"
     for s in "${FIREWALL_SUITES[@]}"; do echo "    $s"; done
@@ -1098,6 +1102,16 @@ run_tor_directory() {
 run_integration() {
     stage "Stage 3: Integration Tests"
 
+    # First, and before the build context: the OpenWrt scenarios need no FIPS
+    # binary and no test image, so a packaging regression is reported in
+    # seconds rather than after the image build.
+    if [[ -z "$ONLY_SUITE" ]]; then
+        run_openwrt_scripts
+    elif [[ "$ONLY_SUITE" == "openwrt-scripts" ]]; then
+        run_openwrt_scripts
+        return
+    fi
+
     # Populate THIS run's build context, then install the binaries into it.
     # Everything but the binaries is copied from the tracked context directory;
     # the binaries are installed fresh, and a previous run's are deliberately
@@ -1256,6 +1270,8 @@ run_suite() {
             run_static "${suite#static-}" ;;
         gateway)
             run_gateway ;;
+        openwrt-scripts)
+            run_openwrt_scripts ;;
         firewall)
             run_firewall ;;
         nat-cone|nat-symmetric|nat-lan)
@@ -1336,6 +1352,19 @@ print_summary() {
 # Verify the local default suite set and the GitHub matrix still cover the
 # same work. Runs first: it takes about a second, and a divergence should be
 # reported before a half-hour suite rather than after it.
+# The OpenWrt maintainer scripts and the fips-gateway init script ship to
+# routers and run there under ash, never under bash. This runs them under ash
+# in a busybox container against stubbed init scripts, so an install, an
+# upgrade from either generation of the package, and a removal each assert what
+# the package left enabled and running.
+run_openwrt_scripts() {
+    local rc=0
+    info "[openwrt-scripts] Running the OpenWrt maintainer-script scenarios"
+    bash "$SCRIPT_DIR/openwrt/maintainer-scripts-test.sh" || rc=$?
+    record "openwrt-scripts" $rc
+    return $rc
+}
+
 run_ci_parity() {
     local rc=0
     info "[ci-parity] Comparing the local suite set against the GitHub matrix"
