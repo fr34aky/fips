@@ -159,6 +159,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the batch and requests one acknowledgement per batch, and NAT errors now
   name the kernel errno. A rebuild that still fails is logged, and the next
   successful rebuild installs the mapping.
+- The gateway's virtual-IP pool now limits how many mappings it holds and how
+  fast it creates them. Any host that can reach the LAN resolver could ask for
+  one new `.fips` name after another, and each got a mapping until the 65,535
+  addresses ran out, while every mapping made each NAT rebuild, each pool tick
+  and shutdown slower. The pool now refuses a new name once it holds 1000 live
+  mappings, and admits new names at 10 per second after a burst of 50. A
+  refused query gets SERVFAIL, and the gateway's "Pool allocation failed"
+  warning says which limit refused it. A name that already has a mapping is
+  answered before either limit is consulted, so names in use keep resolving
+  when the pool is full. The limits are compiled in, not configured.
 - A new OpenWrt install no longer enables and starts `fips-gateway`. The
   generated postinst turned it on unconditionally, contradicting the init
   script's own header, the package README and the deployment tutorial, all of

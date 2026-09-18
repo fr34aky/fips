@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv6Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Instant;
 use tracing::{debug, info};
 
 use rustables::expr::{
@@ -242,14 +243,26 @@ impl NatManager {
                 mesh_addr,
             },
         );
-        self.rebuild()?;
-
-        debug!(
-            virtual_ip = %virtual_ip,
-            mesh_addr = %mesh_addr,
-            "Added DNAT/SNAT rules"
-        );
-        Ok(())
+        let (result, elapsed_us) = self.timed_rebuild();
+        let mappings = self.mappings.len();
+        match &result {
+            Ok(()) => debug!(
+                virtual_ip = %virtual_ip,
+                mesh_addr = %mesh_addr,
+                mappings,
+                elapsed_us,
+                "Added DNAT/SNAT rules"
+            ),
+            Err(e) => debug!(
+                virtual_ip = %virtual_ip,
+                mesh_addr = %mesh_addr,
+                mappings,
+                elapsed_us,
+                error = %e,
+                "Added DNAT/SNAT rules"
+            ),
+        }
+        result
     }
 
     /// Remove DNAT and SNAT rules for a virtual IP mapping.
@@ -257,10 +270,24 @@ impl NatManager {
         if self.mappings.remove(&virtual_ip).is_none() {
             return Err(NatError::RuleNotFound(virtual_ip));
         }
-        self.rebuild()?;
-
-        debug!(virtual_ip = %virtual_ip, "Removed DNAT/SNAT rules");
-        Ok(())
+        let (result, elapsed_us) = self.timed_rebuild();
+        let mappings = self.mappings.len();
+        match &result {
+            Ok(()) => debug!(
+                virtual_ip = %virtual_ip,
+                mappings,
+                elapsed_us,
+                "Removed DNAT/SNAT rules"
+            ),
+            Err(e) => debug!(
+                virtual_ip = %virtual_ip,
+                mappings,
+                elapsed_us,
+                error = %e,
+                "Removed DNAT/SNAT rules"
+            ),
+        }
+        result
     }
 
     /// Flush all rules and delete the nftables table.
@@ -466,6 +493,15 @@ impl NatManager {
             send_batch(&self.encode_batch(&ops)?)?;
         }
         Ok(())
+    }
+
+    /// Rebuild, returning the outcome with the time the rebuild took in
+    /// microseconds, so a mapping change can log its cost on either path.
+    fn timed_rebuild(&self) -> (Result<(), NatError>, u64) {
+        let started = Instant::now();
+        let result = self.rebuild();
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        (result, elapsed_us)
     }
 }
 
