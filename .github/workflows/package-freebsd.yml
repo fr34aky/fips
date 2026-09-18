@@ -229,15 +229,15 @@ jobs:
 
   pfsense:
     name: Build and check the pfSense package (x86_64)
-    # A job of its own, and deliberately NOT a dependency of `release`. A
-    # pfSense-only failure — a new key in the common dns: block, a
-    # dependency that stops linking statically, a checker regression — reds
-    # this check and nothing else; it can never hide behind the FreeBSD
-    # job's result, and it cannot block the FreeBSD release asset. The
-    # pfSense package is therefore never a release asset. It is published
-    # here as a workflow artifact (30-day retention) for anyone to test,
-    # until someone has installed it on a real pfSense box; see
-    # packaging/pfsense/README.md.
+    # A job of its own, so a pfSense-only failure — a new key in the common
+    # dns: block, a dependency that stops linking statically, a checker
+    # regression — reds this check by name and can never hide behind the
+    # FreeBSD job's result. `release` needs both jobs: the packages this
+    # job builds are release assets next to the FreeBSD one, after being run
+    # on pfSense Plus 26.03.1 and 26.07 (see packaging/pfsense/README.md),
+    # so a pfSense failure holds the release the way a FreeBSD failure
+    # does. On every other ref the artifact is kept 30 days for anyone to
+    # test.
     #
     # This VM is FreeBSD 15.1. One build yields static FreeBSD 15 binaries,
     # packaged twice: as FreeBSD:15:amd64 for pfSense CE 2.8.1, and relabelled
@@ -357,7 +357,7 @@ jobs:
   release:
     name: Publish FreeBSD assets to GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, pfsense]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -366,11 +366,17 @@ jobs:
       - name: Download FreeBSD artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          # Only the FreeBSD artifact. Without a pattern this action downloads
-          # every artifact in the run — including the pfSense package from the
-          # `pfsense` job, which is a workflow artifact by design and must never
-          # reach a release. `needs` only orders jobs; it does not scope this.
+          # One named pattern per job: without a pattern this action downloads
+          # every artifact in the run, and `needs` only orders jobs; it does
+          # not scope this.
           pattern: fips_*_x86_64_freebsd
+          path: dist
+          merge-multiple: true
+
+      - name: Download pfSense artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: fips_*_x86_64_pfsense
           path: dist
           merge-multiple: true
 
@@ -380,14 +386,16 @@ jobs:
           set -euo pipefail
           cd dist
 
-          # The pfSense package is never a release asset (see the `pfsense`
-          # job). The download step is scoped to the FreeBSD artifact; this
-          # keeps the rule if that artifact is ever renamed or a new one added.
-          if compgen -G '*-pfsense-*' >/dev/null; then
-            echo "FAIL: a pfSense package reached the release stage; it must stay a workflow artifact:" >&2
-            ls -la ./*-pfsense-* >&2 || true
-            exit 1
-          fi
+          # Three packages are expected: the FreeBSD one and the two pfSense
+          # ones (each job wrote the sidecars inside its own VM). Missing one
+          # is a failure, not a smaller release.
+          for want in '*-freebsd-*.pkg' '*-pfsense-ce2.8-amd64.pkg' '*-pfsense-ce2.9-plus26-amd64.pkg'; do
+            if ! compgen -G "$want" >/dev/null; then
+              echo "FAIL: no package matching $want was downloaded" >&2
+              ls -la . >&2 || true
+              exit 1
+            fi
+          done
 
           pkgs=$(find . -maxdepth 1 -type f -name '*.pkg' | LC_ALL=C sort)
           if [[ -z "$pkgs" ]]; then
