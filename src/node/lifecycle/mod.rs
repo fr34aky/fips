@@ -2005,7 +2005,7 @@ impl Node {
             let (rx, task) = crate::node::netmon::spawn_detector(
                 netmon_cfg,
                 self.entities_snapshot.clone(),
-                Some(self.netmon_trigger.notify()),
+                self.netmon_trigger.clone(),
             );
             self.supervisor.netmon_rx = Some(rx);
             self.supervisor.netmon_task = Some(task);

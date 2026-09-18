@@ -147,7 +147,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs one sample rather than a socket rebind. It is synchronous and callable
   from any thread, before or after `start()`; a poke that lands while the
   detector is sampling is held rather than lost, and a burst coalesces into
-  one wake-up. The push is selected beside the platform's own source and the
+  one wake-up. A platform callback is not ordered against the routing table it
+  reports on, so a pushed wake-up whose sample shows nothing moved looks once
+  more after `node.netmon.debounce_ms` instead of leaving the change to the
+  timer; wake-ups from the kernel and the timer are unchanged. The push is selected beside the platform's own source and the
   timer backstop, never instead of them. The platform wiring
   (`registerNetworkCallback`, or `NWPathMonitor` on iOS) stays with the
   embedder, since the crate has no JNI layer.

@@ -3705,10 +3705,11 @@ impl Node {
     /// changes, while the netlink group bind the detector would otherwise use
     /// is denied to apps, leaving the detector on its poll timer. Poking from
     /// the callback turns a poll-period latency into a debounce-period one.
-    /// Callable before or after [`Self::start`], from any thread; the handle
-    /// survives the node and simply does nothing once it is stopped. A new
-    /// `Node` has a new trigger — an embedder that rebuilds the node must
-    /// fetch it again.
+    /// Callable before or after [`Self::start`], from any thread, and the
+    /// same handle keeps working across a [`Self::stop`] and another
+    /// [`Self::start`]; a poke while no detector is running is held for the
+    /// next one. A new `Node` has a new trigger — an embedder that rebuilds
+    /// the node must fetch it again.
     pub fn netmon_trigger(&self) -> NetmonTrigger {
         self.netmon_trigger.clone()
     }

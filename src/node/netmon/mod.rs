@@ -555,10 +555,19 @@ struct WakeSource {
     /// regress, for the cost of one sample per period: five syscalls per probed
     /// peer, or 640 at the default of 128 peers.
     timer: tokio::time::Interval,
-    /// An embedder's push ([`NetmonTrigger`]), beside the source above rather
-    /// than instead of it. `None` when nothing armed one, which costs no
-    /// `select!` arm.
-    push: Option<Arc<tokio::sync::Notify>>,
+    /// An embedder's push, beside the source above rather than instead of it.
+    /// Always present: a trigger nobody holds can never fire, so a wake source
+    /// built without one simply carries one that stays silent.
+    push: NetmonTrigger,
+}
+
+/// Which arm of [`WakeSource::wait`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Woke {
+    /// The platform source or the timer.
+    Source,
+    /// An embedder's [`NetmonTrigger::poke`].
+    Push,
 }
 
 /// An embedder's handle for waking the medium-change detector now, rather
@@ -569,8 +578,20 @@ struct WakeSource {
 /// is meant to be called straight from a platform network callback (an
 /// Android `ConnectivityManager` one, say). A poke while the detector is
 /// mid-sample is not lost: one wake-up is held until the detector next waits,
-/// and a burst of pokes coalesces into that one. Poking a node whose detector
-/// is disabled or not running does nothing.
+/// and a burst of pokes coalesces into that one. The same holds for a poke
+/// while no detector is running — before `start()`, or between a `stop()` and
+/// the next `start()`: it is held, and costs the detector one extra sample
+/// when it next starts. With `node.netmon.enabled: false` no detector ever
+/// runs and a poke does nothing.
+///
+/// A poke costs a sample — five syscalls per probed peer — and, when that
+/// sample shows nothing moved, one more a debounce period later, because a
+/// platform callback can run ahead of the routing table it reports on. Wire it
+/// to the callbacks that mean the
+/// attachment moved (on Android: `onAvailable`, `onLost` and
+/// `onLinkPropertiesChanged` of the default network) rather than to
+/// `onCapabilitiesChanged`, which fires every few seconds on cellular for
+/// signal and bandwidth estimates and would turn the push into a faster poll.
 #[derive(Clone, Debug)]
 pub struct NetmonTrigger {
     inner: Arc<tokio::sync::Notify>,
@@ -588,8 +609,9 @@ impl NetmonTrigger {
         self.inner.notify_one();
     }
 
-    pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.inner)
+    /// Wait for a poke, consuming the one held if there is one.
+    pub(in crate::node) async fn poked(&self) {
+        self.inner.notified().await;
     }
 }
 
@@ -620,7 +642,7 @@ impl WakeSource {
         Self {
             source: Wake::Timer,
             timer: Self::make_timer(period),
-            push: None,
+            push: NetmonTrigger::new(),
         }
     }
 
@@ -630,7 +652,7 @@ impl WakeSource {
         Self {
             source: Wake::Kernel(watcher),
             timer: Self::make_timer(period),
-            push: None,
+            push: NetmonTrigger::new(),
         }
     }
 
@@ -640,7 +662,7 @@ impl WakeSource {
         Self {
             source: Wake::Injected(pings),
             timer: Self::make_timer(period),
-            push: None,
+            push: NetmonTrigger::new(),
         }
     }
 
@@ -661,7 +683,7 @@ impl WakeSource {
     }
 
     /// Add an embedder push beside the existing source. See [`NetmonTrigger`].
-    fn with_push(mut self, push: Option<Arc<tokio::sync::Notify>>) -> Self {
+    fn with_push(mut self, push: NetmonTrigger) -> Self {
         self.push = push;
         self
     }
@@ -677,20 +699,16 @@ impl WakeSource {
         }
     }
 
-    /// Wait until it is worth sampling again.
-    async fn wait(&mut self) {
+    /// Wait until it is worth sampling again, and say what it was.
+    async fn wait(&mut self) -> Woke {
         // The push is selected beside the platform source, never instead of
         // it: an embedder that pokes is a latency improvement on top of the
         // timer backstop, and a `Notify` holds one permit for a poke that
         // lands while the detector is busy sampling, so it cannot be missed.
-        match self.push.clone() {
-            None => self.wait_source().await,
-            Some(push) => {
-                tokio::select! {
-                    _ = push.notified() => {}
-                    _ = self.wait_source() => {}
-                }
-            }
+        let push = self.push.clone();
+        tokio::select! {
+            _ = push.poked() => Woke::Push,
+            _ = self.wait_source() => Woke::Source,
         }
     }
 
@@ -754,7 +772,7 @@ impl WakeSource {
 pub(crate) fn spawn_detector(
     cfg: NetmonConfig,
     peers: Arc<arc_swap::ArcSwap<EntitySnapshot>>,
-    push: Option<Arc<tokio::sync::Notify>>,
+    push: NetmonTrigger,
 ) -> (NetChangeRx, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
     let handle = tokio::spawn(async move {
@@ -853,9 +871,21 @@ where
     );
 
     loop {
-        wake.wait().await;
+        let woke = wake.wait().await;
 
         let mut candidate = sample();
+        // A push gets one second look. A kernel source re-arms itself — every
+        // route message in a handover's burst is another wake-up — but an
+        // embedder's callback is a single shot, and the platform can deliver
+        // it ahead of the routing table it is about: on Android the
+        // `ConnectivityManager` callback is not ordered against netd
+        // finishing the default-route swap. Without this the poke would be
+        // spent on a sample of the old picture and the change left to the
+        // timer, which is the latency the push exists to remove.
+        if woke == Woke::Push && !debounce.is_zero() && last.moved(&candidate).is_empty() {
+            tokio::time::sleep(debounce).await;
+            candidate = sample();
+        }
         if last.moved(&candidate).is_empty() {
             // Nothing the node is peering over moved. Adopt the sample anyway:
             // it is how a peer that has just joined enters the comparison, and
