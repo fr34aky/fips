@@ -112,14 +112,21 @@ difference decides which may be published:
 
 | Artifact | linkage | toolchain pin | CI |
 |---|---|---|---|
-| `…-pfsense-ce2.8-amd64.pkg` | static | honoured | built + checked, workflow artifact |
+| `…-pfsense-ce2.8-amd64.pkg` | static | honoured | built, checked, install-smoked; workflow artifact |
 | `…-pfsense-ce2.9-plus26-amd64.pkg` | static | honoured | not built — CI has no FreeBSD 16 host |
 | `…-pfsense-plus26-aarch64.pkg` | dynamic | **not** honoured | not built — build it yourself |
 
 No pfSense package is attached to a release. It is built and checked in
 its own CI job (so a pfSense-only failure reds that job without blocking
 the FreeBSD asset) and kept as a 30-day workflow artifact, until one has
-been installed on a real pfSense box.
+been installed on a real pfSense box. "Install-smoked" means
+`testing/pfsense-install-smoke.sh` ran it on the plain FreeBSD VM of the
+same major: `pkg add`, the boot script's start, re-entrant start, restart
+and stop with the real daemon answering `fipsctl` and DNS queries, a
+forced `newsyslog` rotation on the shipped entry with the daemon's open
+log following to the new `/var/log/fips.log`, then `pkg delete`. That is
+the same script to run first on a real box; its header says what a
+plain-FreeBSD pass does not prove.
 
 The two absences are not the same. The FreeBSD 16 Intel package builds
 cleanly with the pinned compiler and links statically, so it is
