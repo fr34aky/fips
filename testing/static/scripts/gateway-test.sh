@@ -477,6 +477,256 @@ else
     check "Gateway shutdown (no completion message in logs)" 1
 fi
 
+# Phase 11: NAT rebuild past the default netlink socket limits
+#
+# Every change rebuilds the whole fips_gateway table in one netlink batch.
+# With the default socket buffers that batch failed from about 105 mappings
+# (the acks overflowed the receive buffer, after the commit) and past about
+# 313 (the batch overflowed the send buffer, and nothing was committed).
+# Drive 400 new names through a gateway whose mappings outlive the phase and
+# judge the result on the kernel's own table, not on the daemon's debug-level
+# success line, which the suite's log level does not show. Runs after phase
+# 10, so the gateway container is stopped when it starts, and it leaves it
+# stopped.
+echo ""
+echo "Phase 11: NAT rebuild past default socket limits"
+
+NATBIG_NAMES=400
+NATBIG_CAP=180
+NATBIG_SETTLE=30
+
+natbig_now() {
+    date -u +%s
+}
+
+natbig_slice() {
+    NATBIG_LOG=$(docker logs --timestamps --since "$NATBIG_STARTED" "$GATEWAY" 2>&1)
+}
+
+natbig_allocated() {
+    natbig_slice
+    NATBIG_ALLOCATED=$(grep -c "Allocated virtual IP" <<< "$NATBIG_LOG" || true)
+}
+
+# Rules the kernel holds right now. A failed listing is recorded through
+# NATBIG_RC, never read as a table with no rules.
+natbig_kernel() {
+    NATBIG_RC=0
+    NATBIG_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>&1) || NATBIG_RC=$?
+    NATBIG_DNAT=$(grep -cE "daddr fd01:[0-9a-f:]* .*dnat" <<< "$NATBIG_NFT" || true)
+    NATBIG_SNAT=$(grep -cE "saddr [0-9a-f:]+ .*snat" <<< "$NATBIG_NFT" || true)
+    NATBIG_MASQ=$(grep -c "masquerade" <<< "$NATBIG_NFT" || true)
+}
+
+natbig_phase() {
+    local config_file="$GENERATED_DIR/gateway/node-a.yaml"
+    local expect_rev
+    expect_rev=$(git -C "$SCRIPT_DIR" rev-parse --short=10 HEAD)
+
+    # Rewrite in place (same inode): the container sees the host file through
+    # a single-file bind mount, which a replace-by-rename would leave behind.
+    python3 - "$config_file" <<'PYEOF'
+import sys, yaml
+path = sys.argv[1]
+with open(path, "r+") as f:
+    cfg = yaml.safe_load(f)
+    cfg["gateway"]["dns"]["ttl"] = 1800
+    cfg["gateway"]["pool_grace_period"] = 1800
+    f.seek(0)
+    yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    f.truncate()
+PYEOF
+
+    docker start "$GATEWAY" >/dev/null
+    NATBIG_STARTED=$(docker inspect -f '{{.State.StartedAt}}' "$GATEWAY")
+    local t0
+    t0=$(natbig_now)
+    echo "  Gateway started at $NATBIG_STARTED (expect rev $expect_rev)"
+
+    local seen_ttl seen_grace
+    seen_ttl=$(docker exec "$GATEWAY" grep -c "ttl: 1800" /etc/fips/fips.yaml || true)
+    seen_grace=$(docker exec "$GATEWAY" grep -c "pool_grace_period: 1800" /etc/fips/fips.yaml || true)
+    if [ "$seen_ttl" -ge 1 ] && [ "$seen_grace" -ge 1 ]; then
+        check "NAT batch: container sees ttl 1800 and grace 1800" 0
+    else
+        check "NAT batch: container config rewrite (ttl: $seen_ttl, grace: $seen_grace)" 1
+        return 0
+    fi
+
+    if wait_for_peers "$GATEWAY" 2 60; then
+        check "NAT batch: gateway peers after restart" 0
+    else
+        check "NAT batch: gateway peers after restart" 1
+        return 0
+    fi
+    local ready=false probe
+    for _ in $(seq 1 60); do
+        probe=$(docker exec "$CLIENT" dig +short AAAA "${NPUB_B}.fips" @${GW_DNS} 2>/dev/null || true)
+        if echo "$probe" | grep -q "^fd01::"; then
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ready" = true ]; then
+        check "NAT batch: gateway DNS answers after restart" 0
+    else
+        check "NAT batch: gateway DNS answers after restart" 1
+        return 0
+    fi
+
+    sleep 1
+    natbig_allocated
+    local rev_lines
+    rev_lines=$(grep -cE "fips-gateway [^ ]+ \(rev ${expect_rev}\) starting" <<< "$NATBIG_LOG" || true)
+    if [ "$rev_lines" -eq 1 ]; then
+        check "NAT batch: startup line reads rev ${expect_rev}) with no -dirty" 0
+    else
+        check "NAT batch: startup line for rev ${expect_rev} (found $rev_lines)" 1
+        return 0
+    fi
+    local baseline="$NATBIG_ALLOCATED"
+    local target=$((baseline + NATBIG_NAMES))
+    echo "  Baseline allocations after readiness: $baseline; target $target"
+    if [ "$baseline" -ge 1 ]; then
+        check "NAT batch: readiness probe allocated (baseline $baseline)" 0
+    else
+        check "NAT batch: readiness probe allocated (baseline $baseline)" 1
+        return 0
+    fi
+
+    # Names: real keys, since the daemon parses each one as a public key.
+    local names_file have_names
+    names_file=$(mktemp)
+    docker exec "$GATEWAY" bash -c \
+        "for i in \$(seq 1 $NATBIG_NAMES); do fipsctl keygen --stdout; done" \
+        | grep '^npub1' >"$names_file" || true
+    have_names=$(wc -l <"$names_file")
+    if [ "$have_names" -lt "$NATBIG_NAMES" ]; then
+        check "NAT batch: generated $NATBIG_NAMES names (got $have_names)" 1
+        rm -f "$names_file"
+        return 0
+    fi
+
+    # Closed-loop AAAA driver, 4 workers, one fresh socket per query.
+    docker exec -i "$CLIENT" sh -c 'cat > /tmp/gw_natbig.py' <<'PYEOF'
+import random, socket, struct, sys, threading
+server = sys.argv[1]
+names = [n.strip() for n in sys.stdin if n.strip()]
+lock = threading.Lock()
+counts = {"answered": 0, "servfail": 0, "timeout": 0, "other": 0}
+def query(name):
+    qid = random.getrandbits(16)
+    pkt = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    for label in (name + ".fips").split("."):
+        raw = label.encode()
+        pkt += bytes([len(raw)]) + raw
+    pkt += b"\x00" + struct.pack(">HH", 28, 1)
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.settimeout(6)
+    try:
+        s.sendto(pkt, (server, 53))
+        while True:
+            data, _ = s.recvfrom(4096)
+            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == qid:
+                break
+    except socket.timeout:
+        return "timeout"
+    finally:
+        s.close()
+    flags, _, ancount = struct.unpack(">HHH", data[2:8])
+    rcode = flags & 0xF
+    if rcode == 2:
+        return "servfail"
+    if rcode == 0 and ancount > 0:
+        return "answered"
+    return "other"
+def worker():
+    while True:
+        with lock:
+            if not names:
+                return
+            name = names.pop()
+        outcome = query(name)
+        with lock:
+            counts[outcome] += 1
+threads = [threading.Thread(target=worker) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(" ".join(f"{k}={v}" for k, v in counts.items()))
+PYEOF
+
+    local remaining out rc=0
+    remaining=$((NATBIG_CAP - ($(natbig_now) - t0)))
+    # timeout reads 0 as no limit and refuses a negative duration.
+    if [ "$remaining" -le 0 ]; then
+        check "NAT batch: setup exceeded ${NATBIG_CAP}s cap" 1
+        rm -f "$names_file"
+        return 0
+    fi
+    out=$(docker exec -i "$CLIENT" timeout "$remaining" \
+        python3 /tmp/gw_natbig.py "$GW_DNS" <"$names_file" 2>&1) || rc=$?
+    rm -f "$names_file"
+    echo "  [$(($(natbig_now) - t0))s] sent $NATBIG_NAMES names: $out (rc=$rc)"
+    natbig_allocated
+    if [ "$rc" -eq 0 ] && [ "$NATBIG_ALLOCATED" -eq "$target" ]; then
+        check "NAT batch: $NATBIG_ALLOCATED live mappings allocated" 0
+    else
+        check "NAT batch: live mappings allocated ($NATBIG_ALLOCATED of $target, rc $rc)" 1
+    fi
+
+    # Settle on the kernel: wait until it holds a DNAT rule per allocation,
+    # or the cap expires. Reaching the cap decides nothing by itself; the
+    # checks below do.
+    local settle=0
+    natbig_kernel
+    while [ "$NATBIG_DNAT" -ne "$NATBIG_ALLOCATED" ] && [ "$settle" -lt "$NATBIG_SETTLE" ]; do
+        sleep 1
+        settle=$((settle + 1))
+        natbig_kernel
+    done
+    # An error logged just after the last commit still counts.
+    sleep 2
+    natbig_kernel
+    natbig_allocated
+    local nat_fail
+    nat_fail=$(grep -c "Failed to add NAT rules" <<< "$NATBIG_LOG" || true)
+    echo "  [$(($(natbig_now) - t0))s] allocated=$NATBIG_ALLOCATED nat_add_fail=$nat_fail" \
+        "table_rc=$NATBIG_RC dnat=$NATBIG_DNAT snat=$NATBIG_SNAT masquerade=$NATBIG_MASQ settle=${settle}s"
+    if [ "$nat_fail" -gt 0 ]; then
+        grep "Failed to add NAT rules" <<< "$NATBIG_LOG" | sed 's/\x1b\[[0-9;]*m//g' \
+            | sed -n '1p;$p' | sed 's/^/    /'
+    fi
+
+    if [ "$nat_fail" -eq 0 ]; then
+        check "NAT batch: no NAT rebuild failed" 0
+    else
+        check "NAT batch: NAT rebuilds failed ($nat_fail)" 1
+    fi
+    if [ "$NATBIG_RC" -eq 0 ]; then
+        check "NAT batch: nft lists the fips_gateway table" 0
+    else
+        check "NAT batch: nft list table failed (rc $NATBIG_RC)" 1
+    fi
+    if [ "$NATBIG_DNAT" -eq "$NATBIG_ALLOCATED" ] && [ "$NATBIG_SNAT" -eq "$NATBIG_ALLOCATED" ]; then
+        check "NAT batch: kernel holds a DNAT and SNAT rule per mapping ($NATBIG_DNAT)" 0
+    else
+        check "NAT batch: kernel rules (dnat $NATBIG_DNAT, snat $NATBIG_SNAT, allocated $NATBIG_ALLOCATED)" 1
+    fi
+    if [ "$NATBIG_MASQ" -eq 2 ]; then
+        check "NAT batch: fips0 and LAN masquerades present" 0
+    else
+        check "NAT batch: masquerade rules ($NATBIG_MASQ, expected 2)" 1
+    fi
+
+    docker stop --time=10 "$GATEWAY" >/dev/null 2>&1 || true
+    echo "  Phase time: $(($(natbig_now) - t0))s"
+}
+
+natbig_phase
+
 echo ""
 echo "=== Results: $PASSED passed, $FAILED failed ==="
 [ "$FAILED" -eq 0 ] && exit 0 || exit 1

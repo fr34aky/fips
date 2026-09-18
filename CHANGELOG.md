@@ -147,6 +147,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now share a single batch, which the kernel applies as one transaction, so a
   refused rebuild leaves the previous table in the packet path. The rules sent
   are unchanged.
+- The gateway's NAT rebuild no longer fails once the table holds more than
+  about 105 mappings. Each rebuild is one netlink batch. From about 105
+  mappings the default socket buffers could not hold its acknowledgements, so
+  rebuilds were logged as failed although they had taken effect. Past about
+  313 mappings the buffers could not hold the batch itself, and new `.fips`
+  names past that count got a virtual IP with no translation. In releases with
+  the gateway through 0.5.1, a rebuild past about 313 mappings also deleted the
+  whole `fips_gateway` table, which stopped every mapping, the `fips0`
+  masquerade and the port forwards. The rebuild now sizes its send buffer to
+  the batch and requests one acknowledgement per batch, and NAT errors now
+  name the kernel errno. A rebuild that still fails is logged, and the next
+  successful rebuild installs the mapping.
 - A new OpenWrt install no longer enables and starts `fips-gateway`. The
   generated postinst turned it on unconditionally, contradicting the init
   script's own header, the package README and the deployment tutorial, all of
