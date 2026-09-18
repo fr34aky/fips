@@ -62,12 +62,18 @@ The supported releases, from [Netgate's version
 table](https://docs.netgate.com/pfsense/en/latest/releases/versions.html)
 as of September 2026:
 
-| Release | FreeBSD base | pkg ABI | Build host needed |
+| Release | FreeBSD base | pkg ABI | Build host |
 |---|---|---|---|
 | pfSense CE 2.8.1 | 15.0-CURRENT | `FreeBSD:15:amd64` | FreeBSD 15, amd64 |
-| pfSense CE 2.9.0 | 16.0-CURRENT | `FreeBSD:16:amd64` | FreeBSD 16, amd64 |
-| pfSense Plus 26.03.1 / 26.07, Intel | 16.0-CURRENT | `FreeBSD:16:amd64` | FreeBSD 16, amd64 |
+| pfSense CE 2.9.0 | 16.0-CURRENT | `FreeBSD:16:amd64` | FreeBSD 15 build, relabelled (see below) |
+| pfSense Plus 26.03.1 / 26.07, Intel | 16.0-CURRENT | `FreeBSD:16:amd64` | FreeBSD 15 build, relabelled (see below) |
 | pfSense Plus 26.03.1 / 26.07, ARM | 16.0-CURRENT | `FreeBSD:16:aarch64` | FreeBSD 16, **aarch64** |
+
+CE 2.8.1 can no longer be installed: the 2.8 line shipped only through
+the Netgate installer, which offers the current release, and the public
+mirror stops at the 2.7.2 ISOs. Its package serves existing 2.8.1
+installs and can only be tested on plain FreeBSD 15. Every pfSense a new
+user can install runs FreeBSD 16.
 
 CE has only ever shipped for amd64; Netgate has said there are no plans
 for an ARM CE image. Plus 24.x and 25.x are end-of-life and deliberately
@@ -113,7 +119,7 @@ difference decides which may be published:
 | Artifact | linkage | toolchain pin | CI |
 |---|---|---|---|
 | `…-pfsense-ce2.8-amd64.pkg` | static | honoured | built, checked, install-smoked; workflow artifact |
-| `…-pfsense-ce2.9-plus26-amd64.pkg` | static | honoured | not built — CI has no FreeBSD 16 host |
+| `…-pfsense-ce2.9-plus26-amd64.pkg` | static | honoured | built (the CE 2.8 binaries, relabelled), checked; workflow artifact |
 | `…-pfsense-plus26-aarch64.pkg` | dynamic | **not** honoured | not built — build it yourself |
 
 No pfSense package is attached to a release. It is built and checked in
@@ -128,15 +134,23 @@ log following to the new `/var/log/fips.log`, then `pkg delete`. That is
 the same script to run first on a real box; its header says what a
 plain-FreeBSD pass does not prove.
 
-The two absences are not the same. The FreeBSD 16 Intel package builds
-cleanly with the pinned compiler and links statically, so it is
-releasable in principle and waits only on a FreeBSD 16 amd64 builder;
-the CI VM is 15.1 and `vmactions/freebsd-vm` offers nothing newer, and
-FreeBSD 16 is not released, so such a builder means a moving
-16.0-CURRENT snapshot. Until then, CI builds and checks only the package
-for the *older* supported CE release, as a workflow artifact. ARM cannot
-honour the pin at all, so it
-stays build-it-yourself regardless of infrastructure.
+The FreeBSD 16 Intel package is the FreeBSD 15 package's binaries under
+a `FreeBSD:16:amd64` label: the CI job builds once on FreeBSD 15.1 and
+runs `build-pkg.sh --no-build --abi FreeBSD:16:amd64` for the second
+package. That is the direction FreeBSD's binary compatibility runs,
+older binaries on a newer kernel, so no FreeBSD 16 build host is needed
+while 16 has no release (the CI VM is 15.1 and `vmactions/freebsd-vm`
+offers nothing newer; a 16.0-CURRENT snapshot would also be *newer*
+than any Netgate base, the direction that is not promised). The
+relabelled package has been run on pfSense Plus 26.03.1 and 26.07; see
+the test record at the end. What CI cannot do with it is `pkg add`, since
+pkg refuses a package whose ABI major differs from the host's: the
+install smoke runs on the FreeBSD 15 package, which carries the same
+bytes, and the checker verifies the label against the binaries from the
+outside. This holds as long as the code builds on 15.1 without needing
+something only 16 provides; if that changes, a FreeBSD 16 build host is
+needed again. ARM cannot honour the pin at all, so it stays
+build-it-yourself regardless of infrastructure.
 
 ### There is no cross-compiling out of this
 
@@ -211,18 +225,22 @@ annotations, and flags `pin_honoured: no` in its output.
 ### FreeBSD 16 is not released
 
 pfSense CE 2.9 and Plus 26.x are built from FreeBSD **16.0-CURRENT**, a development
-branch; 16.0-RELEASE does not exist yet. So a FreeBSD 16 builder means a
-[16.0-CURRENT snapshot](https://download.freebsd.org/snapshots/), not a
-release image — and `vmactions/freebsd-vm`, which this repo's CI uses,
-only goes up to 15.1.
+branch; 16.0-RELEASE does not exist yet. A FreeBSD 16 build host would
+therefore be a [16.0-CURRENT
+snapshot](https://download.freebsd.org/snapshots/), not a release image,
+and one that is months *newer* than any Netgate base (their releases
+track a `main` commit from several months earlier). Binaries built there
+would run on the appliance in the direction FreeBSD does not promise.
+That is why the FreeBSD 16 amd64 package is not built on 16 at all but is
+the FreeBSD 15.1 static build relabelled, which runs in the promised
+direction and has been verified on Plus 26.03.1 and 26.07.
 
-That makes base-library drift a real risk rather than a theoretical one:
-Netgate's `16.0-CURRENT@<hash>` and a FreeBSD snapshot from another date
-are different trees, and a binary can reference a symbol the appliance's
-`libc` does not export. It installs and then fails to start. If `fips`
-exits immediately with a linker error, that is this. Build from a
-snapshot close to the appliance's base, and check what the binary
-actually needs:
+The drift is real for a `--dynamic` build, on either major: Netgate's
+`16.0-CURRENT@<hash>` and a FreeBSD tree from another date are different
+trees, and a binary can reference a symbol the appliance's `libc` does
+not export. It installs and then fails to start. If `fips` exits
+immediately with a linker error, that is this. Build from a base no newer
+than the appliance's, and check what the binary actually needs:
 
 ```sh
 pkg info -F <the .pkg> | grep -A5 "Shared Libs"   # on the build host
@@ -235,6 +253,7 @@ ldd /usr/local/bin/fips                           # on the appliance
 gmake -C packaging pfsense        # or:
 ./packaging/pfsense/build-pkg.sh            # cargo build --release + pkg create
 ./packaging/pfsense/build-pkg.sh --no-build # package existing release binaries
+./packaging/pfsense/build-pkg.sh --no-build --abi FreeBSD:16:amd64  # the same binaries, labelled for FreeBSD 16
 ./packaging/pfsense/build-pkg.sh --dynamic  # link against libc.so.7 (see below)
 ```
 
@@ -259,8 +278,10 @@ appliance's, which is the direction that breaks: the binary references a
 versioned symbol the appliance does not export, installs cleanly, and
 then will not start. A dynamic package needs `libc.so.7`, `libm.so.5`,
 `libthr.so.3` and `libgcc_s.so.1` to agree with it; a static one
-declares no shared libraries at all. What is left is the kernel syscall
-ABI, which is stable within a FreeBSD major.
+declares no shared libraries at all. What is left is the kernel's
+binary compatibility, which FreeBSD promises in one direction only:
+binaries from an older release run on a newer kernel. Build on a base no
+newer than the appliance's.
 
 That is also why a static package survives a pfSense firmware upgrade's
 change of base, where a dynamic one is pinned to the image it was built
@@ -492,8 +513,9 @@ pfctl -ss | grep tun                        # mesh state entries
 ```
 
 `ifconfig <tun-name>` prints `Opened by PID <n>` for the process holding
-a tun device. The interface is destroyed automatically when the daemon
-exits.
+a tun device. After the daemon exits the interface stays listed, down,
+without an address and with nobody holding it (observed on Plus 26.03.1
+and 26.07); the next start opens it again.
 
 ## What is and is not tested
 
@@ -517,23 +539,36 @@ answering) and its DNS Forwarder branch.
 (`fips-dns-teardown` has since been run on the same box and restored
 `custom_options` byte for byte.)
 
-The FreeBSD 16 amd64 package has been run once on pfSense Plus
-26.07-RELEASE amd64, in a KVM virtual machine installed with the Netgate
-installer (the same `FreeBSD:16:amd64` package serves CE 2.9.0). That
-package was built outside `master`'s CI, which builds no FreeBSD 16
-package, on the 16.0-CURRENT 20260907 snapshot:
-`pkg add`, the boot script through start, re-entrant start, restart and
-stop with the daemon answering `fipsctl` and DNS, `pfSctl -c 'service
-reload packages'` (the WAN-address-change path) leaving the running
-daemon alone, a reboot bringing up exactly one daemon with the DNS
-Resolver block regenerated from `config.xml`, `fips-dns-teardown`
-leaving `custom_options` empty as it was, and `pkg delete`. That run
-found the defect fixed alongside this text: `fips-dns-setup` wrote the
-block and reported "updated and restarted", but the running unbound was
-never restarted and answered NXDOMAIN for `.fips` until it was. What the
-VM did not cover: mesh traffic (no peer), the TUN datapath under pf, and
-CE itself. The CE 2.8.1 (FreeBSD 15) package is still built and checked
-only.
+**amd64 on pfSense.** The FreeBSD 16 amd64 package has been run on
+pfSense Plus in KVM virtual machines installed with the Netgate
+installer, so on Netgate's kernel. First a package built on the
+16.0-CURRENT 20260907 snapshot, on Plus 26.07; that run found that
+`fips-dns-setup` never restarted a running unbound. Then the package CI
+now produces, the FreeBSD 15.1 build relabelled, on both Plus 26.03.1
+(`plus-RELENG_26_03_1-n256546-1d1bfd578383`, `kern.osreldate` 1600011)
+and Plus 26.07 (`plus-RELENG_26_07-n256584-8183aef9d019`, 1600018), with
+the same result on each: `testing/pfsense-install-smoke.sh` (45 checks),
+the TUN interface up with its mesh address, the responder answering the
+node's own name directly, `fips-dns-setup` writing the block and `.fips`
+resolving through unbound once the resolver was restarted (that package
+predates the fix that makes `fips-dns-setup` do it), `pfSctl -c 'service
+reload packages'` leaving the running daemon alone, a reboot bringing up
+exactly one daemon with the DNS Resolver block regenerated and resolving,
+`fips-dns-teardown` leaving `custom_options` as it was, and `pkg delete`
+against the running daemon. The two boxes were then peered with each
+other over UDP (a pass-in rule on the tun interface loaded into pf's
+`userrules` anchor, the "accept inbound deliberately" posture above):
+the link authenticated, `ping6` across the mesh ran 200 packets of 56
+bytes and 100 of 1100 bytes each way with no loss, and 10 MiB by TCP each
+way arrived byte-exact. Packets above the daemon's effective MTU (1203
+bytes over the 1280-byte UDP transport) are answered with ICMPv6 Packet
+Too Big and TCP is MSS-clamped, as the no-fragmentation policy in
+`docs/design/fips-mtu.md` says, so a fixed-size `ping6 -s 1160` or larger
+shows loss by design on every platform. What the VMs did not cover:
+physical hardware, and CE 2.9.0 (no installer at hand).
+The CE 2.8.1 (FreeBSD 15) package carries the same binaries and is
+install-smoked on plain FreeBSD 15.1 in CI; it cannot be run on pfSense
+because CE 2.8.1 media no longer exists.
 
 Left behind by `pkg delete`, by design or as known gaps:
 `/usr/local/etc/fips/fips.key` if the daemon generated one (it may be the
