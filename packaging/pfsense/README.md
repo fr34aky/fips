@@ -118,14 +118,17 @@ difference decides which may be published:
 
 | Artifact | linkage | toolchain pin | CI |
 |---|---|---|---|
-| `…-pfsense-ce2.8-amd64.pkg` | static | honoured | built, checked, install-smoked; workflow artifact |
-| `…-pfsense-ce2.9-plus26-amd64.pkg` | static | honoured | built (the CE 2.8 binaries, relabelled), checked; workflow artifact |
+| `…-pfsense-ce2.8-amd64.pkg` | static | honoured | built, checked, install-smoked; release asset |
+| `…-pfsense-ce2.9-plus26-amd64.pkg` | static | honoured | built (the CE 2.8 binaries, relabelled), checked; release asset |
 | `…-pfsense-plus26-aarch64.pkg` | dynamic | **not** honoured | not built — build it yourself |
 
-No pfSense package is attached to a release. It is built and checked in
-its own CI job (so a pfSense-only failure reds that job without blocking
-the FreeBSD asset) and kept as a 30-day workflow artifact, until one has
-been installed on a real pfSense box. "Install-smoked" means
+Both Intel packages are release assets: each tagged release carries
+them next to the FreeBSD package, with their SHA-256 in
+`checksums-freebsd.txt`. They are built and checked in their own CI job,
+so a pfSense-only failure reds that job by name, and the release job
+needs it, so such a failure holds the release rather than shipping
+without them. On every other ref the job's output is a 30-day workflow
+artifact for anyone to test. "Install-smoked" means
 `testing/pfsense-install-smoke.sh` ran it on the plain FreeBSD VM of the
 same major: `pkg add`, the boot script's start, re-entrant start, restart
 and stop with the real daemon answering `fipsctl` and DNS queries, a
