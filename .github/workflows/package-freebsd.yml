@@ -260,6 +260,16 @@ jobs:
       - name: Set SOURCE_DATE_EPOCH from git
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
+      - name: Lint the install smoke test
+        # Same arrangement as package-openwrt.yml's install-nak.sh lint: the
+        # script does not ship in the package, so the guards for shipped sh
+        # scripts do not apply. It is plain sh because pfSense has no bash.
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --shell=sh testing/pfsense-install-smoke.sh
+
       - name: Build and check the pfSense package in a FreeBSD VM
         uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1
         env:
@@ -289,6 +299,10 @@ jobs:
             PKG=$(ls deploy/fips-*-pfsense-*.pkg)
             testing/check-pfsense-pkg.sh "$PKG"
             php -l packaging/pfsense/fips-unbound-custom.php
+            # Install it and run the daemon through the boot script's life on
+            # this FreeBSD 15 kernel; see the script header for what that does
+            # and does not prove about pfSense itself.
+            testing/pfsense-install-smoke.sh "$PKG"
 
             ( cd deploy && sha256 -q "$(basename "$PKG")" \
                 | { read -r h; printf '%s  %s\n' "$h" "$(basename "$PKG")"; } \
