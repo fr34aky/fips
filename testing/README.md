@@ -110,7 +110,9 @@ it the suite builds one through `packaging/debian/build-deb-container.sh`.
 
 Installs the built `.deb` in systemd containers for each
 target distro and verifies unit enablement, conffile placement and
-end-to-end `.fips` resolution as a user would meet it.
+end-to-end `.fips` resolution as a user would meet it. GitHub CI also
+installs the arm64 package on ubuntu22 on an arm64 runner, a leg the
+local run cannot have and the parity check reports as GitHub-only.
 
 ### [boringtun/](boringtun/) -- WireGuard Throughput Baseline
 

@@ -40,6 +40,10 @@ env:
 #                    unreliable on GitHub-hosted runners.
 #   tor-directory  — same; live Tor dependency.
 #
+# Deliberate GitHub-only: the arm64 install leg (ubuntu22). The local host is
+# x86_64 and has no arm64 execution; the leg is compared by distribution only
+# and does not stand in for the amd64 leg of the same distribution.
+#
 # The two runners express the same work in different matrix shapes, and the
 # parity guard compares through that shape rather than around it: chaos legs
 # are compared per scenario (and per flag) via their `scenario:` field,
@@ -787,10 +791,23 @@ jobs:
 # floor violation stops the run.
 # ─────────────────────────────────────────────────────────────────────────────
   deb-package:
-    name: Build .deb
-    runs-on: ubuntu-latest
+    name: Build .deb${{ matrix.deb_arch == 'arm64' && ' (arm64)' || '' }}
+    runs-on: ${{ matrix.os }}
     needs: [build, test]
     if: ${{ !inputs.skip_integration }}
+
+    # The arm64 leg builds natively on an arm runner so the arm64 package the
+    # release ships is install-tested too (job 5). Being one job, both legs
+    # gate job 5 and the dns-resolver job: an arm64 build failure skips the
+    # amd64 install legs on that run as well.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            deb_arch: amd64
+          - os: ubuntu-24.04-arm
+            deb_arch: arm64
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -824,11 +841,23 @@ jobs:
           path: ${{ runner.temp }}/deb-builder-image.tar
           key: ${{ steps.builder.outputs.key }}
 
+      # The package path is the script's last line of stdout. A leg that
+      # produced the other architecture's package goes red here rather than
+      # handing an amd64 package to the arm64 install leg.
       - name: Build the .deb in the pinned build container
         timeout-minutes: 30
+        shell: bash
         run: |
+          set -euo pipefail
           bash packaging/debian/build-deb-container.sh --output-dir deploy \
-            --image-archive "$RUNNER_TEMP/deb-builder-image.tar"
+            --image-archive "$RUNNER_TEMP/deb-builder-image.tar" \
+            | tee "$RUNNER_TEMP/build-deb-container.log"
+          deb=$(tail -n 1 "$RUNNER_TEMP/build-deb-container.log")
+          [ -f "$deb" ] || { echo "build-deb-container.sh did not name a package: '$deb'" >&2; exit 1; }
+          case "$deb" in
+            *_${{ matrix.deb_arch }}.deb) ;;
+            *) echo "Package $deb is not ${{ matrix.deb_arch }}" >&2; exit 1 ;;
+          esac
 
       # On a cache miss the archive exists only if the script built the image
       # and saved it, so its presence is what says there is something to save.
@@ -856,8 +885,8 @@ jobs:
       - name: Upload the .deb
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fips-deb
-          path: deploy/fips_*.deb
+          name: fips-deb-${{ matrix.deb_arch }}
+          path: deploy/fips_*_${{ matrix.deb_arch }}.deb
           if-no-files-found: error
           retention-days: 1
 
@@ -901,7 +930,7 @@ jobs:
       - name: Download the .deb
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: fips-deb
+          name: fips-deb-amd64
           path: _deb
 
       - name: Run dns-resolver test
@@ -944,11 +973,12 @@ jobs:
 #
 # The legs keep `type: deb-install` and `scenario:` because
 # testing/check-ci-parity.sh reads those to match this matrix against the local
-# suite's distro list; the steps below use `scenario:` only.
+# suite's distro list; it reads `arch:` too, and compares only the amd64 legs
+# with the local run. The steps below use `scenario:` and `arch:`.
 # ─────────────────────────────────────────────────────────────────────────────
   deb-install:
-    name: Deb install (${{ matrix.scenario }})
-    runs-on: ubuntu-latest
+    name: Deb install (${{ matrix.scenario }}${{ matrix.arch == 'arm64' && ' arm64' || '' }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     needs: [deb-package]
     if: ${{ !inputs.skip_integration }}
 
@@ -958,14 +988,27 @@ jobs:
         include:
           - type: deb-install
             scenario: debian12
+            arch: amd64
           - type: deb-install
             scenario: debian13
+            arch: amd64
           - type: deb-install
             scenario: ubuntu22
+            arch: amd64
           - type: deb-install
             scenario: ubuntu24
+            arch: amd64
           - type: deb-install
             scenario: ubuntu26
+            arch: amd64
+          # The arm64 package on the oldest supported distribution: a fresh
+          # install and a daemon start. Deliberately GitHub-only (the local host
+          # is x86_64), and deliberately one leg: the upgrade, purge and
+          # conffile paths run under debian12 on amd64 only and stay
+          # unexercised on arm64.
+          - type: deb-install
+            scenario: ubuntu22
+            arch: arm64
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -973,7 +1016,7 @@ jobs:
       - name: Download the .deb
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: fips-deb
+          name: fips-deb-${{ matrix.arch }}
           path: _deb
 
       - name: Run deb-install scenario

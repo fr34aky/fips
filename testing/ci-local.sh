@@ -114,6 +114,11 @@
 #                    unreliable on GitHub-hosted runners.
 #   tor-directory  — same; live Tor dependency.
 #
+# Deliberate GitHub-only (NOT in this local run), with reason:
+#   deb-install ubuntu22 on arm64 — this host is x86_64 and cannot run an
+#                    arm64 package. The guard compares it by distro only and
+#                    does not let it stand in for the amd64 ubuntu22 leg.
+#
 # The two runners express the same work in different matrix shapes, and the
 # guard compares through that shape rather than around it: chaos legs are
 # compared per scenario (and per flag), deb-install legs per distro. The one

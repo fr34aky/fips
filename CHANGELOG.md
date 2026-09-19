@@ -283,6 +283,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning and a rebuild, never a failed build. A cached image is not refreshed
   from apt or the base image until the base image name, the toolchain or
   `Dockerfile.build` changes, as was already true of a developer's machine.
+- CI now builds the arm64 `.deb` on an arm64 runner and installs it on Ubuntu
+  22.04, the oldest supported distribution, starting the daemon, on every push
+  and pull request. Until now the arm64 package was floor-checked and never
+  installed anywhere in the pipeline. Its upgrade, purge and conffile paths
+  remain unexercised; those run on amd64 only. The parity check reads each
+  install leg's architecture, so the arm64 leg is reported as GitHub-only and
+  cannot stand in for a missing amd64 leg of the same distribution.
 
 ## [0.5.1] - 2026-09-06
 
