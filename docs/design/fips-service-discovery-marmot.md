@@ -56,8 +56,9 @@ follow explain each row.
 | How members learn services | Locate and Fetch only | Also as group messages over the relays, so Locate becomes optional for members |
 | Deniability among members | Full: records and sealed locators are unsigned | Records sent as group messages are signed by the sender's MLS leaf key, so members hold an attributable transcript |
 | What outsiders see | An opaque key in service filters; the provider's tree neighbours can tell where it originates | The same, plus relays see ciphertext posted to an opaque group id |
+| Identity visible to outsiders | No npub. Nothing is published; records and sealed locators reach members only. Transit nodes on the path see the provider's `NodeAddr` (a hash of its pubkey) in the session that follows a query | The same, plus the *account* npub is public on the relays: KeyPackages (kind `30443`) and the relay lists (kinds `10050`, `10002`) are ordinary signed events. They show that the key uses Marmot, not which group it is in |
 | When infrastructure fails | Nothing to fail | With no relay reachable, membership freezes; discovery continues on the last known epoch |
-| Exposure of the node key | None | Avoided only through the delegated account key, which adds a signed delegation per node |
+| Access to the node's *private* key outside the daemon | None | Avoided only through the delegated account key, which adds a signed delegation per node |
 | Work needed upstream in Marmot | None | An exporter label and a `discovery_id` component have to be registered |
 
 As a rule of thumb: a static group fits a small, stable set of nodes
@@ -260,6 +261,16 @@ learns that *someone* posted to *some* group.
   a quiet group keeps its keys until someone self-updates.
 - **A second process and a second key** on every member, with the
   delegation that ties them to the node.
+- **It publishes account metadata.** To be invitable, a member
+  publishes KeyPackages (kind `30443`) and its relay lists (kind
+  `10050` for the Welcome inbox, kind `10002` for finding its
+  KeyPackages) as ordinary Nostr events signed by the account key.
+  Anyone who can read those in-mesh relays learns that the key uses
+  Marmot, though not which group it belongs to. A static group
+  publishes nothing at all. With a delegated account key the exposed
+  key is the account's, not the node's; the delegation that links the
+  two travels only inside the group. Group messages themselves are
+  signed by throwaway keys and do not reveal the sender.
 
 ## Phasing
 
