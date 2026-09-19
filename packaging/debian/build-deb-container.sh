@@ -12,9 +12,10 @@
 # Usage: build-deb-container.sh [--output-dir DIR] [--version V] [--features LIST]
 #                               [--rebuild-image]
 #
-# Requires docker. The image is cached between runs and rebuilt only when the
-# Dockerfile or the floor changes; the source is mounted rather than copied, so
-# editing code does not invalidate it.
+# Requires docker. The image is cached between runs under a tag made of the
+# floor image, the Rust toolchain and a hash of Dockerfile.build, so a change to
+# any of the three builds a new image; the source is mounted rather than copied,
+# so editing code does not invalidate it.
 
 set -euo pipefail
 
@@ -35,7 +36,7 @@ while [[ $# -gt 0 ]]; do
         --version)       VERSION="${2:?missing value for --version}"; shift 2 ;;
         --features)      FEATURES="${2:?missing value for --features}"; shift 2 ;;
         --rebuild-image) REBUILD_IMAGE=1; shift ;;
-        -h|--help)       sed -n '2,17p' "$0"; exit 0 ;;
+        -h|--help)       sed -n '2,18p' "$0"; exit 0 ;;
         *)               echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -47,13 +48,21 @@ command -v docker >/dev/null 2>&1 || {
 
 # Read the toolchain from the pin rather than choosing one here, and put it in
 # the tag so a bump rebuilds the image instead of silently reusing a stale one.
+# The Dockerfile's content goes in the tag for the same reason: without it a
+# host that has the image cached keeps using it after the Dockerfile changes.
 RUST_TOOLCHAIN=$(awk -F'"' '/^channel *=/{print $2; exit}' "$REPO_ROOT/rust-toolchain.toml")
 [ -n "$RUST_TOOLCHAIN" ] || {
     echo "build-deb-container: could not read channel from rust-toolchain.toml" >&2
     exit 2
 }
 
-IMAGE_TAG="fips-deb-builder:${FIPS_BUILD_IMAGE//[:\/]/-}-rust${RUST_TOOLCHAIN}"
+DOCKERFILE_HASH=$(sha256sum "$SCRIPT_DIR/Dockerfile.build" | cut -c1-12) || DOCKERFILE_HASH=""
+[[ "$DOCKERFILE_HASH" =~ ^[0-9a-f]{12}$ ]] || {
+    echo "build-deb-container: could not hash $SCRIPT_DIR/Dockerfile.build" >&2
+    exit 2
+}
+
+IMAGE_TAG="fips-deb-builder:${FIPS_BUILD_IMAGE//[:\/]/-}-rust${RUST_TOOLCHAIN}-${DOCKERFILE_HASH}"
 
 if [ "$REBUILD_IMAGE" -eq 1 ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     echo "=== Building $IMAGE_TAG from $FIPS_BUILD_IMAGE with Rust $RUST_TOOLCHAIN ===" >&2
@@ -67,10 +76,10 @@ else
     echo "=== Using cached $IMAGE_TAG ===" >&2
 fi
 
-# Derive the version and the timestamp on the host, where git works, and pass
-# both in. The container then never runs git, which matters for two reasons: a
-# worktree's .git is a file pointing outside the mount and would not resolve,
-# and a bind-mounted repository trips git's dubious-ownership check.
+# Derive the version and the timestamp on the host and pass both in, because a
+# worktree's .git is a file pointing outside the mount and does not resolve in
+# the container. The image's git is there only for build.rs's revision, which is
+# empty for a worktree build for the same reason.
 if [ -z "$VERSION" ]; then
     CRATE_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO_ROOT/Cargo.toml")
     if [[ "$CRATE_VERSION" == *-dev ]]; then
@@ -100,7 +109,8 @@ if [ -n "$FEATURES" ]; then
     # it is also what marks the version so a feature package is distinguishable
     # from the default build of the same commit. It refuses --features with
     # --no-build for that reason, so the two cases cannot share one command.
-    # The version still comes from the host, because the image has no git.
+    # The version still comes from the host, because a worktree's .git does
+    # not resolve inside the mount.
     BUILD_CMD="packaging/debian/build-deb.sh --features '$FEATURES' --version '$VERSION' --output-dir /out --name-file /name/deb"
 else
     BUILD_CMD="cargo build --release --locked

@@ -245,6 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states a floor lower or higher than the one they need. A dependency the
   packaging tool drops, including one it drops after only a warning when it
   cannot resolve a binary, now fails the build instead of shipping.
+- `-V` on binaries built into the Linux packages now includes the source
+  revision, as `<version> (rev <git-hash>)`. The build image had no git, so
+  every container-built binary printed the version alone. A package built from
+  a git worktree still has no revision, because the worktree's git directory is
+  outside the tree the build sees. The build image's tag now includes a hash of
+  its Dockerfile, so a host with an older image cached builds a new one instead
+  of reusing it.
 
 ### Changed
 
