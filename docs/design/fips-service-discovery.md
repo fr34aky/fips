@@ -138,7 +138,9 @@ signed with the node's identity key; there is no separate service key.
 | `scheme` | no | URL scheme a client should use (`http`, `ws`, …). |
 | `path` | no | URL path prefix. |
 | `name` | no | Self-asserted display label. Not unique, not trusted. |
-| `expiration` | yes | NIP-40 expiry. Records are short-lived and refreshed. |
+| `expiration` | signed records | NIP-40 expiry. Records are short-lived and refreshed. |
+| `valid_until` | Marmot inner records | Same meaning as `expiration`, for records sent inside a Marmot group, where a sender's `expiration` tag does not survive. See [Records by scope](#records-by-scope). |
+| `-` | restricted records | NIP-70 protected-event marker. A receiver must not republish or re-serve the record; NIP-70-aware relays refuse it from anyone but the author. |
 
 `content` may hold service-specific JSON (for a relay, a subset of its
 NIP-11 document). A record is capped at 1024 bytes so that it always
@@ -149,6 +151,9 @@ Rules a consumer applies:
 
 - The event signature must verify, and the address to connect to is
   *derived from `pubkey`*. The record has no address field on purpose.
+  An unsigned record is accepted only in the two forms described under
+  [Records by scope](#records-by-scope), where the channel it arrived
+  on authenticates `pubkey` instead.
 - When fetched directly, `pubkey` must equal the authenticated session
   peer. A node only serves its own records on the fetch port.
 - Newer `created_at` replaces older for the same `(pubkey, d)`.
@@ -169,6 +174,101 @@ discovery (kind 30166) describes relays as observed by monitors, not
 self-announced endpoints; NIP-89 (kind 31990) maps event kinds to
 handler apps; DNS-SD has the right vocabulary (and is reused for the
 DNS view below) but no signatures and assumes multicast.
+
+#### Records by scope
+
+The record always says *what* is offered. The group never appears in
+it: a group name is a local label and a group secret is a secret. The
+scope (see [Scopes and groups](#scopes-and-groups)) decides who
+receives the record, over which channel, and whether it is signed.
+
+| Scope | Form | Delivered over |
+| ----- | ---- | -------------- |
+| `public` | Signed event, as above | Fetch port; optionally directories |
+| `allow` (npub list) | Signed event with a `["-"]` tag | Fetch port only, to session peers on the list |
+| `secret`, static | Unsigned event with a `["-"]` tag | Fetch port only, after the group proof |
+| `secret`, Marmot-managed | Unsigned Marmot inner event inside a kind `445` group message | In-mesh relays; also the fetch port |
+
+An **npub-list** record is the public record plus the protected
+marker. It is never published to a relay.
+
+```json
+{
+  "kind": 37196,
+  "pubkey": "<node pubkey>",
+  "created_at": 1790000000,
+  "tags": [
+    ["d", "blossom:3000"],
+    ["s", "blossom"],
+    ["port", "3000", "tcp"],
+    ["scheme", "http"],
+    ["name", "family photos"],
+    ["expiration", "1790003600"],
+    ["-"]
+  ],
+  "content": "",
+  "id": "…",
+  "sig": "<signed by the node key>"
+}
+```
+
+A **static secret group** record has the same fields and tags but no
+`sig`. The Noise XK session on the fetch port already authenticates
+the provider, and `pubkey` must equal the session peer. A signed copy
+would be transferable: a member who leaks it could prove to outsiders
+that the node offers the service. Without the signature the record is
+deniable, and it cannot be cached or relayed by anyone else, which is
+what a secret scope wants.
+
+A **Marmot-managed group** record has two layers. The inner event is
+what members read. It follows Marmot's application payload shape: the
+fields of a Nostr event with `id` but without `sig`, which Marmot
+forbids on inner events. MLS authenticates the sender, the sender's
+credential is the node pubkey, and a receiver checks that `pubkey`
+matches it, so the record stays bound to the node's address.
+
+```json
+{
+  "id": "<sha256 of the NIP-01 serialization>",
+  "pubkey": "<node pubkey>",
+  "created_at": 1790000000,
+  "kind": 37196,
+  "tags": [
+    ["d", "http:8080"],
+    ["s", "http"],
+    ["port", "8080", "tcp"],
+    ["name", "lab dashboard"],
+    ["valid_until", "1790003600"]
+  ],
+  "content": ""
+}
+```
+
+The inner event travels in an MLS application message, published as
+Marmot's kind `445`. This is all a relay sees:
+
+```json
+{
+  "kind": 445,
+  "pubkey": "<fresh ephemeral key, used once>",
+  "created_at": 1790000003,
+  "tags": [
+    ["h", "<nostr_group_id, 64 hex characters>"]
+  ],
+  "content": "<base64(nonce || ChaCha20-Poly1305(group_event_key, MLS message))>",
+  "id": "…",
+  "sig": "<signed by the ephemeral key>"
+}
+```
+
+The inner record uses `valid_until` rather than `expiration` because
+Marmot treats retention as group state, not a sender preference: a
+sender-supplied `expiration` tag is replaced or removed according to
+the group's message-retention component, and the outer kind `445`
+carries an `expiration` tag only when that component enables
+retention. A group used for discovery SHOULD enable retention of about
+the record lifetime (one hour), so that relays drop stale
+announcements.
 
 ### Locate: finding providers
 
@@ -507,15 +607,13 @@ Locate or a lookup confirms the provider is reachable.
 
 Secret-group records are never published to a directory as plain
 events, because the author pubkey alone would reveal that a node
-belongs to *some* group. A Marmot-managed group has a better channel:
-the record is sent as a Marmot application message. The inner event
-keeps the kind-37196 shape but is unsigned (Marmot forbids a `sig` on
-inner events; MLS authenticates the sender, and the sender's
-credential is the node pubkey, so address binding holds). The outer
-relay event is Marmot's kind `445`: signed by a fresh ephemeral key,
-tagged only with the group's `h` routing id, content encrypted under
-the epoch's group-event key. A relay learns that *someone* posted to
-*some* group.
+belongs to *some* group. Records of npub-list and static secret groups
+therefore stay off relays entirely. A Marmot-managed group has a
+better channel: the record is sent as a Marmot application message
+(both layers are shown under [Records by scope](#records-by-scope)).
+The outer relay event is signed by a fresh ephemeral key, tagged only
+with the group's `h` routing id, and encrypted under the epoch's
+group-event key. A relay learns that *someone* posted to *some* group.
 
 Two consequences. Members of a Marmot-managed group learn the group's
 services from group messages alone, so Locate becomes optional for
