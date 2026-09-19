@@ -7,9 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Gateway
+
+- The gateway counts sessions on a kernel without `/proc/net/nf_conntrack`.
+  When the file is absent it dumps the conntrack table over netlink, as
+  `conntrack -L` does, so a mapping carrying traffic is pinned instead of
+  being reclaimed on its TTL and grace period alone. Kernels built without
+  `CONFIG_NF_CONNTRACK_PROCFS`, such as Ubuntu's, had session pinning off.
+- The gateway says at startup whether it can read conntrack sessions. It
+  reads the table once, as each tick does, and logs either the source it read
+  or that no source is readable and session pinning is off. An operator on a
+  kernel with no readable source learned this only from a warning at the first
+  failed tick.
+
+### Changed
+
+#### Packaging (Debian)
+
+- An upgrade of the `.deb` now reapplies the firewall ruleset in place. Until
+  now an upgrade reloaded nothing, so a changed `/etc/fips/fips.nft` took
+  effect only at the next reboot or manual restart, and a restart deletes the
+  `fips` table and leaves the mesh interface unfiltered until the ruleset is
+  loaded again. `fips-firewall.service`, in both the Debian and the plain
+  systemd unit, gains a reload that replaces the ruleset in one transaction,
+  and the postinst reloads the unit only when it is already active, so an
+  upgrade never turns the firewall on for a host that has not opted in. A
+  reload that fails leaves the previous ruleset in place and is reported; the
+  upgrade goes on.
+
+#### Packaging (AUR)
+
+- The AUR publish on a release tag now waits until every package workflow of
+  that tag has succeeded. It used to push the new `pkgver` while the Linux,
+  macOS, Windows, OpenWrt and FreeBSD packages were still building; at v0.5.1
+  the AUR was updated while the release had 15 of its 17 assets. Because the
+  AUR package pins the tag's source archive, withdrawing a bad release after
+  that point left the AUR package unbuildable. A failed or cancelled package
+  run now stops the publish, and one that has not finished within an hour
+  fails it.
+
+#### Dependencies
+
+- The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
+  It arrives through `rand`, a direct dependency,
+  so it sits on the built path rather than off to one side. The requirement in
+  `Cargo.toml` already admitted 0.10.2, so this is a lockfile change and no code
+  changed with it. **This is not a security fix**: `cargo audit` reports nothing
+  against `chacha20` at either version, and 0.10.1 was withdrawn by its
+  maintainer rather than flagged by an advisory. What it buys is that a fresh
+  checkout can resolve the lockfile without reaching for a yanked version.
+
 ### Fixed
 
-#### Data-plane / transports
+#### Data plane and transports
 
 - Two inbound TCP connections that share a peer address but arrive on different
   local addresses no longer share one pool entry. The kernel names a connection
@@ -49,7 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
 
-#### Link rekey
+#### Link and session rekey
 
 - A forged rekey msg2 no longer takes the link down. The rekey initiator gave
   up its handshake before reading msg2 and abandoned the cycle when the read
@@ -66,9 +118,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forgery now costs the initiator the msg2 key agreement until the cycle ends,
   where before only the first one did; the msg1 resend budget bounds that. The
   wire format is unchanged.
-
-#### Session rekey
-
 - A SessionAck that fails to read no longer ends a session rekey this node
   started. The handler took the rekey handshake off the session before reading
   the ack's msg2 and abandoned the rekey when the read failed, although nothing
@@ -107,7 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes, while the row's `transport_id` and `remote_addr` stay those the
   link was created with. The counters cover authenticated link frames only, so
   they are not expected to match the transport totals in `show_transports`.
-  The response shape is unchanged.
+  The response shape is unchanged. Fixes #158.
 - `show_peers` (`fipsctl show peers`) now reports a peer that has gone quiet
   as `stale`. Its `connectivity` was read from a state that nothing outside
   the tests ever changed, so every peer read `connected` until it was
@@ -119,7 +168,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values the open-discovery tutorial described never occurred, and the
   tutorial no longer lists them. The response shape is unchanged.
 
-#### Identity & config
+#### Identity and config
 
 - A persistent node whose identity key path cannot be examined now refuses to
   start instead of coming up under a new identity. `Path::exists` reports false
@@ -134,14 +183,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Gateway
 
-- A `.fips` query the gateway answers without an address no longer takes an
-  address from the pool. Every query type was allocated a mapping before the
-  code looked at what the client had asked for, and an A or HTTPS query was
-  then answered with NODATA, so any host that can reach the LAN resolver could
-  consume the pool one name at a time with a query type it is never given an
-  address for. Only AAAA and ANY allocate now. A non-AAAA query for a name that
-  already has a mapping still refreshes that mapping's TTL clock, so a client
-  querying both types does not lose half of its refresh.
 - Conntrack sessions are matched by address rather than by text, so live
   traffic pins a gateway mapping again. The session count searched each
   `/proc/net/nf_conntrack` line for `dst=` followed by the virtual IP in its
@@ -161,19 +202,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions for every mapping, as it always has, so reclamation keeps working
   rather than pinning the whole pool; but the first failure and each change of
   outcome after it are now logged, so an unreadable source is no longer
-  indistinguishable from an idle one. A kernel built without
-  `CONFIG_NF_CONNTRACK_PROCFS` has no `/proc/net/nf_conntrack` at all and fails
-  identically every tick, so a repeat is logged at debug rather than warn.
-- The gateway says at startup whether it can read conntrack sessions. It
-  reads the table once, as each tick does, and logs either the source it read
-  or that no source is readable and session pinning is off. An operator on a
-  kernel with no readable source learned this only from a warning at the first
-  failed tick.
-- The gateway counts sessions on a kernel without `/proc/net/nf_conntrack`.
-  When the file is absent it dumps the conntrack table over netlink, as
-  `conntrack -L` does, so a mapping carrying traffic is pinned instead of
-  being reclaimed on its TTL and grace period alone. Kernels built without
-  `CONFIG_NF_CONNTRACK_PROCFS`, such as Ubuntu's, had session pinning off.
+  indistinguishable from an idle one. A source that fails identically every
+  tick is logged at debug rather than warn on a repeat.
 - The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
   `fips_gateway` table in a batch of its own, discarded that batch's result,
   and only then sent the batch that recreated the table, the chains, the
@@ -196,6 +226,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the batch and requests one acknowledgement per batch, and NAT errors now
   name the kernel errno. A rebuild that still fails is logged, and the next
   successful rebuild installs the mapping.
+- A `.fips` query the gateway answers without an address no longer takes an
+  address from the pool. Every query type was allocated a mapping before the
+  code looked at what the client had asked for, and an A or HTTPS query was
+  then answered with NODATA, so any host that can reach the LAN resolver could
+  consume the pool one name at a time with a query type it is never given an
+  address for. Only AAAA and ANY allocate now. A non-AAAA query for a name that
+  already has a mapping still refreshes that mapping's TTL clock, so a client
+  querying both types does not lose half of its refresh.
 - The gateway's virtual-IP pool now limits how many mappings it holds and how
   fast it creates them. Any host that can reach the LAN resolver could ask for
   one new `.fips` name after another, and each got a mapping until the 65,535
@@ -206,6 +244,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning says which limit refused it. A name that already has a mapping is
   answered before either limit is consulted, so names in use keep resolving
   when the pool is full. The limits are compiled in, not configured.
+
+#### Nostr and NAT traversal
+
+- A node no longer publishes NIP-09 deletion requests signed with its routing
+  key after a NAT traversal attempt. Each request put the node's public
+  identity next to the ids of its offer and answer gift wraps on every relay it
+  reached, which the one-time signing keys on those wraps exist to prevent, and
+  most of the requests deleted nothing, since a relay deletes a gift wrap only
+  at its recipient's request. A relay that stores the wraps now keeps them
+  until their NIP-40 expiration; relays that do not store ephemeral events
+  never held them. The advertisement retraction still sends its deletion
+  request, since that names an event the routing key signed itself. The
+  discovery and traversal design documents describe the new behaviour.
+
+#### Packaging (OpenWrt)
+
 - A new OpenWrt install no longer enables and starts `fips-gateway`. The
   generated postinst turned it on unconditionally, contradicting the init
   script's own header, the package README and the deployment tutorial, all of
@@ -228,13 +282,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   port, add the LAN prefix and advertise the pool route, and only then start a
   daemon that exits immediately because the gateway is disabled, leaving `.fips`
   resolution pointed at a port nothing listens on.
-- The four OpenWrt maintainer-script bodies now live in
-  `packaging/openwrt-ipk/scripts/` instead of inside heredocs in the two build
-  scripts, so the `.ipk` and `.apk` packages install the same bodies and the
-  scenarios in `testing/openwrt/` run what ships.
+- The `.ipk` and `.apk` packages now install the same maintainer scripts. The
+  four script bodies live in `packaging/openwrt-ipk/scripts/` instead of inside
+  heredocs in the two build scripts, so the scenarios in `testing/openwrt/` run
+  what ships.
 
-#### Packaging
+#### Packaging (Debian)
 
+- A `.deb` upgrade whose new daemon cannot start no longer hangs apt. The
+  postinst started `fips.service` and then `fips-dns.service` with blocking
+  calls, and because `fips-dns.service` requires the daemon, a daemon that
+  failed on every start left the second call, apt and everything queued behind
+  it waiting for ever with no message. Each start is now queued and waited on
+  for at most 60 seconds. A unit that does not come up has its status printed
+  and fails the configure step, so apt exits non-zero and names the unit; a
+  masked unit, or one whose condition is not met, is reported and skipped.
+- The `.deb` maintainer scripts now manage `fips-gateway` with the rest of the
+  package's services. An upgrade stopped the daemon, which the gateway
+  requires, and never brought the gateway back, so an operator who had enabled
+  it lost it until the next reboot; removing or purging the package left the
+  gateway's enablement symlink behind, pointing at a unit file that no longer
+  exists. The gateway is now stopped before the daemon on upgrade and
+  restarted afterwards only when it is enabled and the daemon came up, and it
+  is stopped and disabled on remove and purge. A gateway that does not come
+  back is reported but does not fail the upgrade.
 - The `.deb` now declares `libgcc-s1 (>= 4.2)`. All four binaries link
   `libgcc_s.so.1`, but cargo-deb removes every libgcc entry from the
   dependencies it derives, so the package never said so. `libc6` depends on
@@ -252,44 +323,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the tree the build sees. The build image's tag now includes a hash of
   its Dockerfile, so a host with an older image cached builds a new one instead
   of reusing it.
+- `packaging/debian/build-deb-container.sh` now returns the package it just
+  built. It picked the most recently modified `fips_*.deb` in the output
+  directory that sorted last by name, so a package with a higher version left
+  there by an earlier run was returned instead.
 
-### Changed
+#### Packaging (AUR)
 
-- The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
-  It arrives through `rand`, a direct dependency,
-  so it sits on the built path rather than off to one side. The requirement in
-  `Cargo.toml` already admitted 0.10.2, so this is a lockfile change and no code
-  changed with it. **This is not a security fix**: `cargo audit` reports nothing
-  against `chacha20` at either version, and 0.10.1 was withdrawn by its
-  maintainer rather than flagged by an advisory. What it buys is that a fresh
-  checkout can resolve the lockfile without reaching for a yanked version.
-- The dns-resolver test suite's end-to-end scenarios now run the `fips` and
-  `fips-gateway` binaries from the Debian package rather than compiling their
-  own. The suite used to build both in a Debian 12 image with whatever Rust was
-  current, a second release build on every CI run with no cache, and not the
-  toolchain or the build that ships. It now takes `--deb PATH`, and CI hands it
-  the package the install suite installs, so one package build serves both; run
-  on its own it builds the package through the same container script the
-  release uses. The GitHub leg moves to a job of its own that waits for the
-  package build, with its check name unchanged, and a local CI run builds the
-  package once for both suites. The suite now needs `dpkg-deb` on the host.
-- The Linux release and CI package builds reuse their builder image across
-  GitHub runners instead of assembling it on every leg from apt, rustup and a
-  compile of `cargo-deb`. `build-deb-container.sh` gains `--print-image-tag` and
-  `--image-archive PATH`: the workflows key an Actions cache entry on the image
-  tag, load the image from it when present, and save it after a build. Only a
-  push to `maint`, `master` or `next` saves an entry; pull requests and topic
-  branches read the default branch's. A corrupt or mismatched archive is a
-  warning and a rebuild, never a failed build. A cached image is not refreshed
-  from apt or the base image until the base image name, the toolchain or
-  `Dockerfile.build` changes, as was already true of a developer's machine.
-- CI now builds the arm64 `.deb` on an arm64 runner and installs it on Ubuntu
-  22.04, the oldest supported distribution, starting the daemon, on every push
-  and pull request. Until now the arm64 package was floor-checked and never
-  installed anywhere in the pipeline. Its upgrade, purge and conffile paths
-  remain unexercised; those run on amd64 only. The parity check reads each
-  install leg's architecture, so the arm64 leg is reported as GitHub-only and
-  cannot stand in for a missing amd64 leg of the same distribution.
+- The release `PKGBUILD` now lists `dbus` as a runtime dependency. The `fips`
+  binary links `libdbus-1`, and the `fips-git` package already declared it.
 
 ## [0.5.1] - 2026-09-06
 
@@ -4150,3 +4192,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Design documentation suite covering all protocol layers
 - CHANGELOG.md following Keep a Changelog format
 - Repository mirrored to [ngit](https://gitworkshop.dev/npub1y0gja7r4re0wyelmvdqa03qmjs62rwvcd8szzt4nf4t2hd43969qj000ly/relay.ngit.dev/fips)
+
+<!-- markdownlint-configure-file { "MD024": { "siblings_only": true } } -->
