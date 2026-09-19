@@ -115,9 +115,9 @@ dump_diagnostics() {
 #
 # Which rejection they take is not what the event's gibberish `content`
 # suggests. `parse_overlay_advert_event` looks for the `protocol` tag
-# first (src/nostr/runtime.rs:1665-1671) and this event carries only `d`
+# first (src/nostr/runtime.rs:1657-1663) and this event carries only `d`
 # and `app`, so it fails with `missing required protocol tag` and never
-# reaches the `serde_json::from_str` at :1679. The content is therefore
+# reaches the `serde_json::from_str` at :1671. The content is therefore
 # belt and braces rather than the thing under test.
 #
 # Neither branch logs anything: see the coverage-gap note in run_test.
@@ -236,7 +236,7 @@ while int.from_bytes(secret, "big") == 0 or int.from_bytes(secret, "big") >= N:
 pubkey = xonly_pubkey(secret).hex()
 created_at = int(time.time())
 # Both of these must match the consumers' subscription filter, which is
-# kind + identifier and no author clause (src/nostr/runtime.rs:1042-1044).
+# kind + identifier and no author clause (src/nostr/runtime.rs:1041-1043).
 # The literals are ADVERT_KIND and ADVERT_IDENTIFIER in src/nostr/types.rs
 # and are duplicated here rather than derived, so changing either there
 # silently stops this event reaching the daemons while the relay goes on

@@ -448,6 +448,45 @@ ping_peer() {
     fi
 }
 
+# Fail if the relay holds any kind 5 deletion request.
+#
+# A node signs a deletion request with its routing key, so one naming a
+# traversal signal's wrap would tie that key to a signal sent under a one-time
+# key. Nodes delete only adverts they withdraw, and the lab's nodes advertise
+# throughout, so after a scenario the relay should hold none. strfry scan reads
+# the relay's own store and prints one event per line. A scan that cannot run
+# or print parseable events has observed nothing, so it fails the check too.
+assert_no_deletion_requests() {
+    local relay="$1" events="" report=""
+    if ! events="$(docker exec "$relay" strfry scan '{"kinds":[5]}' 2>/dev/null)"; then
+        echo "FAIL: could not scan $relay for deletion requests" >&2
+        return 1
+    fi
+    if ! report="$(python3 -c '
+import json, sys
+events = []
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        events.append(json.loads(line))
+for ev in events:
+    ids = [t[1] for t in ev.get("tags", []) if len(t) > 1 and t[0] == "e"]
+    print("  kind 5 by %s... naming %s" % (ev["pubkey"][:16], ", ".join(ids)))
+print(len(events))
+' <<<"$events")"; then
+        echo "FAIL: could not parse $relay's scan for deletion requests" >&2
+        return 1
+    fi
+    local count="${report##*$'\n'}"
+    if [ "$count" != "0" ]; then
+        echo "FAIL: $relay holds $count deletion request(s):" >&2
+        sed '$d' <<<"$report" >&2
+        return 1
+    fi
+    echo "  $relay holds no deletion requests"
+    return 0
+}
+
 # A relay that faulted while a scenario's assertions still passed is a finding
 # about the relay, not about the scenario, so it is reported and not made a
 # failure: the scenario proved what it set out to prove.
@@ -497,6 +536,10 @@ run_cone() {
         dump_cone_diagnostics
         return 1
     }
+    assert_no_deletion_requests "$RELAY_CONTAINER" || {
+        dump_cone_diagnostics
+        return 1
+    }
     note_relay_event
     cleanup
 }
@@ -543,6 +586,10 @@ run_symmetric() {
         dump_symmetric_diagnostics
         return 1
     }
+    assert_no_deletion_requests "$RELAY_CONTAINER" || {
+        dump_symmetric_diagnostics
+        return 1
+    }
     note_relay_event
     cleanup
 }
@@ -583,6 +630,10 @@ run_lan() {
         return 1
     }
     ping_peer fips-nat-lan-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A" || {
+        dump_lan_diagnostics
+        return 1
+    }
+    assert_no_deletion_requests "$RELAY_CONTAINER" || {
         dump_lan_diagnostics
         return 1
     }
