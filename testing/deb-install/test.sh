@@ -58,6 +58,10 @@ SKIP=0
 # however many scenarios run in one process.
 SUPPLIED_DEB=""
 DEB_PREPARED=0
+# The package the scenarios install, set by build_deb() on every path that
+# succeeds. Scenarios use it rather than listing the cache directory, so which
+# file they install never depends on what else happens to be in there.
+DEB_PATH=""
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -202,6 +206,7 @@ build_deb() {
         fi
         rm -f "$DEB_CACHE_DIR"/*.deb
         cp "$SUPPLIED_DEB" "$DEB_CACHE_DIR/"
+        DEB_PATH="$DEB_CACHE_DIR/$(basename "$SUPPLIED_DEB")"
         DEB_PREPARED=1
         log "Installing the supplied package $(basename "$SUPPLIED_DEB")"
         return 0
@@ -218,6 +223,7 @@ build_deb() {
         local cached_age
         cached_age=$(stat -c '%Y' "$cached_deb" 2>/dev/null || echo 0)
         if awk "BEGIN { exit !($cached_age >= $newest_src) }"; then
+            DEB_PATH="$cached_deb"
             log "Using cached .deb at $cached_deb"
             return 0
         fi
@@ -233,20 +239,28 @@ build_deb() {
     # not exhibit a defect that only the release environment produced. It stayed
     # green through five releases that could not start on two of the five
     # distributions in its own matrix.
+    #
+    # The cache holds one package at a time. Clearing it first is what keeps the
+    # reuse check above honest, since that check looks at whichever package it
+    # finds; and the package installed is the one the build names on the last
+    # line of its stdout, never one found by listing the directory.
     log "Building the .deb in the pinned build container (slow on first run)"
-    if ! bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
-            --output-dir "$DEB_CACHE_DIR" >&2; then
+    rm -f "$DEB_CACHE_DIR"/*.deb
+    local build_out
+    if ! build_out=$(bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
+            --output-dir "$DEB_CACHE_DIR"); then
         echo "  ERROR: container build failed" >&2
         return 1
     fi
 
-    cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
-    if [ -n "$cached_deb" ]; then
-        log "Cached at $cached_deb ($(stat -c %s "$cached_deb") bytes)"
-    else
-        echo "  ERROR: no .deb produced by the container build" >&2
+    cached_deb=$(printf '%s\n' "$build_out" | tail -n 1)
+    if [ -z "$cached_deb" ] || [ ! -f "$cached_deb" ]; then
+        echo "  ERROR: the container build did not report a package path: '$cached_deb'" >&2
         return 1
     fi
+    DEB_PATH="$cached_deb"
+    log "Cached at $cached_deb ($(stat -c %s "$cached_deb") bytes)"
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -267,8 +281,7 @@ _run_deb_install_scenario() {
 
     build_deb || { fail ".deb build failed"; return; }
 
-    local cached_deb
-    cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
+    local cached_deb="$DEB_PATH"
     if [ -z "$cached_deb" ] || [ ! -f "$cached_deb" ]; then
         fail "no .deb available at $DEB_CACHE_DIR"
         return
