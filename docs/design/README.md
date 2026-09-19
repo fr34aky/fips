@@ -50,6 +50,7 @@ documents cover specific subsystems in detail.
 | [fips-mesh-operation.md](fips-mesh-operation.md) | How the mesh operates: routing, discovery, error recovery |
 | [fips-nostr-discovery.md](fips-nostr-discovery.md) | Optional Nostr-mediated peer discovery and UDP NAT hole-punch |
 | [port-advertisement-and-nat-traversal.md](port-advertisement-and-nat-traversal.md) | Nostr-signaled port advertisement and UDP NAT-traversal protocol; generic, with FIPS as an example implementation |
+| [fips-service-discovery.md](fips-service-discovery.md) | **Proposal, not implemented.** Mesh-only service discovery: signed service records, bloom-guided provider lookup, public and group scopes, DNS view |
 
 ### Deeper Dives
 
