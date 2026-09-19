@@ -276,6 +276,25 @@ runtime_packages() {
     return 0
 }
 
+# Patch a minimal gateway config into the container's fips.yaml, since the
+# shipped one has the gateway disabled, and restart fips.service to load it.
+# The caller checks that the daemon came back.
+apply_gateway_config() {
+    local name="$1"
+    timeout "$CONFIG_RESTART_TIMEOUT" docker exec "$name" bash -c '
+        systemctl unmask fips-gateway.service 2>/dev/null
+        cp /etc/fips/fips.yaml /etc/fips/fips.yaml.orig
+        cat >> /etc/fips/fips.yaml <<EOF
+gateway:
+  enabled: true
+  pool: "fd01::/112"
+  lan_interface: "eth0"
+EOF
+        systemctl restart fips.service
+    ' >/dev/null 2>&1
+    return
+}
+
 # ─────────────────────────────────────────────────────────────────────
 # Scenario runner
 #
@@ -536,19 +555,7 @@ DOCKERFILE
     # default preset) and ipv6 forwarding (gateway checks before
     # the DNS upstream check), which the container is started with;
     # see start_systemd_container_with_tun.
-    timeout "$CONFIG_RESTART_TIMEOUT" docker exec "$name" bash -c '
-        systemctl unmask fips-gateway.service 2>/dev/null
-        # Patch in a minimal gateway config since the shipped fips.yaml
-        # has gateway disabled by default.
-        cp /etc/fips/fips.yaml /etc/fips/fips.yaml.orig
-        cat >> /etc/fips/fips.yaml <<EOF
-gateway:
-  enabled: true
-  pool: "fd01::/112"
-  lan_interface: "eth0"
-EOF
-        systemctl restart fips.service
-    ' >/dev/null 2>&1
+    apply_gateway_config "$name"
 
     sleep 3
     if wait_for_service_active "$name" fips.service 5; then
@@ -611,7 +618,13 @@ EOF
 # Every apt run here is bounded: an upgrade that blocks in postinst is one of
 # the defects this scenario exists to catch, and an unbounded one would hang
 # the suite instead of failing it.
-UPGRADE_APT_TIMEOUT=150
+# The package's own worst case on a healthy daemon is its three bounded starts,
+# 60s + 60s + 90s, so an upgrade bound above that reports the package's
+# diagnosis rather than this one.
+UPGRADE_APT_TIMEOUT=300
+# The dead-daemon reinstall skips the units behind the daemon, so its worst
+# case is one 60s bound.
+DEAD_DAEMON_APT_TIMEOUT=150
 # postinst waits up to 60s for a unit that does not start. When the daemon
 # cannot start, apt has to return a failure well inside this.
 DEAD_DAEMON_LIMIT=120
@@ -626,15 +639,16 @@ cexec() {
     return
 }
 
-# Run apt-get in /opt/fips-deb inside the container, bounded, keeping the
-# existing configuration files. Sets APT_RC, APT_SECS and APT_OUT rather than
-# returning a status, because every caller needs all three.
+# Run apt-get in /opt/fips-deb inside the container, bounded by the given
+# number of seconds, keeping the existing configuration files. Sets APT_RC,
+# APT_SECS and APT_OUT rather than returning a status, because every caller
+# needs all three.
 run_apt() {
-    local name="$1"
-    shift
+    local name="$1" limit="$2"
+    shift 2
     local start=$SECONDS
     APT_RC=0
-    APT_OUT=$(timeout "$UPGRADE_APT_TIMEOUT" docker exec -w /opt/fips-deb "$name" \
+    APT_OUT=$(timeout "$limit" docker exec -w /opt/fips-deb "$name" \
         apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
         "$@" 2>&1) || APT_RC=$?
     APT_SECS=$((SECONDS - start))
@@ -781,8 +795,50 @@ start_nft_monitor() {
     return 1
 }
 
-# Host that opted in to the firewall: the upgrade must apply the new ruleset in
-# place, with no moment at which the fips table is absent.
+# Apply the gateway config and start fips-gateway.service, bounded, requiring
+# it to be active. Leaves it enabled or not as the caller already set it.
+start_gateway() {
+    local name="$1"
+    apply_gateway_config "$name"
+    if ! wait_for_service_active "$name" fips.service 10; then
+        return 1
+    fi
+    start_unit "$name" fips-gateway.service "$GATEWAY_START_TIMEOUT" >/dev/null 2>&1 || true
+    if wait_for_service_active "$name" fips-gateway.service 10; then
+        return 0
+    fi
+    cexec "$name" systemctl status --no-pager fips-gateway.service 2>&1 | tail -15
+    return 1
+}
+
+# Print a unit's MainPID; 0 when it has no main process.
+main_pid() {
+    local name="$1" unit="$2"
+    cexec "$name" systemctl show -p MainPID --value "$unit" 2>/dev/null || echo 0
+    return 0
+}
+
+# Pass or fail on whether a unit runs a new process of the installed binary
+# after the upgrade: active, a MainPID other than the one before, and an
+# executable that is the installed file rather than one the upgrade replaced,
+# which the kernel reports with a " (deleted)" suffix.
+check_new_binary() {
+    local name="$1" unit="$2" binary="$3" before="$4" what="$5" pid exe
+    pid=$(main_pid "$name" "$unit")
+    exe=$(cexec "$name" readlink "/proc/$pid/exe" 2>/dev/null || true)
+    if cexec "$name" systemctl is-active --quiet "$unit" && [ "$pid" != 0 ] &&
+        [ "$pid" != "$before" ] && [ "$exe" = "$binary" ]; then
+        pass "$what: $unit runs the upgraded $binary"
+    else
+        fail "$what: $unit is $(cexec "$name" systemctl is-active "$unit" 2>/dev/null), MainPID $before -> $pid, exe '$exe' (want active, a new process, $binary)"
+    fi
+    return 0
+}
+
+# Host that opted in to the firewall and enabled the gateway: the upgrade must
+# apply the new ruleset in place, with no moment at which the fips table is
+# absent, and bring the gateway back on the new binary. Purging the package
+# must then leave no enablement behind for the gateway.
 _upgrade_opted_in() {
     local name="$1" image="$2" deb="$3"
     log "upgrade on a host that opted in ($name)"
@@ -795,13 +851,22 @@ _upgrade_opted_in() {
         cleanup_container "$name"
         return 0
     fi
+    cexec "$name" systemctl enable fips-gateway.service >/dev/null 2>&1
+    if ! start_gateway "$name"; then
+        fail "opted in: fips-gateway did not start before the upgrade"
+        cleanup_container "$name"
+        return 0
+    fi
     if ! start_nft_monitor "$name"; then
         fail "opted in: nft monitor is not observing table changes"
         cleanup_container "$name"
         return 0
     fi
+    local fips_pid gw_pid
+    fips_pid=$(main_pid "$name" fips.service)
+    gw_pid=$(main_pid "$name" fips-gateway.service)
 
-    run_apt "$name" install -y ./next.deb
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install -y ./next.deb
     echo "  upgrade took ${APT_SECS}s"
     if [ "$APT_RC" -eq 0 ]; then
         pass "opted in: upgrade exits 0"
@@ -823,28 +888,47 @@ _upgrade_opted_in() {
     else
         pass "opted in: the fips table was never deleted during the upgrade"
     fi
+    check_new_binary "$name" fips.service /usr/bin/fips "$fips_pid" "opted in, after upgrade"
+    check_new_binary "$name" fips-gateway.service /usr/bin/fips-gateway "$gw_pid" "opted in, after upgrade"
+
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" purge -y fips
+    echo "  purge took ${APT_SECS}s"
+    if [ "$APT_RC" -ne 0 ]; then
+        fail "opted in: purge exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+    fi
+    local link=/etc/systemd/system/multi-user.target.wants/fips-gateway.service state
+    state=$(cexec "$name" systemctl is-enabled fips-gateway.service 2>/dev/null || true)
+    if ! cexec "$name" test -e "$link" && ! cexec "$name" test -L "$link" &&
+        [ "$state" != "enabled" ]; then
+        pass "opted in, after purge: no fips-gateway enablement left behind"
+    else
+        fail "opted in, after purge: fips-gateway still enabled ('$state', $(cexec "$name" ls -l "$link" 2>&1))"
+    fi
 
     cleanup_container "$name"
     return 0
 }
 
-# Host that never opted in to the firewall or enabled the gateway: the upgrade
-# must leave both as they were. Then the package is reinstalled twice: with the
-# daemon masked, when apt must succeed and start nothing, and with a daemon
-# that cannot start, when apt must fail, promptly, naming the unit, rather than
-# wait for ever on a unit that requires a daemon which never comes up.
+# Host that never opted in to the firewall and ran the gateway without enabling
+# it: the upgrade must leave neither running nor enabled. Then the package is
+# reinstalled three times: with the daemon masked, when apt must succeed and
+# start nothing; with an enabled gateway that cannot start, when apt must
+# succeed, say so, and leave the daemon running; and with a daemon that cannot
+# start, when apt must fail, promptly, naming the unit, rather than wait for
+# ever on a unit that requires a daemon which never comes up.
 _upgrade_not_opted_in() {
     local name="$1" image="$2" deb="$3"
     log "upgrade on a host that never opted in ($name)"
     upgrade_boot "$name" "$image" "$deb" || { cleanup_container "$name"; return 0; }
     make_next_package "$name" "$deb" || { cleanup_container "$name"; return 0; }
-    if ! start_daemon_units "$name"; then
-        fail "not opted in: fips and fips-dns did not start before the upgrade"
+    if ! start_daemon_units "$name" || ! start_gateway "$name"; then
+        fail "not opted in: fips, fips-dns and fips-gateway did not start before the upgrade"
         cleanup_container "$name"
         return 0
     fi
 
-    run_apt "$name" install -y ./next.deb
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install -y ./next.deb
     echo "  upgrade took ${APT_SECS}s"
     if [ "$APT_RC" -eq 0 ]; then
         pass "not opted in: upgrade exits 0"
@@ -855,6 +939,7 @@ _upgrade_not_opted_in() {
     check_active "$name" fips.service "not opted in, after upgrade"
     check_active "$name" fips-dns.service "not opted in, after upgrade"
     check_left_off "$name" fips-firewall.service "not opted in, after upgrade"
+    check_left_off "$name" fips-gateway.service "not opted in, after upgrade"
     if cexec "$name" nft list table inet fips >/dev/null 2>&1; then
         fail "not opted in, after upgrade: the fips firewall table is loaded"
     else
@@ -866,7 +951,7 @@ _upgrade_not_opted_in() {
     # masked unit, so the message is what tells the two apart.
     cexec "$name" bash -c 'systemctl stop fips-dns.service fips.service; systemctl mask fips.service' \
         >/dev/null 2>&1
-    run_apt "$name" install --reinstall -y ./next.deb
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install --reinstall -y ./next.deb
     echo "  reinstall with the daemon masked took ${APT_SECS}s (exit $APT_RC)"
     if [ "$APT_RC" -eq 0 ] && grep -q "fips.service is masked" <<<"$APT_OUT" &&
         ! cexec "$name" systemctl is-active --quiet fips.service &&
@@ -883,6 +968,33 @@ _upgrade_not_opted_in() {
         return 0
     fi
 
+    # An enabled gateway that fails on start, behind a daemon that is healthy:
+    # the gateway is an opt-in addition, so apt must report it and succeed.
+    # Restart=no so it reaches failed at once rather than looping.
+    cexec "$name" bash -c '
+        mkdir -p /etc/systemd/system/fips-gateway.service.d
+        printf "[Service]\nExecStart=\nExecStart=/bin/false\nRestart=no\n" \
+            > /etc/systemd/system/fips-gateway.service.d/broken.conf
+        systemctl daemon-reload
+        systemctl enable fips-gateway.service
+    ' >/dev/null 2>&1
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install --reinstall -y ./next.deb
+    echo "  reinstall with a broken gateway took ${APT_SECS}s (exit $APT_RC)"
+    if [ "$APT_RC" -eq 0 ] &&
+        grep -q "fips-gateway.service did not come back" <<<"$APT_OUT" &&
+        cexec "$name" systemctl is-active --quiet fips.service; then
+        pass "broken gateway: apt succeeds, reports the gateway and leaves the daemon running"
+    else
+        fail "broken gateway: apt exited $APT_RC (want 0, a message that fips-gateway.service did not come back, and fips active)"
+        echo "$APT_OUT" | tail -20
+    fi
+    cexec "$name" bash -c '
+        systemctl disable fips-gateway.service
+        rm -rf /etc/systemd/system/fips-gateway.service.d
+        systemctl daemon-reload
+        systemctl reset-failed fips-gateway.service
+    ' >/dev/null 2>&1
+
     # A daemon that fails on every start: exit 1, so Restart=on-failure loops,
     # and the start job of fips-dns, which requires it, is never dispatched.
     cexec "$name" bash -c '
@@ -891,7 +1003,7 @@ _upgrade_not_opted_in() {
             > /etc/systemd/system/fips.service.d/broken.conf
         systemctl daemon-reload
     '
-    run_apt "$name" install --reinstall -y ./next.deb
+    run_apt "$name" "$DEAD_DAEMON_APT_TIMEOUT" install --reinstall -y ./next.deb
     echo "  reinstall with a dead daemon took ${APT_SECS}s (exit $APT_RC)"
     if [ "$APT_RC" -ne 0 ] && [ "$APT_RC" -ne 124 ] &&
         [ "$APT_SECS" -lt "$DEAD_DAEMON_LIMIT" ] &&
