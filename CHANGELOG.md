@@ -78,6 +78,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the refusal is counted as `ack_handshake_failed`, as it already was for a
   first-contact session. The wire format is unchanged.
 
+#### Session coordinates
+
+- A node with no coordinates cached for a session's destination no longer
+  sends its own coordinates in their place. The lookup that supplies them falls
+  back to the node's own coordinates, which a first-contact SessionSetup needs
+  because its destination field cannot be empty, but the established data path,
+  the standalone CoordsWarmup and the rekey SessionSetup used the same
+  fallback. Every receiver files the destination coordinates it is sent under
+  the destination's address, so a destination reached this way cached its own
+  address under the sender's coordinates. On a cache miss a data frame now goes
+  out without coordinates and leaves the warmup budget for the first frames
+  after the cache is refilled, a standalone CoordsWarmup is not sent, and a
+  rekey SessionSetup, which can only miss for a direct peer, carries the
+  coordinates that peer announced. First-contact setup is unchanged. The wire
+  format is unchanged.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has

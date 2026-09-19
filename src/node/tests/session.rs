@@ -5282,6 +5282,427 @@ async fn test_forged_session_ack_leaves_the_rekey_able_to_complete_on_the_genuin
 }
 
 // ============================================================================
+// Integration tests: a destination with no cached coordinates
+// ============================================================================
+
+/// Build a two-node routable mesh with periodic rekey off and an established
+/// FSP session from node 0 to node 1, with node 0's coordinate warmup budget
+/// set to `warmup`.
+///
+/// node 1's budget is 0, so none of its frames carry coordinates: each one
+/// that did would re-warm node 0's entry for node 1, and these tests need
+/// that entry to stay gone once they remove it.
+async fn make_warmup_pair(warmup: u8) -> Vec<TestNode> {
+    let configs = (0..2)
+        .map(|i| {
+            let mut config = Config::new();
+            config.node.rekey.enabled = false;
+            config.node.session.coords_warmup_packets = if i == 0 { warmup } else { 0 };
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+    pump_until_quiet(&mut nodes).await;
+    nodes
+}
+
+/// The address path `node` has cached for `addr`, if any.
+///
+/// Compared by address because coordinates carried in a session frame arrive
+/// without the declaration metadata a node's own copy holds.
+fn cached_path(node: &TestNode, addr: &NodeAddr) -> Option<Vec<NodeAddr>> {
+    node.node
+        .coord_cache()
+        .get(addr, wall_clock_ms())
+        .map(addr_path)
+}
+
+/// The address path of a coordinate, self to root.
+fn addr_path(coords: &crate::proto::stp::TreeCoordinate) -> Vec<NodeAddr> {
+    coords.node_addrs().copied().collect()
+}
+
+/// Deliver a PathBroken naming `dest` to `nodes[at]`, reported by `reporter`.
+/// The reporter must not be `dest`, or the signal is refused as forged before
+/// it removes anything.
+///
+/// Nothing is pumped afterwards: the handler starts a lookup, and in a small
+/// mesh its answer would refill the entry the signal removed before the test
+/// could send into the miss.
+async fn deliver_path_broken(
+    nodes: &mut [TestNode],
+    at: usize,
+    dest: NodeAddr,
+    reporter: NodeAddr,
+) {
+    use crate::proto::routing::PathBroken;
+    let encoded = PathBroken::new(dest, reporter).encode();
+    nodes[at]
+        .node
+        .handle_path_broken(&reporter, &encoded[5..])
+        .await;
+}
+
+/// A data frame to a destination whose coordinates this node does not have
+/// cached must not carry this node's own coordinates in their place.
+///
+/// The shape reached in practice: a direct peer whose cache entry is gone,
+/// here removed by a PathBroken from a third address. The destination warms
+/// its cache from every coordinate-bearing frame, so a frame carrying the
+/// sender's coordinates as the destination's leaves the destination holding
+/// its own address under the sender's coordinates. Once the coordinates are
+/// known again, the warmup budget the miss did not spend is spent on frames
+/// that carry them.
+#[tokio::test]
+async fn test_a_data_frame_to_a_destination_with_no_cached_coordinates_carries_none_and_keeps_the_warmup()
+ {
+    let mut nodes = make_warmup_pair(1).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node0_coords = nodes[0].node.tree_state().my_coords().clone();
+    let node1_coords = nodes[1].node.tree_state().my_coords().clone();
+
+    // A transit router reports the path to node 1 broken. It is a third
+    // address: a report "from" node 1 about node 1 is refused as forged.
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    deliver_path_broken(&mut nodes, 0, node1_addr, reporter).await;
+    assert!(
+        nodes[0]
+            .node
+            .coord_cache()
+            .get(&node1_addr, wall_clock_ms())
+            .is_none(),
+        "precondition: the PathBroken must have removed node 0's entry for node 1"
+    );
+    let warmup = |nodes: &[TestNode]| {
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .coords_warmup_remaining()
+    };
+    assert_eq!(warmup(&nodes), 1, "PathBroken resets the warmup budget");
+
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+    let recv_before = nodes[1]
+        .node
+        .get_session(&node0_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the cache miss")
+        .await
+        .expect("send_session_data failed");
+    // node 1 takes the frame, and node 0 then drops everything node 1 sent
+    // back. That includes the answer to the lookup the PathBroken started,
+    // which would both refill the cache and reset the warmup budget, and so
+    // hide whether the miss spent it.
+    process_available_packets(&mut nodes[1..]).await;
+    while nodes[0].packet_rx.try_recv().is_ok() {}
+
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "node 1 must not be sent node 0's coordinates as its own"
+    );
+    assert_ne!(
+        cached_path(&nodes[1], &node1_addr),
+        Some(addr_path(&node0_coords)),
+        "node 1 must not hold its own address under node 0's coordinates"
+    );
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .traffic_counters()
+            .1,
+        recv_before + 1,
+        "the frame must still be delivered"
+    );
+    assert_eq!(
+        warmup(&nodes),
+        1,
+        "a frame sent without coordinates must not spend the warmup budget"
+    );
+
+    // Node 0's cache is refilled without a discovery answer, so the only
+    // budget left to spend is the one the miss preserved. node 1's entry for
+    // node 0 is removed first, so the only way node 1 can learn node 0's
+    // coordinates again is from a frame that carries them.
+    let now_ms = wall_clock_ms();
+    nodes[0]
+        .node
+        .insert_coord_hint(node1_addr, node1_coords, now_ms);
+    nodes[1].node.coord_cache.remove(&node0_addr);
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the refill")
+        .await
+        .expect("send_session_data failed");
+    pump_until_quiet(&mut nodes).await;
+
+    assert_eq!(
+        cached_path(&nodes[1], &node0_addr),
+        Some(addr_path(&node0_coords)),
+        "the first frame after the refill must carry node 0's coordinates"
+    );
+    assert_eq!(
+        warmup(&nodes),
+        0,
+        "and it spends the warmup budget the miss preserved"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A standalone CoordsWarmup to a destination with no cached coordinates
+/// sends nothing: its only content would be this node's coordinates standing
+/// in for the destination's.
+#[tokio::test]
+async fn test_a_coords_warmup_to_a_destination_with_no_cached_coordinates_sends_nothing() {
+    let mut nodes = make_warmup_pair(5).await;
+    let node1_addr = *nodes[1].node.node_addr();
+
+    nodes[0].node.coord_cache.remove(&node1_addr);
+    let warmup_before = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .unwrap()
+        .coords_warmup_remaining();
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "precondition: node 1's queue is empty"
+    );
+
+    nodes[0]
+        .node
+        .send_coords_warmup(&node1_addr)
+        .await
+        .expect("a skipped warmup is not an error");
+
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "no CoordsWarmup may be sent without the destination's coordinates"
+    );
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .coords_warmup_remaining(),
+        warmup_before,
+        "the warmup budget must not move"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A rekey SessionSetup to a direct peer whose cache entry is gone carries
+/// the peer's own announced coordinates, not this node's.
+#[tokio::test]
+async fn test_a_rekey_setup_to_a_peer_with_no_cached_coordinates_carries_the_peers_announced_ones()
+{
+    // node 0 rekeys after one message; node 1 never initiates.
+    let mut cfg0 = Config::new();
+    cfg0.node.rekey.after_messages = 1;
+    let mut cfg1 = Config::new();
+    cfg1.node.rekey.after_messages = u64::MAX;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    let mut nodes = run_tree_test_with_configs(vec![cfg0, cfg1], &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_coords = nodes[1].node.tree_state().my_coords().clone();
+    assert_eq!(
+        nodes[0].node.tree_state().peer_coords(&node1_addr),
+        Some(&node1_coords),
+        "precondition: node 0 knows node 1's announced coordinates"
+    );
+
+    // One frame crosses node 0's rekey trigger, sent while the cache still
+    // holds node 1, so only the rekey setup can meet the miss.
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"before the rekey")
+        .await
+        .expect("send_session_data failed");
+    pump_until_quiet(&mut nodes).await;
+
+    // node 1's entry for its own address goes too, so what it holds after
+    // the rekey can only have come from the setup.
+    nodes[0].node.coord_cache.remove(&node1_addr);
+    nodes[1].node.coord_cache.remove(&node1_addr);
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+
+    nodes[0].node.check_session_rekey().await;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "the rekey setup must not name node 0's coordinates as node 1's"
+    );
+    assert_eq!(
+        cached_path(&nodes[1], &node1_addr),
+        Some(addr_path(&node1_coords)),
+        "the setup's destination coordinates must be node 1's own"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the rekey must complete at node 0"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "and at node 1"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A transit router must not end up holding the destination under the
+/// source's coordinates after the source's cache entry for it is gone.
+///
+/// Not a red-first test: a source routes to a destination that is not a
+/// direct peer only through its coordinate cache, so on a miss there is no
+/// next hop and no frame reaches the transit router at all. This constructs
+/// that rather than leaving it to a reading of the routing code.
+#[tokio::test]
+async fn test_a_transit_router_does_not_learn_the_source_coordinates_as_the_destinations() {
+    // Only A sends coordinates, so nothing but a frame from A can re-warm
+    // A's entry for B once it is removed.
+    let configs = (0..3)
+        .map(|i| {
+            let mut config = Config::new();
+            config.node.rekey.enabled = false;
+            if i != 0 {
+                config.node.session.coords_warmup_packets = 0;
+            }
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1), (1, 2)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let a_addr = *nodes[0].node.node_addr();
+    let t_addr = *nodes[1].node.node_addr();
+    let b_addr = *nodes[2].node.node_addr();
+    let a_coords = nodes[0].node.tree_state().my_coords().clone();
+    let b_pubkey = nodes[2].node.identity().pubkey_full();
+
+    nodes[0]
+        .node
+        .initiate_session(b_addr, b_pubkey)
+        .await
+        .expect("initiate_session failed");
+    pump_until_quiet(&mut nodes).await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&b_addr)
+            .is_some_and(|e| e.is_established()),
+        "precondition: A and B must hold an established session"
+    );
+    assert!(
+        nodes[2]
+            .node
+            .get_session(&a_addr)
+            .is_some_and(|e| e.is_established()),
+        "precondition: B must hold the session too"
+    );
+
+    // T reports the path to B broken, and A's entry for B goes.
+    deliver_path_broken(&mut nodes, 0, b_addr, t_addr).await;
+    assert!(
+        nodes[0]
+            .node
+            .coord_cache()
+            .get(&b_addr, wall_clock_ms())
+            .is_none(),
+        "precondition: A's entry for B must be gone"
+    );
+
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+    let sent = nodes[0]
+        .node
+        .send_session_data(&b_addr, 0, 0, b"after the cache miss")
+        .await;
+    pump_until_quiet(&mut nodes).await;
+
+    assert_ne!(
+        cached_path(&nodes[1], &b_addr),
+        Some(addr_path(&a_coords)),
+        "T must not hold B under A's coordinates"
+    );
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "T must not be sent a coordinate filed under the wrong address"
+    );
+    assert!(
+        sent.is_err(),
+        "with no coordinates cached for B, A has no route to it, which is why \
+         no transit router can see the frame"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+// ============================================================================
 // Tick-loop maintenance with periodic rekey disabled
 // ============================================================================
 
