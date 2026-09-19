@@ -164,6 +164,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indistinguishable from an idle one. A kernel built without
   `CONFIG_NF_CONNTRACK_PROCFS` has no `/proc/net/nf_conntrack` at all and fails
   identically every tick, so a repeat is logged at debug rather than warn.
+- The gateway says at startup whether it can read conntrack sessions. It
+  reads the table once, as each tick does, and logs either the source it read
+  or that no source is readable and session pinning is off. An operator on a
+  kernel with no readable source learned this only from a warning at the first
+  failed tick.
 - The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
   `fips_gateway` table in a batch of its own, discarded that batch's result,
   and only then sent the batch that recreated the table, the chains, the

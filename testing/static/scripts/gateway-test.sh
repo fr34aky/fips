@@ -153,6 +153,27 @@ if [ "$DNS_READY" != true ]; then
     echo "  WARNING: Gateway DNS did not respond within 30s, continuing anyway"
 fi
 
+# The gateway names its conntrack source once at startup, before the DNS
+# resolver starts, so by now the line is in the log. Ask the gateway's own
+# namespace which source it should have found. A failed `docker logs` reds the
+# check rather than counting as zero lines.
+if docker exec "$GATEWAY" test -e /proc/net/nf_conntrack; then
+    EXPECT_SRC=proc
+else
+    EXPECT_SRC=none
+fi
+if GW_START_LOG=$(docker logs "$GATEWAY" 2>&1); then
+    SRC_PROC=$(grep -cF 'Conntrack source: proc; session pinning is on' <<< "$GW_START_LOG" || true)
+    SRC_NONE=$(grep -cF 'No conntrack source is readable; session pinning is off' <<< "$GW_START_LOG" || true)
+    case "$EXPECT_SRC" in
+        proc) SRC_OK=$([ "$SRC_PROC" -eq 1 ] && [ "$SRC_NONE" -eq 0 ] && echo 0 || echo 1) ;;
+        *) SRC_OK=$([ "$SRC_NONE" -eq 1 ] && [ "$SRC_PROC" -eq 0 ] && echo 0 || echo 1) ;;
+    esac
+    check "Conntrack source line at startup (expect $EXPECT_SRC; proc lines $SRC_PROC, none lines $SRC_NONE)" "$SRC_OK"
+else
+    check "Conntrack source line at startup (docker logs failed)" 1
+fi
+
 # Phase 3: Client network setup — route virtual IP pool via gateway
 echo ""
 echo "Phase 3: Client network setup"

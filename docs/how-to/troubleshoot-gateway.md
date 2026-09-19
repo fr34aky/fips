@@ -159,6 +159,28 @@ failed to bind the socket and continued without it (the warning
 `Failed to bind gateway control socket — continuing without it` is
 in the journal in that case).
 
+### Session pinning is off
+
+The gateway keeps a mapping while conntrack shows sessions to its
+virtual IP. At startup it reads conntrack once, the same way each
+10 s tick does, and logs which source answered:
+
+- `Conntrack source: proc; session pinning is on`: sessions are read
+  from `/proc/net/nf_conntrack`.
+- `No conntrack source is readable; session pinning is off`: no
+  source could be read, and the line carries the error. Every mapping
+  then reads zero sessions, so a mapping is reclaimed on its TTL and
+  grace period alone, even while a client that has not re-queried DNS
+  still has traffic flowing through it.
+
+The proc file exists only on a kernel built with
+`CONFIG_NF_CONNTRACK_PROCFS`, and only once `nf_conntrack` is loaded:
+
+```sh
+ls /proc/net/nf_conntrack
+grep NF_CONNTRACK_PROCFS /boot/config-$(uname -r)
+```
+
 ## Outbound-half diagnostics
 
 Symptoms in this section all involve a LAN client trying to reach a

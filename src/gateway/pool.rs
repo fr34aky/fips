@@ -159,6 +159,93 @@ impl ConntrackQuerier for ProcConntrack {
     }
 }
 
+/// Where a conntrack snapshot was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConntrackSource {
+    /// `/proc/net/nf_conntrack`.
+    Proc,
+}
+
+impl ConntrackSource {
+    /// Short name of the source.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Proc => "proc",
+        }
+    }
+}
+
+/// Why no conntrack source could be read.
+#[derive(Debug)]
+pub struct ConntrackUnreadable {
+    /// The error reading `/proc/net/nf_conntrack`.
+    pub proc: std::io::Error,
+}
+
+impl ConntrackUnreadable {
+    /// The error that stands for the whole failed read.
+    fn into_error(self) -> std::io::Error {
+        self.proc
+    }
+}
+
+/// The conntrack reader the gateway uses, which also says which source
+/// answered.
+///
+/// The per-tick read and the startup probe both go through this type, so the
+/// probe cannot report a source the tick would not use. The querier is a type
+/// parameter so tests can substitute fakes.
+pub struct SystemConntrack<P = ProcConntrack> {
+    proc: P,
+}
+
+impl<P: ConntrackQuerier> SystemConntrack<P> {
+    /// A reader over the given proc querier.
+    pub fn new(proc: P) -> Self {
+        Self { proc }
+    }
+
+    /// Read conntrack once and say which source the snapshot came from.
+    pub fn read(&self) -> Result<(ConntrackSource, ConntrackSnapshot), ConntrackUnreadable> {
+        match self.proc.snapshot() {
+            Ok(snapshot) => Ok((ConntrackSource::Proc, snapshot)),
+            Err(proc) => Err(ConntrackUnreadable { proc }),
+        }
+    }
+}
+
+impl Default for SystemConntrack {
+    fn default() -> Self {
+        Self::new(ProcConntrack)
+    }
+}
+
+impl<P: ConntrackQuerier> ConntrackQuerier for SystemConntrack<P> {
+    fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+        self.read()
+            .map(|(_, snapshot)| snapshot)
+            .map_err(ConntrackUnreadable::into_error)
+    }
+}
+
+/// Outcome of the startup check for a readable conntrack source.
+#[derive(Debug)]
+pub enum ConntrackProbe {
+    /// Sessions can be read, from this source.
+    Found(ConntrackSource),
+    /// No source can be read, so every mapping reads zero sessions and session
+    /// pinning is off.
+    Missing(ConntrackUnreadable),
+}
+
+/// Read conntrack once, as a tick would, and report which source answered.
+pub fn probe_conntrack<P: ConntrackQuerier>(reader: &SystemConntrack<P>) -> ConntrackProbe {
+    match reader.read() {
+        Ok((source, _)) => ConntrackProbe::Found(source),
+        Err(e) => ConntrackProbe::Missing(e),
+    }
+}
+
 /// Count conntrack lines by the destination addresses they name.
 ///
 /// Every `dst=` value is parsed as an address and compared as an address. The
@@ -1134,5 +1221,43 @@ mod tests {
             ReadReport::Changed,
             "a different failure is a different outcome and is worth a line"
         );
+    }
+
+    /// A conntrack querier that succeeds with an empty snapshot, or fails with
+    /// a fixed error kind.
+    struct FixedRead(Option<std::io::ErrorKind>);
+
+    impl ConntrackQuerier for FixedRead {
+        fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+            match self.0 {
+                None => Ok(ConntrackSnapshot::default()),
+                Some(kind) => Err(kind.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn conntrack_probe_names_the_proc_source_when_the_proc_read_succeeds() {
+        let reader = SystemConntrack::new(FixedRead(None));
+
+        match probe_conntrack(&reader) {
+            ConntrackProbe::Found(source) => {
+                assert_eq!(source, ConntrackSource::Proc);
+                assert_eq!(source.name(), "proc");
+            }
+            ConntrackProbe::Missing(e) => panic!("expected the proc source, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn conntrack_probe_reports_missing_with_the_error_when_the_proc_read_fails() {
+        let reader = SystemConntrack::new(FixedRead(Some(std::io::ErrorKind::PermissionDenied)));
+
+        match probe_conntrack(&reader) {
+            ConntrackProbe::Missing(e) => {
+                assert_eq!(e.proc.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            ConntrackProbe::Found(source) => panic!("expected no source, got {source:?}"),
+        }
     }
 }
