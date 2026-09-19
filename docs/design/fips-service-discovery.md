@@ -367,7 +367,10 @@ DNS resolution does today (`DnsResolvedIdentity` in
 `src/upper/dns.rs`). After that the provider is routable.
 
 With flag `E` the body has a different layout and carries no
-signature; see [Scopes](#scopes-and-groups).
+signature; see [Scopes](#scopes-and-groups). Coordinates from a sealed
+response are cached as `Hint`, never as `Verified`: any group member
+can produce one, so they must not outrank or overwrite coordinates
+that a signed proof established.
 
 #### Forwarding
 
@@ -405,20 +408,37 @@ keeps the nearest `max_responses` per key until they pass
 query:
 
 1. It answers with its cached locators, flag `C` set.
-2. If it can supply `max_responses` fresh locators, it does not
-   forward.
+2. If it can supply `max_responses` fresh locators, it forwards only
+   one query in `cache_forward_every` (4) for that key, again subject
+   to `ttl` and the forward limiter.
 3. Otherwise it forwards, subject to `ttl` and the forward limiter.
 
-Because a full cache is not refreshed while the node does not forward,
-it drains within two minutes and the next query floods again. New
-providers therefore become visible within that time, and a withdrawn
-one disappears within it.
+Two rules keep the cache from becoming a way to end other people's
+searches:
+
+- **A full cache never stops forwarding completely.** "Nearest wins"
+  plus "full means stop" would let a sybil with `max_responses`
+  identities next to a busy transit node win every refill and cut
+  everyone behind that node off from all other providers — without
+  being on anyone's path. With one query in four still forwarded,
+  honest locators keep arriving.
+- **No single downstream peer may hold more than half of a key's
+  cache slots**, the same share rule that applies to the
+  `max_responses` counter. Identities that all sit behind one link
+  compete with each other for that half; the other half goes to
+  locators that arrived over other links, even if they are further
+  away.
+
+A full cache is refreshed by the forwarded quarter and otherwise
+drains within two minutes. New providers therefore become visible
+within that time, and a withdrawn one disappears within it.
 
 An earlier draft left transit answering out because it "lets a node
-suppress competitors' answers". That is true with or without a cache:
-any transit node can drop responses it does not like. The threat is
-covered under [Security](#security-and-threat-model); leaving the
-cache out would not remove it.
+suppress competitors' answers". A hostile *transit node* can do that
+with or without a cache: it can drop any response it does not like.
+What the cache adds is the hostile *provider* next to an honest
+transit node, which the two rules above address. Both threats are
+covered under [Security](#security-and-threat-model).
 
 Sealed responses cannot be cached — they are encrypted per request —
 so blinded keys always travel to the provider. Group queries are few
@@ -574,7 +594,12 @@ The discovery wire protocol is identical in both cases:
   transit node could replay an observed key and learn that someone
   answers; without the timestamp it could replay a whole observed
   query after the dedup window and learn the direction and round-trip
-  time of a provider.
+  time of a provider. The timestamp alone does not close that: the
+  lookup dedup table forgets a `request_id` after
+  `recent_expiry_secs` (10 s), well inside the 30-second tolerance. A
+  provider therefore keeps its own set of authenticated `request_id`s
+  for the full acceptance window (60 s, both directions of skew) and
+  answers each one once.
 - The response is sealed. After `path_mtu` it carries a random 12-byte
   `nonce` and one ChaCha20-Poly1305 ciphertext over `responder ‖
   coords ‖ issued_at`, under a key derived from `k_seal` and
@@ -591,7 +616,10 @@ The discovery wire protocol is identical in both cases:
   group — exactly what the unsigned record avoids. The price: a member
   can forge a locator that names another member. The session to that
   node then finds no such service, and the forger has gained nothing
-  it could not do by lying in a record.
+  it could not do by lying in a record. Because the coordinates in it
+  are unauthenticated too, the requester caches them as `Hint`
+  (`src/cache/entry.rs`); cached as `Verified`, a forged locator would
+  let a member plant wrong coordinates for another member's address.
 - On the fetch port the requester adds `HMAC(k_auth, "fetch" ‖
   client pubkey ‖ provider pubkey ‖ req_id)`, binding the proof to
   this session.
@@ -691,6 +719,8 @@ node:
       max_group_poll: 64
     locator_refresh_secs: 30
     locator_max_age_secs: 120
+    cache_forward_every: 4            # a full transit cache still
+                                      # forwards one query in four
     publish_to_directories: false
     trust:
       providers: any          # any | known
@@ -857,7 +887,9 @@ Points the implementation has to handle:
 | `ttl`, `max_responses` clamp | transit | local lookup TTL, local `max_responses` |
 | Responses relayed per request | transit | 8, at most half from one downstream peer while others are pending |
 | Forward interval per (key, inbound peer) | transit | 2 s; suppressed plain queries are answered from cache |
-| Locator cache | transit | 8 per key, 256 keys, LRU |
+| Locator cache | transit | 8 per key, at most half from one downstream peer, 256 keys, LRU |
+| Forwarding with a full cache | transit | one query in 4 per key |
+| Answered group `request_id`s | provider | remembered for 60 s, each answered once |
 | Queries per link peer | transit | token bucket |
 | Service filter inbound FPR | every node | own cap, default as `node.bloom.max_inbound_fpr` |
 | Fetch requests per session | provider | token bucket |
@@ -880,8 +912,12 @@ Points the implementation has to handle:
 - **Suppression and eclipse.** A transit node can drop responses, and
   a sybil near the origin can answer first with many identities and
   fill the `max_responses` counters downstream, so that honest answers
-  are dropped. The per-downstream-peer share of the counter limits
-  what one branch can crowd out, the origin prefers answers that
+  are dropped. The same sybil next to an honest transit node could
+  fill that node's locator cache and, if a full cache stopped
+  forwarding, end the search for everyone behind it. The
+  per-downstream-peer share of the counter *and of the cache* limits
+  what one branch can crowd out, a full cache still forwards one
+  query in four, the origin prefers answers that
   arrived over different first-hop peers when it has a choice, and a
   client that needs more than "some provider" sets
   `trust.providers: known`. Against a hostile node on the only path,
@@ -941,8 +977,10 @@ Points the implementation has to handle:
   fades if routing filters grow as planned, but larger filters need a
   protocol version of their own — v1 nodes must reject any other
   `size_class` — so transparency through old nodes is lost either way,
-  a v1 `FilterAnnounce` is already about 1,071 bytes of a 1,243-byte
-  link budget, and constrained nodes that fold filters down would
+  a v1 `FilterAnnounce` payload is already 1,035 bytes of a link
+  budget of about 1,243 on a 1,280-byte transport (roughly 1,071 of
+  1,280 on the wire), and constrained nodes that fold filters down
+  would
   carry the pollution at the worst FPR.
 - **A per-request proof, as in `LookupResponse`.** Signing
   `request_id ‖ key ‖ coords` makes every answer fresh, but it cannot
@@ -987,10 +1025,11 @@ bound, the cache hit rate and how long a new provider stays invisible.
 - **Service filter size and mixed size classes.** Size class 0 is a
   guess. If routing filters move to mixed sizes with folding, does the
   service filter follow or stay fixed?
-- **Cache stickiness.** A full transit cache is not refreshed for up
-  to two minutes. Is that the right trade between load on the first
-  eight providers and visibility of new ones, or should a node forward
-  one query in *n* regardless?
+- **Cache stickiness.** A full transit cache forwards one query in
+  four and gives no downstream peer more than half of its slots. Both
+  numbers are guesses. They trade search traffic against how long a
+  new provider stays invisible, how much load the nearest providers
+  carry, and how much of a cache a well-placed sybil can hold.
 - **Clocks.** Locators and sealed queries assume clocks within 30
   seconds. Nostr events already assume roughly that; is it acceptable
   for small devices without a battery-backed clock?

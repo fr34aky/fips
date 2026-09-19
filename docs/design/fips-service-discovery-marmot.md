@@ -121,15 +121,12 @@ Locate and Fetch: the record is sent as a Marmot application message
 through the in-mesh relays. It has two layers. The inner event is what
 members read. It follows Marmot's application payload shape: the
 fields of a Nostr event with `id` but without `sig`, which Marmot
-forbids on inner events. MLS authenticates the sender, and a receiver
-checks that `pubkey` is a node npub that the sender's credential may
-speak for (the node itself, or a verified delegation), so the record
-stays bound to the node's address.
+forbids on inner events.
 
 ```json
 {
   "id": "<sha256 of the NIP-01 serialization>",
-  "pubkey": "<node pubkey>",
+  "pubkey": "<account pubkey of the MLS sender>",
   "created_at": 1790000000,
   "kind": 37196,
   "tags": [
@@ -137,11 +134,30 @@ stays bound to the node's address.
     ["s", "http"],
     ["port", "8080", "tcp"],
     ["name", "lab dashboard"],
+    ["node", "<node pubkey, 64 hex characters>"],
     ["valid_until", "1790003600"]
   ],
   "content": ""
 }
 ```
+
+`pubkey` is the *account* key, not the node key. Marmot requires a
+receiver to compare the inner event's `pubkey` with the account
+identity authenticated by the MLS sender leaf and to drop the payload
+on a mismatch, so with a delegated account key a record that carried
+the node pubkey there would be discarded by every compliant client
+before discovery ever saw it. This is the one place where a service
+record's `pubkey` is not the node: the node is named by the `node`
+tag. Two checks keep the record bound to the node's address:
+
+1. Marmot's own check: `pubkey` equals the MLS sender's account.
+2. The companion's check: that account holds a verified, unexpired
+   delegation for the key in the `node` tag, or *is* that key.
+
+A record that fails the second check is dropped. When the companion
+hands a record to the daemon's discovery cache it rewrites it into the
+ordinary form: `pubkey` becomes the node key and the `node` tag is
+removed.
 
 The inner event travels in an MLS application message, published as
 Marmot's kind `445`. This is all a relay sees:
@@ -160,9 +176,10 @@ Marmot's kind `445`. This is all a relay sees:
 }
 ```
 
-The inner record uses `valid_until` rather than `expiration` — the
-only place where a service record does — because Marmot treats
-retention as group state, not a sender preference: a sender-supplied
+The inner record also uses `valid_until` rather than `expiration` —
+again the only place where a service record does — because Marmot
+treats retention as group state, not a sender preference: a
+sender-supplied
 `expiration` tag is replaced or removed according to the group's
 message-retention component, and the outer kind `445` carries an
 `expiration` tag only when that component enables retention. A group
