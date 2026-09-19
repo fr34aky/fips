@@ -10,12 +10,19 @@
 # releases it did not.
 #
 # Usage: build-deb-container.sh [--output-dir DIR] [--version V] [--features LIST]
-#                               [--rebuild-image]
+#                               [--rebuild-image] [--image-archive PATH]
+#        build-deb-container.sh --print-image-tag
 #
-# Requires docker. The image is cached between runs under a tag made of the
-# floor image, the Rust toolchain and a hash of Dockerfile.build, so a change to
-# any of the three builds a new image; the source is mounted rather than copied,
-# so editing code does not invalidate it.
+# Requires docker, except for --print-image-tag. The image is cached between
+# runs under a tag made of the floor image, the Rust toolchain and a hash of
+# Dockerfile.build, so a change to any of the three builds a new image; the
+# source is mounted rather than copied, so editing code does not invalidate it.
+#
+# --print-image-tag prints that tag and exits. --image-archive carries the image
+# between hosts that do not share a docker daemon, such as fresh CI runners:
+# when the image is absent and PATH exists it is loaded from there, and when
+# this run builds the image it is saved there. A bad archive is warned about and
+# the image rebuilt; it never fails the build.
 
 set -euo pipefail
 
@@ -29,6 +36,8 @@ DEST_DIR="$REPO_ROOT/deploy"
 VERSION=""
 FEATURES=""
 REBUILD_IMAGE=0
+PRINT_TAG=0
+IMAGE_ARCHIVE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,15 +45,12 @@ while [[ $# -gt 0 ]]; do
         --version)       VERSION="${2:?missing value for --version}"; shift 2 ;;
         --features)      FEATURES="${2:?missing value for --features}"; shift 2 ;;
         --rebuild-image) REBUILD_IMAGE=1; shift ;;
-        -h|--help)       sed -n '2,18p' "$0"; exit 0 ;;
+        --print-image-tag) PRINT_TAG=1; shift ;;
+        --image-archive) IMAGE_ARCHIVE="${2:?missing value for --image-archive}"; shift 2 ;;
+        -h|--help)       sed -n '2,25p' "$0"; exit 0 ;;
         *)               echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
-
-command -v docker >/dev/null 2>&1 || {
-    echo "build-deb-container: docker is required and was not found." >&2
-    exit 2
-}
 
 # Read the toolchain from the pin rather than choosing one here, and put it in
 # the tag so a bump rebuilds the image instead of silently reusing a stale one.
@@ -64,7 +70,50 @@ DOCKERFILE_HASH=$(sha256sum "$SCRIPT_DIR/Dockerfile.build" | cut -c1-12) || DOCK
 
 IMAGE_TAG="fips-deb-builder:${FIPS_BUILD_IMAGE//[:\/]/-}-rust${RUST_TOOLCHAIN}-${DOCKERFILE_HASH}"
 
-if [ "$REBUILD_IMAGE" -eq 1 ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+# Before the docker check, so a workflow can key a cache on the tag without
+# docker being involved.
+if [ "$PRINT_TAG" -eq 1 ]; then
+    printf '%s\n' "$IMAGE_TAG"
+    exit 0
+fi
+
+command -v docker >/dev/null 2>&1 || {
+    echo "build-deb-container: docker is required and was not found." >&2
+    exit 2
+}
+
+# A problem with the image archive is a warning, not a failure: the archive only
+# saves time, and failing a release over a bad cache entry would hold the tag
+# until someone removed the entry by hand. The ::warning:: line puts it on the
+# GitHub run summary; the plain line is for everywhere else.
+archive_warning() {
+    echo "::warning::build-deb-container: $*"
+    echo "build-deb-container: warning: $*" >&2
+}
+
+# Stays unset when the image was found or loaded, so only an image this run
+# built is saved: saving a loaded one would only rewrite the archive it came from.
+BUILT_IMAGE=0
+if [ "$REBUILD_IMAGE" -eq 1 ]; then
+    BUILT_IMAGE=1
+elif docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    echo "=== Using cached $IMAGE_TAG ===" >&2
+elif [ -n "$IMAGE_ARCHIVE" ] && [ -f "$IMAGE_ARCHIVE" ]; then
+    echo "=== Loading $IMAGE_TAG from $IMAGE_ARCHIVE ===" >&2
+    if ! docker load -i "$IMAGE_ARCHIVE" >&2; then
+        archive_warning "could not load $IMAGE_ARCHIVE; building $IMAGE_TAG instead"
+        BUILT_IMAGE=1
+    elif ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+        archive_warning "$IMAGE_ARCHIVE does not hold $IMAGE_TAG; building it instead"
+        BUILT_IMAGE=1
+    else
+        echo "=== Using $IMAGE_TAG loaded from $IMAGE_ARCHIVE ===" >&2
+    fi
+else
+    BUILT_IMAGE=1
+fi
+
+if [ "$BUILT_IMAGE" -eq 1 ]; then
     echo "=== Building $IMAGE_TAG from $FIPS_BUILD_IMAGE with Rust $RUST_TOOLCHAIN ===" >&2
     docker build \
         --build-arg "BASE=$FIPS_BUILD_IMAGE" \
@@ -72,8 +121,19 @@ if [ "$REBUILD_IMAGE" -eq 1 ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 
         -t "$IMAGE_TAG" \
         -f "$SCRIPT_DIR/Dockerfile.build" \
         "$SCRIPT_DIR"
-else
-    echo "=== Using cached $IMAGE_TAG ===" >&2
+
+    # Written to a temporary name and renamed, so a failed or interrupted save
+    # never leaves a truncated archive where a cache step would pick it up.
+    if [ -n "$IMAGE_ARCHIVE" ]; then
+        ARCHIVE_TMP="$IMAGE_ARCHIVE.tmp.$$"
+        if docker save "$IMAGE_TAG" -o "$ARCHIVE_TMP" >&2 \
+                && mv -f "$ARCHIVE_TMP" "$IMAGE_ARCHIVE"; then
+            echo "=== Saved $IMAGE_TAG to $IMAGE_ARCHIVE ===" >&2
+        else
+            rm -f "$ARCHIVE_TMP"
+            archive_warning "could not save $IMAGE_TAG to $IMAGE_ARCHIVE; the next run will build it again"
+        fi
+    fi
 fi
 
 # Derive the version and the timestamp on the host and pass both in, because a

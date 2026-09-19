@@ -102,7 +102,9 @@ and exchanges datagrams on it with no TUN device and no IPv6 emulation.
 Runs `fips-dns-setup` against each supported Linux resolver backend in
 systemd containers, verifying backend detection, generated config and
 teardown, plus an end-to-end scenario that resolves a `.fips` name
-through the configured backend.
+through the configured backend. The end-to-end scenarios run the
+binaries from a Debian package: `--deb PATH` supplies one, and without
+it the suite builds one through `packaging/debian/build-deb-container.sh`.
 
 ### [deb-install/](deb-install/) -- Debian Package Install
 

@@ -263,6 +263,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against `chacha20` at either version, and 0.10.1 was withdrawn by its
   maintainer rather than flagged by an advisory. What it buys is that a fresh
   checkout can resolve the lockfile without reaching for a yanked version.
+- The dns-resolver test suite's end-to-end scenarios now run the `fips` and
+  `fips-gateway` binaries from the Debian package rather than compiling their
+  own. The suite used to build both in a Debian 12 image with whatever Rust was
+  current, a second release build on every CI run with no cache, and not the
+  toolchain or the build that ships. It now takes `--deb PATH`, and CI hands it
+  the package the install suite installs, so one package build serves both; run
+  on its own it builds the package through the same container script the
+  release uses. The GitHub leg moves to a job of its own that waits for the
+  package build, with its check name unchanged, and a local CI run builds the
+  package once for both suites. The suite now needs `dpkg-deb` on the host.
+- The Linux release and CI package builds reuse their builder image across
+  GitHub runners instead of assembling it on every leg from apt, rustup and a
+  compile of `cargo-deb`. `build-deb-container.sh` gains `--print-image-tag` and
+  `--image-archive PATH`: the workflows key an Actions cache entry on the image
+  tag, load the image from it when present, and save it after a build. Only a
+  push to `maint`, `master` or `next` saves an entry; pull requests and topic
+  branches read the default branch's. A corrupt or mismatched archive is a
+  warning and a rebuild, never a failed build. A cached image is not refreshed
+  from apt or the base image until the base image name, the toolchain or
+  `Dockerfile.build` changes, as was already true of a developer's machine.
 
 ## [0.5.1] - 2026-09-06
 

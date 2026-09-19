@@ -27,6 +27,8 @@
 #   dns-resolver is the one leg still compared at leg granularity rather than
 #   per scenario: it is a single leg and a single suite on both sides, and it
 #   runs all of its scenarios internally. Its scenario list is NOT cross-checked.
+#   On GitHub it is the one leg of a job of its own (it waits for the package
+#   build), which the sweep across every job below finds like any other leg.
 #
 # The local suite set is discovered by sweeping ci-local.sh for *_SUITES arrays
 # rather than from a hardcoded list of variable names, and every run_suite
