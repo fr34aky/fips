@@ -1222,28 +1222,33 @@ async fn rekey_cutover_preserves_data_plane() {
     cleanup_nodes(&mut nodes).await;
 }
 
-/// A forged rekey msg2 that carries the initiator's live rekey index must not
-/// split the link.
+/// A two-node pair caught mid FMP rekey, with node 1's msg2 held back from
+/// node 0. Built by [`rekey_pair_with_held_msg2`].
+struct HeldMsg2Pair {
+    nodes: Vec<TestNode>,
+    node0_addr: NodeAddr,
+    node1_addr: NodeAddr,
+    fips0: crate::FipsAddress,
+    fips1: crate::FipsAddress,
+    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    node0_idx_before: Option<crate::utils::index::SessionIndex>,
+    node1_idx_before: Option<crate::utils::index::SessionIndex>,
+    rekey_idx: crate::utils::index::SessionIndex,
+    held_msg2: crate::transport::ReceivedPacket,
+}
+
+/// Build a two-node pair with an FSP session, age both link sessions past
+/// both rekey gates, start node 0's FMP rekey, deliver its msg1 to node 1
+/// only, and pull node 1's real msg2 out of node 0's queue.
 ///
-/// An on-path observer sees the rekey msg1 go out, reads the initiator's
-/// cleartext rekey index from it, and delivers a msg2 of the right size under
-/// that index ahead of the responder's real reply. Under IK the forgery cannot
-/// authenticate: only the responder's static key produces a msg2 the initiator
-/// can read. The IK responder has already committed its new session when it
-/// answered msg1 and cuts over on its own next rekey tick, so the initiator has
-/// to keep the cycle through the forgery and complete it on the real msg2. An
-/// initiator that gives the cycle up instead holds no session matching the one
-/// the responder now sends on.
-///
-/// Deterministic, no wall-clock wait: both sessions are backdated past node 0's
-/// time trigger and node 1's rekey-acceptance floor, node 1 never initiates,
-/// and every handshake message is delivered by hand.
-#[tokio::test]
-async fn forged_rekey_msg2_does_not_split_the_link() {
-    use crate::noise::HANDSHAKE_MSG2_SIZE;
-    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2, build_msg2};
+/// node 0 rekeys on time and node 1 only ever responds, so node 1 holds the
+/// new session it committed at msg1 and node 0 is mid-cycle when this
+/// returns. Both directions are shown to decode before the rekey, so a later
+/// delivery failure is the rekey's and not the harness's.
+async fn rekey_pair_with_held_msg2() -> HeldMsg2Pair {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2};
     use crate::transport::ReceivedPacket;
-    use crate::utils::index::SessionIndex;
 
     const REKEY_AFTER_SECS: u64 = 60;
 
@@ -1305,12 +1310,7 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
     let pre_rev = build_ipv6_packet(&fips1, &fips0, b"pre-rekey 1 to 0");
     nodes[0].node.handle_tun_outbound(pre_fwd.clone()).await;
     nodes[1].node.handle_tun_outbound(pre_rev.clone()).await;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if process_available_packets(&mut nodes).await == 0 {
-            break;
-        }
-    }
+    pump_until_quiet(&mut nodes).await;
     let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
     assert_eq!(got, vec![pre_fwd], "baseline node 0 to node 1 must decode");
     let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
@@ -1362,12 +1362,75 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
     let mut held: Vec<ReceivedPacket> =
         std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
     assert_eq!(held.len(), 1, "node 0 must have only node 1's msg2 queued");
-    let real_msg2 = held.remove(0);
+    let held_msg2 = held.remove(0);
     assert_eq!(
-        CommonPrefix::parse(&real_msg2.data).map(|p| p.phase),
+        CommonPrefix::parse(&held_msg2.data).map(|p| p.phase),
         Some(PHASE_MSG2),
         "the held packet must be node 1's msg2"
     );
+
+    HeldMsg2Pair {
+        nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node0_idx_before,
+        node1_idx_before,
+        rekey_idx,
+        held_msg2,
+    }
+}
+
+/// Deliver queued packets between the nodes until a round moves none, for at
+/// most 50 rounds of 10 ms.
+async fn pump_until_quiet(nodes: &mut [TestNode]) {
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if process_available_packets(nodes).await == 0 {
+            break;
+        }
+    }
+}
+
+/// A forged rekey msg2 that carries the initiator's live rekey index must not
+/// split the link.
+///
+/// An on-path observer sees the rekey msg1 go out, reads the initiator's
+/// cleartext rekey index from it, and delivers a msg2 of the right size under
+/// that index ahead of the responder's real reply. Under IK the forgery cannot
+/// authenticate: only the responder's static key produces a msg2 the initiator
+/// can read. The IK responder has already committed its new session when it
+/// answered msg1 and cuts over on its own next rekey tick, so the initiator has
+/// to keep the cycle through the forgery and complete it on the real msg2. An
+/// initiator that gives the cycle up instead holds no session matching the one
+/// the responder now sends on.
+///
+/// Deterministic, no wall-clock wait: both sessions are backdated past node 0's
+/// time trigger and node 1's rekey-acceptance floor, node 1 never initiates,
+/// and every handshake message is delivered by hand.
+#[tokio::test]
+async fn forged_rekey_msg2_does_not_split_the_link() {
+    use crate::noise::HANDSHAKE_MSG2_SIZE;
+    use crate::proto::fmp::wire::build_msg2;
+    use crate::transport::ReceivedPacket;
+    use crate::utils::index::SessionIndex;
+
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node0_idx_before,
+        node1_idx_before,
+        rekey_idx,
+        held_msg2: real_msg2,
+    } = rekey_pair_with_held_msg2().await;
 
     // The forgery: a well-formed header naming node 0's live rekey index, a
     // valid curve point as the ephemeral so the read gets as far as mixing it
@@ -1386,12 +1449,7 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
     nodes[0].node.handle_msg2(real_msg2).await;
     nodes[0].node.check_rekey().await;
     nodes[1].node.check_rekey().await;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if process_available_packets(&mut nodes).await == 0 {
-            break;
-        }
-    }
+    pump_until_quiet(&mut nodes).await;
 
     // node 1 cut over to the session it committed at msg1. Without this the
     // delivery checks below could pass because no rekey happened at all.
@@ -1405,12 +1463,7 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
     let post_rev = build_ipv6_packet(&fips1, &fips0, b"post-rekey 1 to 0");
     nodes[0].node.handle_tun_outbound(post_fwd.clone()).await;
     nodes[1].node.handle_tun_outbound(post_rev.clone()).await;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        if process_available_packets(&mut nodes).await == 0 {
-            break;
-        }
-    }
+    pump_until_quiet(&mut nodes).await;
 
     let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
     assert_eq!(
@@ -1444,6 +1497,112 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
     assert!(
         !peer.rekey_in_progress(),
         "node 0 must not be left mid-rekey"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A rekey msg2 lost in transit, with no attacker present, must not split the
+/// link.
+///
+/// node 1 answers node 0's rekey msg1, commits its new session at once, and
+/// cuts over on its own next rekey tick. node 1's msg2 never arrives. node 0
+/// walks its whole msg1 resend ladder, which node 1 now meets holding a young
+/// post-cutover session, then abandons the cycle at the budget, and its time
+/// cadence fires again. The pair must end up able to carry data both ways.
+///
+/// What this does not model: the tick loop and the link-dead reap are not
+/// driven, only the rekey tick and the resend function, each called by hand.
+/// The resend ladder runs on a synthetic millisecond clock, while node 1's
+/// session ages are real `Instant`s, so every resent msg1 lands inside node
+/// 1's 30 s post-cutover window, as it would in real time for the first 30 s.
+///
+/// It fails today at the node 1 to node 0 delivery: node 1 sends on the session
+/// it cut over to, addressed to the rekey index node 0 abandoned, and node 0's
+/// re-fired rekey msg1 is answered as a duplicate with a msg2 node 0 no longer
+/// has a dispatch entry for. Ignored until the responder stops committing ahead
+/// of the initiator.
+#[tokio::test]
+#[ignore = "known defect: a rekey msg2 lost in transit splits the link, because the \
+            responder cuts over to keys the initiator never installs"]
+async fn dropped_rekey_msg2_does_not_split_the_link() {
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node1_idx_before,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+
+    // The msg2 is lost. The helper already asserted it was a msg2 frame, so
+    // this drop is of the real reply.
+    drop(held_msg2);
+
+    // node 1 holds a pending session and no rekey in progress, so its tick
+    // cuts over to it.
+    nodes[1].node.check_rekey().await;
+    assert_ne!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must have cut over to the session it committed at msg1"
+    );
+
+    // node 0's msg1 resend ladder at the default 1 s interval and 2x backoff:
+    // resends at +1, +3, +7, +15 and +31 s, then the abandon past the budget.
+    let base_ms = Node::now_ms();
+    for offset_s in [1u64, 3, 7, 15, 31, 63] {
+        nodes[0]
+            .node
+            .resend_pending_rekeys(base_ms + offset_s * 1000)
+            .await;
+        pump_until_quiet(&mut nodes).await;
+    }
+    assert!(
+        !nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_in_progress(),
+        "node 0 must have abandoned the cycle at the resend budget"
+    );
+
+    // node 0 was never dampened (it never received a msg1 from node 1), so
+    // its cadence fires again.
+    nodes[0].node.check_rekey().await;
+    pump_until_quiet(&mut nodes).await;
+    nodes[0].node.check_rekey().await;
+    nodes[1].node.check_rekey().await;
+    pump_until_quiet(&mut nodes).await;
+
+    let post_fwd = build_ipv6_packet(&fips0, &fips1, b"post-loss 0 to 1");
+    let post_rev = build_ipv6_packet(&fips1, &fips0, b"post-loss 1 to 0");
+    nodes[0].node.handle_tun_outbound(post_fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(post_rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![post_fwd],
+        "node 0 to node 1 must decode after the lost msg2"
+    );
+
+    // The discriminating assertion, as in the forged-msg2 test: node 1 sends
+    // on the session it cut over to, addressed to node 0's rekey index, and
+    // node 0 decodes it only if it holds a session registered under it.
+    let handshake = &nodes[0].node.stats().handshake;
+    let (bad_state, unknown) = (handshake.bad_state, handshake.unknown_connection);
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![post_rev],
+        "node 1 to node 0 must decode after the lost msg2 \
+         (node 0 handshake rejects: bad_state={bad_state}, unknown_connection={unknown})"
     );
 
     cleanup_nodes(&mut nodes).await;
@@ -4501,40 +4660,39 @@ async fn test_forged_setups_from_one_link_peer_stop_creating_session_entries_onc
     cleanup_nodes(&mut nodes).await;
 }
 
+/// The limiter's clock for the refill test: tokio's paused clock, which the
+/// test moves with `tokio::time::advance` and nothing else moves.
+fn paused_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 #[tokio::test]
 async fn test_a_drained_setup_bucket_refills_and_admits_the_next_legitimate_setup() {
-    // The refill has to be slow enough that the draining loop below cannot be
-    // outrun by the refill it is draining against. At the 50/s this test used
-    // to run at, a token returned every 20 ms, so on a loaded runner the loop
-    // outlived its own window, the third setup was admitted, and the
-    // precondition failed on arrangement rather than on behaviour. At 2/s a
-    // delivery would have to take 500 ms to lose that race.
-    let mut nodes = make_setup_limited_pair(2, 2.0).await;
+    const BURST: u32 = 2;
+    const RATE: f64 = 2.0;
+    let mut nodes = make_setup_limited_pair(BURST, RATE).await;
 
-    // Deliver until one is actually refused, rather than assuming three is
-    // enough: a delivery the refill absorbs costs one more iteration and
-    // nothing else. The cap is what a runner slow enough to lose even this
-    // race trips, and it says so rather than reporting a drained bucket that
-    // was never drained.
+    // From here the limiter reads a clock only the test moves, so the drain
+    // cannot race a refill however slowly each delivery runs, and the refill
+    // below is exactly the one the test grants.
+    tokio::time::pause();
+    nodes[1].node.setup_rate_limiter.set_clock(paused_now);
+
     let before = nodes[1].node.stats().session.setup_rate_limited;
-    let mut delivered = 0;
-    while nodes[1].node.stats().session.setup_rate_limited == before {
-        assert!(
-            delivered < 50,
-            "the bucket must actually be drained before the refill is tested; \
-             50 forged setups drew no refusal, so each delivery is outlasting \
-             the 500 ms refill interval"
-        );
+    for _ in 0..=BURST {
         deliver_forged_setup_over_link(&mut nodes).await;
-        delivered += 1;
     }
+    assert_eq!(
+        nodes[1].node.stats().session.setup_rate_limited,
+        before + 1,
+        "the burst must be admitted and the one setup past it refused"
+    );
 
-    // A full burst back from empty at 2/s, so the legitimate setup below meets
-    // the same bucket however many tokens the drain left behind. The point
-    // being made is that the denial is transient and clears on its own; the
-    // length of the window is a function of the configured rate, not of the
-    // claim.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // A full burst back from empty at the configured rate, so the legitimate
+    // setup below meets a bucket the refill alone has restored. The denial
+    // is transient and clears on its own; how long it lasts is a function of
+    // the configured rate.
+    tokio::time::advance(Duration::from_secs_f64(f64::from(BURST) / RATE)).await;
     establish_pair_session(&mut nodes).await;
 
     cleanup_nodes(&mut nodes).await;
@@ -4839,6 +4997,24 @@ fn test_session_entry_size_stays_within_the_budget_the_cap_is_derived_from() {
 // Integration tests: a forged SessionAck against an in-flight initiation
 // ============================================================================
 
+/// A forged SessionAck of exactly the right length, carrying `from`'s tree
+/// coordinates.
+///
+/// The leading 33 bytes of its handshake payload are a valid compressed
+/// point, which is what makes it discriminate a rollback: random bytes
+/// usually fail `PublicKey::from_slice` before anything has been mixed into
+/// the symmetric state. The epoch ciphertext after it is zeroed, so the read
+/// fails only once the point has been mixed in.
+fn forged_session_ack(from: &TestNode) -> Vec<u8> {
+    let mut payload = Identity::generate().pubkey_full().serialize().to_vec();
+    payload.extend_from_slice(&[0u8; crate::noise::EPOCH_ENCRYPTED_SIZE]);
+    assert_eq!(payload.len(), crate::noise::XK_HANDSHAKE_MSG2_SIZE);
+    let coords = from.node.tree_state().my_coords().clone();
+    SessionAck::new(coords.clone(), coords)
+        .with_handshake(payload)
+        .encode()
+}
+
 #[tokio::test]
 async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_genuine_ack() {
     let mut nodes = make_rekey_disabled_pair().await;
@@ -4860,17 +5036,7 @@ async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_g
         .expect("initiating entry present")
         .last_activity();
 
-    // A forged ack of exactly the right length. The leading 33 bytes are a
-    // valid compressed point, which is the point of the test: random bytes
-    // usually fail `PublicKey::from_slice` before anything has been mixed
-    // into the symmetric state, so they would not discriminate the rollback.
-    let mut payload = Identity::generate().pubkey_full().serialize().to_vec();
-    payload.extend_from_slice(&[0u8; crate::noise::EPOCH_ENCRYPTED_SIZE]);
-    assert_eq!(payload.len(), crate::noise::XK_HANDSHAKE_MSG2_SIZE);
-    let coords = nodes[1].node.tree_state().my_coords().clone();
-    let forged = SessionAck::new(coords.clone(), coords)
-        .with_handshake(payload)
-        .encode();
+    let forged = forged_session_ack(&nodes[1]);
 
     nodes[0]
         .node
@@ -4919,6 +5085,617 @@ async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_g
             .expect("responder session present")
             .is_established(),
         "and the responder must reach Established too"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A SessionAck that fails to read must not end an FSP rekey the node
+/// initiated.
+///
+/// Nothing authenticates a SessionAck before its msg2 is read: the only tie
+/// to the rekey is the datagram's source address, which the sender chooses.
+/// So the rekey-initiator arm has to put its handshake back, rolled back to
+/// its pre-read state, and let the genuine ack complete the cycle, as the
+/// primary arm does for an initiation.
+#[tokio::test]
+async fn test_forged_session_ack_leaves_the_rekey_able_to_complete_on_the_genuine_ack() {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_ESTABLISHED};
+    use crate::transport::ReceivedPacket;
+
+    // node 0 rekeys after one message; node 1 never initiates.
+    let mut cfg0 = Config::new();
+    cfg0.node.rekey.after_messages = 1;
+    let mut cfg1 = Config::new();
+    cfg1.node.rekey.after_messages = u64::MAX;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    let mut nodes = run_tree_test_with_configs(vec![cfg0, cfg1], &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+
+    // One frame crosses node 0's rekey trigger.
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"before the rekey")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+
+    // node 0 sends its rekey SessionSetup; only node 1 is pumped, so node 1
+    // arms and its SessionAck waits in node 0's queue.
+    nodes[0].node.check_session_rekey().await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .is_some_and(|e| e.has_rekey_in_progress() && e.is_rekey_initiator()),
+        "node 0 must have initiated a rekey"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes[1..]).await;
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .is_some_and(|e| e.has_rekey_in_progress() && !e.is_rekey_initiator()),
+        "node 1 must have armed as the rekey responder"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let held: Vec<ReceivedPacket> =
+        std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
+    assert!(
+        !held.is_empty(),
+        "node 1's SessionAck must be queued at node 0"
+    );
+    for packet in &held {
+        assert_eq!(
+            CommonPrefix::parse(&packet.data).map(|p| p.phase),
+            Some(PHASE_ESTABLISHED),
+            "every held packet must be a link frame"
+        );
+    }
+
+    // The forgery arrives first, under node 1's address.
+    let forged = forged_session_ack(&nodes[1]);
+    nodes[0]
+        .node
+        .handle_session_payload(&node1_addr, &node1_addr, &forged, 1280, false)
+        .await;
+    let entry = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .expect("an unreadable ack must not remove the session");
+    assert!(
+        entry.has_rekey_in_progress() && entry.is_rekey_initiator(),
+        "the rekey must still be in flight after an ack that did not read"
+    );
+    assert_eq!(
+        nodes[0].node.stats().session.ack_handshake_failed,
+        1,
+        "the refusal must be counted"
+    );
+
+    // Release the genuine ack. This is the assertion that tells the outcomes
+    // apart: an initiator that abandoned on the forgery meets the genuine ack
+    // with no rekey in flight and completes nothing.
+    for packet in held {
+        nodes[0].node.handle_encrypted_frame(packet).await;
+    }
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 0 must complete the rekey on the genuine ack"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 1 must hold the new session after msg3"
+    );
+
+    // node 0 cuts over on its liveness timer, and data decodes both ways on
+    // the new epoch.
+    let now_ms = wall_clock_ms();
+    nodes[0]
+        .node
+        .sessions
+        .get_mut(&node1_addr)
+        .unwrap()
+        .set_rekey_completed_ms(now_ms - 10_000);
+    nodes[0].node.check_session_rekey().await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_none(),
+        "node 0 must have cut over"
+    );
+
+    let recv1_before = nodes[1]
+        .node
+        .get_session(&node0_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the rekey 0 to 1")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    let entry1 = nodes[1].node.get_session(&node0_addr).unwrap();
+    assert_eq!(
+        entry1.traffic_counters().1,
+        recv1_before + 1,
+        "node 0 to node 1 must decode on the new epoch"
+    );
+    assert!(
+        entry1.pending_new_session().is_none(),
+        "node 0's first new-epoch frame must complete node 1's cutover"
+    );
+
+    let recv0_before = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[1]
+        .node
+        .send_session_data(&node0_addr, 0, 0, b"after the rekey 1 to 0")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .traffic_counters()
+            .1,
+        recv0_before + 1,
+        "node 1 to node 0 must decode on the new epoch"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+// ============================================================================
+// Integration tests: a destination with no cached coordinates
+// ============================================================================
+
+/// Build a two-node routable mesh with periodic rekey off and an established
+/// FSP session from node 0 to node 1, with node 0's coordinate warmup budget
+/// set to `warmup`.
+///
+/// node 1's budget is 0, so none of its frames carry coordinates: each one
+/// that did would re-warm node 0's entry for node 1, and these tests need
+/// that entry to stay gone once they remove it.
+async fn make_warmup_pair(warmup: u8) -> Vec<TestNode> {
+    let configs = (0..2)
+        .map(|i| {
+            let mut config = Config::new();
+            config.node.rekey.enabled = false;
+            config.node.session.coords_warmup_packets = if i == 0 { warmup } else { 0 };
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+    pump_until_quiet(&mut nodes).await;
+    nodes
+}
+
+/// The address path `node` has cached for `addr`, if any.
+///
+/// Compared by address because coordinates carried in a session frame arrive
+/// without the declaration metadata a node's own copy holds.
+fn cached_path(node: &TestNode, addr: &NodeAddr) -> Option<Vec<NodeAddr>> {
+    node.node
+        .coord_cache()
+        .get(addr, wall_clock_ms())
+        .map(addr_path)
+}
+
+/// The address path of a coordinate, self to root.
+fn addr_path(coords: &crate::proto::stp::TreeCoordinate) -> Vec<NodeAddr> {
+    coords.node_addrs().copied().collect()
+}
+
+/// Deliver a PathBroken naming `dest` to `nodes[at]`, reported by `reporter`.
+/// The reporter must not be `dest`, or the signal is refused as forged before
+/// it removes anything.
+///
+/// Nothing is pumped afterwards: the handler starts a lookup, and in a small
+/// mesh its answer would refill the entry the signal removed before the test
+/// could send into the miss.
+async fn deliver_path_broken(
+    nodes: &mut [TestNode],
+    at: usize,
+    dest: NodeAddr,
+    reporter: NodeAddr,
+) {
+    use crate::proto::routing::PathBroken;
+    let encoded = PathBroken::new(dest, reporter).encode();
+    nodes[at]
+        .node
+        .handle_path_broken(&reporter, &encoded[5..])
+        .await;
+}
+
+/// A data frame to a destination whose coordinates this node does not have
+/// cached must not carry this node's own coordinates in their place.
+///
+/// The shape reached in practice: a direct peer whose cache entry is gone,
+/// here removed by a PathBroken from a third address. The destination warms
+/// its cache from every coordinate-bearing frame, so a frame carrying the
+/// sender's coordinates as the destination's leaves the destination holding
+/// its own address under the sender's coordinates. Once the coordinates are
+/// known again, the warmup budget the miss did not spend is spent on frames
+/// that carry them.
+#[tokio::test]
+async fn test_a_data_frame_to_a_destination_with_no_cached_coordinates_carries_none_and_keeps_the_warmup()
+ {
+    let mut nodes = make_warmup_pair(1).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node0_coords = nodes[0].node.tree_state().my_coords().clone();
+    let node1_coords = nodes[1].node.tree_state().my_coords().clone();
+
+    // A transit router reports the path to node 1 broken. It is a third
+    // address: a report "from" node 1 about node 1 is refused as forged.
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    deliver_path_broken(&mut nodes, 0, node1_addr, reporter).await;
+    assert!(
+        nodes[0]
+            .node
+            .coord_cache()
+            .get(&node1_addr, wall_clock_ms())
+            .is_none(),
+        "precondition: the PathBroken must have removed node 0's entry for node 1"
+    );
+    let warmup = |nodes: &[TestNode]| {
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .coords_warmup_remaining()
+    };
+    assert_eq!(warmup(&nodes), 1, "PathBroken resets the warmup budget");
+
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+    let recv_before = nodes[1]
+        .node
+        .get_session(&node0_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the cache miss")
+        .await
+        .expect("send_session_data failed");
+    // node 1 takes the frame, and node 0 then drops everything node 1 sent
+    // back. That includes the answer to the lookup the PathBroken started,
+    // which would both refill the cache and reset the warmup budget, and so
+    // hide whether the miss spent it.
+    process_available_packets(&mut nodes[1..]).await;
+    while nodes[0].packet_rx.try_recv().is_ok() {}
+
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "node 1 must not be sent node 0's coordinates as its own"
+    );
+    assert_ne!(
+        cached_path(&nodes[1], &node1_addr),
+        Some(addr_path(&node0_coords)),
+        "node 1 must not hold its own address under node 0's coordinates"
+    );
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .traffic_counters()
+            .1,
+        recv_before + 1,
+        "the frame must still be delivered"
+    );
+    assert_eq!(
+        warmup(&nodes),
+        1,
+        "a frame sent without coordinates must not spend the warmup budget"
+    );
+
+    // Node 0's cache is refilled without a discovery answer, so the only
+    // budget left to spend is the one the miss preserved. node 1's entry for
+    // node 0 is removed first, so the only way node 1 can learn node 0's
+    // coordinates again is from a frame that carries them.
+    let now_ms = wall_clock_ms();
+    nodes[0]
+        .node
+        .insert_coord_hint(node1_addr, node1_coords, now_ms);
+    nodes[1].node.coord_cache.remove(&node0_addr);
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the refill")
+        .await
+        .expect("send_session_data failed");
+    pump_until_quiet(&mut nodes).await;
+
+    assert_eq!(
+        cached_path(&nodes[1], &node0_addr),
+        Some(addr_path(&node0_coords)),
+        "the first frame after the refill must carry node 0's coordinates"
+    );
+    assert_eq!(
+        warmup(&nodes),
+        0,
+        "and it spends the warmup budget the miss preserved"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A standalone CoordsWarmup to a destination with no cached coordinates
+/// sends nothing: its only content would be this node's coordinates standing
+/// in for the destination's.
+#[tokio::test]
+async fn test_a_coords_warmup_to_a_destination_with_no_cached_coordinates_sends_nothing() {
+    let mut nodes = make_warmup_pair(5).await;
+    let node1_addr = *nodes[1].node.node_addr();
+
+    nodes[0].node.coord_cache.remove(&node1_addr);
+    let warmup_before = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .unwrap()
+        .coords_warmup_remaining();
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "precondition: node 1's queue is empty"
+    );
+
+    nodes[0]
+        .node
+        .send_coords_warmup(&node1_addr)
+        .await
+        .expect("a skipped warmup is not an error");
+
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "no CoordsWarmup may be sent without the destination's coordinates"
+    );
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .coords_warmup_remaining(),
+        warmup_before,
+        "the warmup budget must not move"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A rekey SessionSetup to a direct peer whose cache entry is gone carries
+/// the peer's own announced coordinates, not this node's.
+#[tokio::test]
+async fn test_a_rekey_setup_to_a_peer_with_no_cached_coordinates_carries_the_peers_announced_ones()
+{
+    // node 0 rekeys after one message; node 1 never initiates.
+    let mut cfg0 = Config::new();
+    cfg0.node.rekey.after_messages = 1;
+    let mut cfg1 = Config::new();
+    cfg1.node.rekey.after_messages = u64::MAX;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    let mut nodes = run_tree_test_with_configs(vec![cfg0, cfg1], &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_coords = nodes[1].node.tree_state().my_coords().clone();
+    assert_eq!(
+        nodes[0].node.tree_state().peer_coords(&node1_addr),
+        Some(&node1_coords),
+        "precondition: node 0 knows node 1's announced coordinates"
+    );
+
+    // One frame crosses node 0's rekey trigger, sent while the cache still
+    // holds node 1, so only the rekey setup can meet the miss.
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"before the rekey")
+        .await
+        .expect("send_session_data failed");
+    pump_until_quiet(&mut nodes).await;
+
+    // node 1's entry for its own address goes too, so what it holds after
+    // the rekey can only have come from the setup.
+    nodes[0].node.coord_cache.remove(&node1_addr);
+    nodes[1].node.coord_cache.remove(&node1_addr);
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+
+    nodes[0].node.check_session_rekey().await;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "the rekey setup must not name node 0's coordinates as node 1's"
+    );
+    assert_eq!(
+        cached_path(&nodes[1], &node1_addr),
+        Some(addr_path(&node1_coords)),
+        "the setup's destination coordinates must be node 1's own"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the rekey must complete at node 0"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "and at node 1"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A transit router must not end up holding the destination under the
+/// source's coordinates after the source's cache entry for it is gone.
+///
+/// Not a red-first test: a source routes to a destination that is not a
+/// direct peer only through its coordinate cache, so on a miss there is no
+/// next hop and no frame reaches the transit router at all. This constructs
+/// that rather than leaving it to a reading of the routing code.
+#[tokio::test]
+async fn test_a_transit_router_does_not_learn_the_source_coordinates_as_the_destinations() {
+    // Only A sends coordinates, so nothing but a frame from A can re-warm
+    // A's entry for B once it is removed.
+    let configs = (0..3)
+        .map(|i| {
+            let mut config = Config::new();
+            config.node.rekey.enabled = false;
+            if i != 0 {
+                config.node.session.coords_warmup_packets = 0;
+            }
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1), (1, 2)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+
+    let a_addr = *nodes[0].node.node_addr();
+    let t_addr = *nodes[1].node.node_addr();
+    let b_addr = *nodes[2].node.node_addr();
+    let a_coords = nodes[0].node.tree_state().my_coords().clone();
+    let b_pubkey = nodes[2].node.identity().pubkey_full();
+
+    nodes[0]
+        .node
+        .initiate_session(b_addr, b_pubkey)
+        .await
+        .expect("initiate_session failed");
+    pump_until_quiet(&mut nodes).await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&b_addr)
+            .is_some_and(|e| e.is_established()),
+        "precondition: A and B must hold an established session"
+    );
+    assert!(
+        nodes[2]
+            .node
+            .get_session(&a_addr)
+            .is_some_and(|e| e.is_established()),
+        "precondition: B must hold the session too"
+    );
+
+    // T reports the path to B broken, and A's entry for B goes.
+    deliver_path_broken(&mut nodes, 0, b_addr, t_addr).await;
+    assert!(
+        nodes[0]
+            .node
+            .coord_cache()
+            .get(&b_addr, wall_clock_ms())
+            .is_none(),
+        "precondition: A's entry for B must be gone"
+    );
+
+    let mismatch_before = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .coord_warm_key_mismatch
+        .get();
+    let sent = nodes[0]
+        .node
+        .send_session_data(&b_addr, 0, 0, b"after the cache miss")
+        .await;
+    pump_until_quiet(&mut nodes).await;
+
+    assert_ne!(
+        cached_path(&nodes[1], &b_addr),
+        Some(addr_path(&a_coords)),
+        "T must not hold B under A's coordinates"
+    );
+    assert_eq!(
+        nodes[1]
+            .node
+            .metrics()
+            .forwarding
+            .coord_warm_key_mismatch
+            .get(),
+        mismatch_before,
+        "T must not be sent a coordinate filed under the wrong address"
+    );
+    assert!(
+        sent.is_err(),
+        "with no coordinates cached for B, A has no route to it, which is why \
+         no transit router can see the frame"
     );
 
     cleanup_nodes(&mut nodes).await;
