@@ -25,11 +25,11 @@ internet is involved at any step.
 
 The proposal adds three capabilities:
 
-- **Announcing.** A node publishes a signed *service record* for each
-  service it wants found: type, port, protocol and a little metadata.
-  The record is a Nostr event signed with the node's FIPS identity
-  key. Each announcement has a scope: public, a list of npubs, a
-  shared-secret group, or a combination.
+- **Announcing.** A node publishes a *service record* for each service
+  it wants found: type, port, protocol and a little metadata. The
+  record is a Nostr event under the node's FIPS identity key. Each
+  announcement has a scope: public, a list of npubs, a shared-secret
+  group, or a combination.
 - **Finding.** A node asks the mesh for providers of a service type
   and gets back the nearest ones first. The answer carries everything
   needed to connect: npub, FIPS address, port, protocol.
@@ -46,12 +46,13 @@ Three existing properties of FIPS make this cheaper than it sounds:
    (`src/identity/address.rs`). A record signed by a pubkey is
    therefore bound to exactly one address. Nobody can announce a
    service on another node's address, a record never needs to carry an
-   address, and records can be cached or relayed by untrusted parties
-   without losing authenticity.
+   address, and public records can be cached or relayed by untrusted
+   parties without losing authenticity.
 2. **Bloom filters already answer "which direction".** Every node
    gossips a filter of what is reachable through it
-   ([fips-bloom-filters.md](fips-bloom-filters.md)). A service type
-   hashed into the same filter reuses all of that propagation.
+   ([fips-bloom-filters.md](fips-bloom-filters.md)). A second, small
+   filter for service keys reuses the same propagation rules and the
+   same code.
 3. **Sessions authenticate both ends.** An FSP session is Noise XK,
    so a provider knows the npub of whoever is asking. That is all an
    npub-list group needs.
@@ -81,8 +82,8 @@ Discovery is split into three planes. Only the first two are required.
 
 | Plane | Question answered | Mechanism |
 | ----- | ----------------- | --------- |
-| Locate | Which nodes offer service key *K*, and where are they in the tree? | Bloom-guided `ServiceQuery` / `ServiceResponse` link messages |
-| Fetch | What exactly does that node offer? | Signed Nostr events over an FSP session to a reserved port |
+| Locate | Which nodes offer service key *K*, and where are they in the tree? | A service bloom filter, and `ServiceQuery` / `ServiceResponse` link messages that carry cacheable signed *locators* |
+| Fetch | What exactly does that node offer? | Nostr events over an FSP session to a reserved port |
 | Index | What is out there? (browse, search) | In-mesh Nostr relays acting as directories |
 
 A typical public lookup:
@@ -90,12 +91,16 @@ A typical public lookup:
 ```text
 client                         transit                      provider
   |                               |                             |
-  |  bloom pre-check: some peer's filter contains K             |
-  |-- ServiceQuery(K, ttl=2) ---->|  (no match in range)        |
+  |  pre-check: some peer's service filter contains K           |
+  |-- ServiceQuery(K, ttl=1) ---->|  (no provider, empty cache) |
   |-- ServiceQuery(K, ttl=4) ---->|-- forwarded along tree ---->|
-  |                               |                             |  sign proof
-  |<-- ServiceResponse(pubkey, coords, proof) -- reverse path --|
-  |  verify proof, cache coords, prime identity cache           |
+  |                               |                             |  locator
+  |                               |                             |  (signed at
+  |                               |                             |  most every
+  |                               |                             |  30 s)
+  |<-- ServiceResponse(locator) --|<-- reverse path ------------|
+  |                               |  verify, cache locator
+  |  verify locator, cache coords, prime identity cache         |
   |                                                             |
   |== FSP session (Noise XK) to port 257 ======================>|
   |-- LIST nostr-relay ---------------------------------------->|
@@ -105,13 +110,17 @@ client                         transit                      provider
   `-> connect to [fd..]:7777
 ```
 
+The next client that asks the same transit node within the locator's
+lifetime is answered from its cache.
+
 ### Service records
 
 A service record is a parameterized replaceable Nostr event, tentative
 **kind 37196**, the sibling of the overlay advert kind 37195
 (`src/nostr/types.rs`,
 [../reference/nostr-events.md](../reference/nostr-events.md)). It is
-signed with the node's identity key; there is no separate service key.
+issued under the node's identity key; there is no separate service
+key.
 
 ```json
 {
@@ -119,28 +128,28 @@ signed with the node's identity key; there is no separate service key.
   "pubkey": "<node pubkey>",
   "created_at": 1790000000,
   "tags": [
-    ["d", "nostr-relay:7777"],
+    ["d", "nostr-relay:tcp:7777"],
     ["s", "nostr-relay"],
     ["port", "7777", "tcp"],
     ["scheme", "ws"],
     ["name", "andre's relay"],
     ["expiration", "1790003600"]
   ],
-  "content": ""
+  "content": "",
+  "id": "…",
+  "sig": "<signed by the node key>"
 }
 ```
 
 | Tag | Required | Meaning |
 | --- | -------- | ------- |
-| `d` | yes | Instance identifier, `<type>:<port>`. Makes the event replaceable per service instance. |
+| `d` | yes | Instance identifier, `<type>:<proto>:<port>`. Makes the event replaceable per service instance; the protocol is part of it so that the same type on the same port over `tcp` and `udp` stays two instances. |
 | `s` | yes | Service type. Single-letter so that Nostr relays index it and `{"#s": [...]}` filters work on directories. |
 | `port` | yes | Port and transport protocol (`tcp` or `udp`) on the node's FIPS address. |
 | `scheme` | no | URL scheme a client should use (`http`, `ws`, …). |
 | `path` | no | URL path prefix. |
 | `name` | no | Self-asserted display label. Not unique, not trusted. |
-| `expiration` | signed records | NIP-40 expiry. Records are short-lived and refreshed. |
-| `valid_until` | Marmot inner records | Same meaning as `expiration`, for records sent inside a Marmot group, where a sender's `expiration` tag does not survive. See [Records by scope](#records-by-scope). |
-| `-` | restricted records | NIP-70 protected-event marker. A receiver must not republish or re-serve the record; NIP-70-aware relays refuse it from anyone but the author. |
+| `expiration` | yes | NIP-40 expiry. Records are short-lived and refreshed. |
 
 `content` may hold service-specific JSON (for a relay, a subset of its
 NIP-11 document). A record is capped at 1024 bytes so that it always
@@ -149,11 +158,12 @@ fits in one FSP datagram; FIPS does not fragment
 
 Rules a consumer applies:
 
-- The event signature must verify, and the address to connect to is
-  *derived from `pubkey`*. The record has no address field on purpose.
-  An unsigned record is accepted only in the two forms described under
-  [Records by scope](#records-by-scope), where the channel it arrived
-  on authenticates `pubkey` instead.
+- The address to connect to is *derived from `pubkey`*. The record has
+  no address field on purpose.
+- A **public** record must carry a valid signature. A **restricted**
+  record is unsigned and is accepted only on the fetch port, where the
+  Noise XK session authenticates `pubkey` instead; see
+  [Records by scope](#records-by-scope).
 - When fetched directly, `pubkey` must equal the authenticated session
   peer. A node only serves its own records on the fetch port.
 - Newer `created_at` replaces older for the same `(pubkey, d)`.
@@ -185,12 +195,14 @@ receives the record, over which channel, and whether it is signed.
 | Scope | Form | Delivered over |
 | ----- | ---- | -------------- |
 | `public` | Signed event, as above | Fetch port; optionally directories |
-| `allow` (npub list) | Signed event with a `["-"]` tag | Fetch port only, to session peers on the list |
-| `secret`, static | Unsigned event with a `["-"]` tag | Fetch port only, after the group proof |
-| `secret`, Marmot-managed | Unsigned Marmot inner event inside a kind `445` group message | In-mesh relays; also the fetch port |
+| `allow` (npub list) | Unsigned event | Fetch port only, to session peers on the list |
+| `secret` | Unsigned event | Fetch port only, after the group proof |
+| `secret` + `allow` | Unsigned event | Fetch port only, after the group proof, to session peers on the list |
 
-An **npub-list** record is the public record plus the protected
-marker. It is never published to a relay.
+The rule behind the table: **a signature exists so that third parties
+can carry a record.** Public records are cached, relayed and stored on
+directories, so they are signed. Restricted records are never carried
+by anyone but their author, so they are never signed:
 
 ```json
 {
@@ -198,111 +210,95 @@ marker. It is never published to a relay.
   "pubkey": "<node pubkey>",
   "created_at": 1790000000,
   "tags": [
-    ["d", "blossom:3000"],
+    ["d", "blossom:tcp:3000"],
     ["s", "blossom"],
     ["port", "3000", "tcp"],
     ["scheme", "http"],
     ["name", "family photos"],
-    ["expiration", "1790003600"],
-    ["-"]
+    ["expiration", "1790003600"]
   ],
   "content": "",
-  "id": "…",
-  "sig": "<signed by the node key>"
+  "id": "<sha256 of the NIP-01 serialization>"
 }
 ```
 
-A **static secret group** record has the same fields and tags but no
-`sig`. The Noise XK session on the fetch port already authenticates
-the provider, and `pubkey` must equal the session peer. A signed copy
+The Noise XK session on the fetch port already authenticates the
+provider, and `pubkey` must equal the session peer. A signed copy
 would be transferable: a member who leaks it could prove to outsiders
 that the node offers the service. Without the signature the record is
 deniable, and it cannot be cached or relayed by anyone else, which is
-what a secret scope wants.
+what a restricted scope wants. The Locate plane keeps this property:
+a sealed `ServiceResponse` carries no signature either (see
+[Scopes and groups](#scopes-and-groups)).
 
-A **Marmot-managed group** record has two layers. The inner event is
-what members read. It follows Marmot's application payload shape: the
-fields of a Nostr event with `id` but without `sig`, which Marmot
-forbids on inner events. MLS authenticates the sender, the sender's
-credential is the node pubkey, and a receiver checks that `pubkey`
-matches it, so the record stays bound to the node's address.
+An unsigned event cannot be published to a relay at all, so restricted
+records need no NIP-70 `["-"]` marker.
 
-```json
-{
-  "id": "<sha256 of the NIP-01 serialization>",
-  "pubkey": "<node pubkey>",
-  "created_at": 1790000000,
-  "kind": 37196,
-  "tags": [
-    ["d", "http:8080"],
-    ["s", "http"],
-    ["port", "8080", "tcp"],
-    ["name", "lab dashboard"],
-    ["valid_until", "1790003600"]
-  ],
-  "content": ""
-}
-```
-
-The inner event travels in an MLS application message, published as
-Marmot's kind `445`. This is all a relay sees:
-
-```json
-{
-  "kind": 445,
-  "pubkey": "<fresh ephemeral key, used once>",
-  "created_at": 1790000003,
-  "tags": [
-    ["h", "<nostr_group_id, 64 hex characters>"]
-  ],
-  "content": "<base64(nonce || ChaCha20-Poly1305(group_event_key, MLS message))>",
-  "id": "…",
-  "sig": "<signed by the ephemeral key>"
-}
-```
-
-The inner record uses `valid_until` rather than `expiration` because
-Marmot treats retention as group state, not a sender preference: a
-sender-supplied `expiration` tag is replaced or removed according to
-the group's message-retention component, and the outer kind `445`
-carries an `expiration` tag only when that component enables
-retention. A group used for discovery SHOULD enable retention of about
-the record lifetime (one hour), so that relays drop stale
-announcements.
+Groups whose secrets are managed by an external key-agreement protocol
+may have a further channel for their records. The Marmot case is
+described in
+[fips-service-discovery-marmot.md](fips-service-discovery-marmot.md).
 
 ### Locate: finding providers
 
-#### Service keys in the bloom filter
+#### The service filter
 
-Each announcement contributes one 16-byte **service key** to the
-node's own bloom filter entries:
+Each `public` or `secret` announcement contributes one 16-byte
+**service key**:
 
 ```text
 public key  = SHA-256("fips-svc-v1" || type)[..16]
 ```
 
-The key goes in next to the node's own address and its leaf
-dependents, in `BloomState::compute_outgoing_filter` and `base_filter`
-(`src/proto/bloom/state.rs`), using the existing
-`BloomFilter::insert_bytes` (`src/proto/bloom/core.rs`). From there it
-propagates exactly like a node address: along tree edges, split
-horizon, debounced, subject to the inbound FPR cap.
+Service keys do **not** go into the routing bloom filter. They go into
+a second filter, the *service filter*, gossiped in its own link
+message, `ServiceFilterAnnounce = 0x21`, next to `FilterAnnounce =
+0x20` (`src/proto/link.rs`). The payload layout and the code are those
+of `FilterAnnounce` (`BloomFilter`, `src/proto/bloom/core.rs`); the
+state is a second instance of `BloomState`
+(`src/proto/bloom/state.rs`) whose own entries are the node's service
+keys instead of its address and leaf dependents. Propagation rules are
+identical: along tree edges, split horizon, debounced, rebuilt from
+scratch on every recompute, subject to its own inbound FPR cap.
+All peers receive the filter; only tree-peer filters are merged.
+
+The service filter is small, tentatively size class 0 (512 bytes,
+4,096 bits, k = 5). It holds one entry per service *type* and one per
+*(secret group, type)* in the whole mesh, not one per node: 200
+distinct keys give an FPR of 0.05 %, 500 give 2 %.
+
+**Capability is implicit.** A node sends one `ServiceFilterAnnounce`
+(possibly empty) when a link comes up, and afterwards only to peers
+from which it has received one. `ServiceQuery` is sent only to peers
+whose service filter is known. An old node logs one unknown message
+per link-up and is otherwise left alone.
 
 Consequences worth stating:
 
-- **No new propagation protocol.** `FilterAnnounce` is unchanged.
+- **A filter match means a query can get there.** The filter
+  propagates only across nodes that also forward queries, so the
+  pre-check never promises providers behind a node that would drop
+  the query.
+- **Routing is untouched.** Service keys consume no routing-filter
+  capacity, cannot push a routing filter over
+  `node.bloom.max_inbound_fpr`, and a poisoned service filter harms
+  discovery only. This holds on constrained nodes too, which the
+  scaling plan in [fips-bloom-filters.md](fips-bloom-filters.md)
+  expects to *fold* received routing filters down to a smaller size.
 - **Cost is per type, not per provider.** Every provider of
   `nostr-relay` inserts the same key, which sets the same bits. A
   thousand relays cost the mesh one filter entry.
-- **Old nodes participate without knowing.** To a node that predates
-  this feature a service key is just more bits to merge and forward.
 - **Withdrawal works.** Filters are rebuilt from scratch on every
   recompute, so a removed announcement disappears with the next
   update. Nothing relies on deleting from a bloom filter.
-- A service key is shaped like a `NodeAddr`, so the existing
-  `RoutingView::peers_reaching` (`src/proto/lookup/core.rs`) answers
-  "which peers may reach a provider" unchanged. A collision with a
-  real node address has probability 2⁻¹²⁸ per pair.
+- **A filter says "that way", not "how near" or "how many".** A
+  popular key is a *true* positive on almost every tree edge: the
+  upward filter holds the subtree, the downward filter the rest of the
+  mesh. No filter size changes that. Bounding the search is the job of
+  the mechanisms under [Bounding the search](#bounding-the-search).
+
+Why not the routing filter, as an earlier draft had it, is recorded
+under [Alternatives considered](#alternatives-considered).
 
 #### ServiceQuery and ServiceResponse
 
@@ -318,95 +314,176 @@ of `LinkMessageType` (`src/proto/link.rs`, currently `0x30` and
 | `flags` | 1 | bit 0 `A`: group auth present |
 | `request_id` | 8 | Random; fresh per attempt |
 | `key` | 16 | Service key (public or blinded) |
-| `origin` | 16 | Requester `NodeAddr` |
-| `ttl` | 1 | Hop limit, decremented per hop |
-| `max_responses` | 1 | Cap on responses relayed per request |
+| `ttl` | 1 | Hop limit, decremented per forward; a node that receives `ttl = 1` answers but does not forward. Clamped by every transit node to its own lookup TTL |
+| `max_responses` | 1 | Cap on responses relayed per request. Clamped by every transit node to its own `query.max_responses` |
 | `min_mtu` | 2 | As in `LookupRequest` |
-| `origin_coords` | 2 + 16×n | Fallback for response routing |
+| `timestamp` | 4 | Only with `A`. Unix seconds |
 | `auth` | 16 | Only with `A`; see [Scopes](#scopes-and-groups) |
+
+Unlike `LookupRequest`, the query names **no origin**. Responses
+return by reverse path through `request_id`, and if a reverse-path
+entry has expired the response is dropped and the origin's retry
+covers it. Every node in the search radius would otherwise learn
+*who* is looking for *what*. A direct neighbour can still guess that a
+query with a ring-start `ttl` originated next door; nodes further out
+cannot.
 
 `ServiceResponse = 0x33`:
 
 | Field | Size | Notes |
 | ----- | ---- | ----- |
 | `version` | 1 | `0x01` |
-| `flags` | 1 | bit 0 `E`: body is sealed |
+| `flags` | 1 | bit 0 `E`: body is sealed; bit 1 `C`: answered from a transit cache |
 | `request_id` | 8 | Echo |
 | `key` | 16 | Echo |
 | `path_mtu` | 2 | Transit annotation, outside the signature |
 | `responder` | 32 | Responder x-only pubkey |
 | `coords` | 2 + 16×n | Responder tree coordinates |
-| `proof` | 64 | Schnorr over `request_id ‖ key ‖ coords` |
+| `issued_at` | 4 | Unix seconds |
+| `proof` | 64 | Schnorr over `"fips-svc-loc-v1" ‖ key ‖ coords ‖ issued_at` |
 
-This is `LookupResponse` plus the responder's pubkey. A lookup already
-knows whose signature to expect; a service query does not, so the
-response has to say. The requester checks the proof against the
-carried pubkey, derives the `NodeAddr` from it, caches the coordinates
-as `Verified` (`src/cache/entry.rs`) and primes the identity cache the
-same way a DNS resolution does today (`DnsResolvedIdentity` in
+`responder`, `coords`, `issued_at` and `proof` together are a
+**locator**: a short-lived, self-contained statement "I provide *K*
+and I am at these coordinates". It deliberately does *not* cover
+`request_id`:
+
+- A provider signs a locator when its coordinates change and at most
+  every `locator_refresh_secs` (30 s) per key — not once per query. A
+  flood of queries costs it no signatures.
+- A locator is valid for any requester until `issued_at +
+  locator_max_age_secs` (120 s; 30 s of clock skew into the future is
+  tolerated). That is what lets transit nodes cache it. The clock
+  requirement is the one record `expiration` already imposes.
+- Freshness per request is not needed. A locator is a routing hint;
+  liveness is proven by the FSP session that follows. If the
+  coordinates have gone stale within the two minutes, session setup
+  falls back to an ordinary `LookupRequest` for the `NodeAddr`, which
+  the identity cache can already supply.
+
+The requester checks the proof against the carried pubkey, derives the
+`NodeAddr` from it, caches the coordinates as `Verified`
+(`src/cache/entry.rs`) and primes the identity cache the same way a
+DNS resolution does today (`DnsResolvedIdentity` in
 `src/upper/dns.rs`). After that the provider is routable.
 
-With flag `E` everything after `path_mtu` is one AEAD ciphertext; see
-[Scopes](#scopes-and-groups).
+With flag `E` the body has a different layout and carries no
+signature; see [Scopes](#scopes-and-groups).
 
 #### Forwarding
 
-Forwarding reuses the lookup machinery
+Forwarding borrows from the lookup machinery
 ([fips-mesh-operation.md](fips-mesh-operation.md), "Bloom-Guided Tree
-Routing"): `plan_forward` sends the query to tree peers whose filter
-contains the key, falling back to non-tree matches; responses return
-by reverse path through the `recent_requests` table
-(`src/proto/lookup/state.rs`) with `origin_coords` as the fallback;
-the per-peer eviction accounting, the transit forward limiter and the
-per-peer signing budget (`LookupSignRateLimiter`,
-`src/node/rate_limit.rs`) apply as they do to lookups.
+Routing") and changes it where a shared key behaves differently from a
+unique address:
 
-A node that holds a matching announcement answers **and** keeps
-forwarding, because other providers may lie further on.
+- `plan_forward` sends the query to tree peers whose *service* filter
+  contains the key, falling back to non-tree peers when no tree peer
+  with a known service filter matches.
+- Responses return by reverse path through the `recent_requests` table
+  (`src/proto/lookup/state.rs`). There is no coordinate fallback.
+- A node that holds a matching announcement answers **and** keeps
+  forwarding, because other providers may lie further on.
+- **The forward limiter is keyed by (key, inbound peer)**, not by key
+  alone. A lookup target is one node, so collapsing rapid lookups for
+  it is harmless. A service key is shared by every client in the mesh:
+  a per-key interval would let one `nostr-relay` query per two seconds
+  through a busy transit node and drop everyone else's, and anyone
+  could suppress a type by asking for it every two seconds. Keyed per
+  inbound peer, a client can only ever suppress queries that arrive
+  over the same link as its own.
+- **A suppressed query is answered, not dropped**, when the transit
+  node can answer it from its locator cache (next section). The
+  limiter then bounds flooding without costing liveness.
+- The per-peer eviction accounting and the transit forward limiter
+  apply as they do to lookups.
 
-#### The flooding problem
+#### Transit locator cache
+
+A transit node verifies every plain (not sealed) locator it relays and
+keeps the nearest `max_responses` per key until they pass
+`locator_max_age_secs`, for a bounded number of keys (LRU). On a plain
+query:
+
+1. It answers with its cached locators, flag `C` set.
+2. If it can supply `max_responses` fresh locators, it does not
+   forward.
+3. Otherwise it forwards, subject to `ttl` and the forward limiter.
+
+Because a full cache is not refreshed while the node does not forward,
+it drains within two minutes and the next query floods again. New
+providers therefore become visible within that time, and a withdrawn
+one disappears within it.
+
+An earlier draft left transit answering out because it "lets a node
+suppress competitors' answers". That is true with or without a cache:
+any transit node can drop responses it does not like. The threat is
+covered under [Security](#security-and-threat-model); leaving the
+cache out would not remove it.
+
+Sealed responses cannot be cached — they are encrypted per request —
+so blinded keys always travel to the provider. Group queries are few
+by nature.
+
+#### Bounding the search
 
 This is where a service query differs from a lookup, and it is the
 main cost of the design. A `NodeAddr` lives in exactly one place, so a
-lookup follows one branch. A popular service key is present in almost
-every filter on almost every tree edge, so a naive query reaches the
-whole tree.
+lookup follows one branch. A query for a *rare* key is guided the same
+way. A *popular* key is present behind almost every tree edge, so a
+naive query reaches the whole tree.
 
 The proposal bounds this with:
 
-- **Expanding-ring search.** The origin tries `ttl` 2, 4, 8, 16, then
-  the full lookup TTL, with a fresh `request_id` each time, and stops
-  as soon as it has enough verified answers. Inner rings are
-  re-visited, but the cost is geometric and the common case — a
-  provider nearby — ends after the first or second ring. This also
-  gives **locality for free**: nearest providers answer first.
+- **Expanding-ring search.** The origin tries `ttl` 1, 2, 4, 8, 16,
+  then the full lookup TTL, with a fresh `request_id` each time, and
+  stops as soon as it has enough verified answers. The first ring goes
+  to *every* direct peer with a matching service filter, tree or not,
+  so a provider (or a warm cache) one mesh hop away is always asked.
+  Inner rings are re-visited, but the cost is geometric and the common
+  case — a provider or a cache nearby — ends after the first rings.
+  This also gives **locality for free**: nearest providers answer
+  first. The ring is a courtesy of the origin, not a bound the mesh
+  can rely on; the bounds that hold against a hostile origin are the
+  clamps, the limiter and the cache.
 - **`max_responses`.** A transit node relays at most that many
   distinct responses per `request_id`, replacing the lookup's single
   `response_forwarded` flag with a small counter and a set of
-  responder digests.
-- **Bloom pre-check.** If no peer's filter contains the key the origin
-  reports "no providers" without sending anything, as lookups do.
+  responder digests. While a branch it forwarded to has not answered
+  yet, no single downstream peer may fill more than half of the
+  counter.
+- **Clamps.** `ttl` and `max_responses` are chosen by the origin, so
+  every transit node clamps them to its own configuration.
+- **Transit cache.** One flood per key, per inbound peer, per two
+  seconds refills caches along its path; everything else in that time
+  is answered locally.
+- **No per-query signatures.** Providers sign per refresh interval.
+  The signing budget (`LookupSignRateLimiter`,
+  `src/node/rate_limit.rs`) is not touched by service queries.
+- **Pre-check.** If no peer's service filter contains the key the
+  origin reports "no providers" without sending anything, as lookups
+  do.
 - **Origin caching.** Positive results are cached for
   `cache_ttl_secs`; negative results for a shorter time.
-- **Rate limits.** Per-key transit forward interval, per-peer query
-  token bucket, per-peer signing budget on the provider.
-- **Later: transit answers.** Because records are self-signed, a
-  transit node that has recently seen a verified response could answer
-  from cache and stop forwarding. This is left out of the first
-  version; see [Open questions](#open-questions).
+  `query.prefetch` keeps named types warm in the background.
 
 False positives send a query into a subtree with no provider. The TTL
-bounds the damage, and the rate is whatever the filter FPR already is
-for routing.
+bounds the damage, and with a few hundred keys in the service filter
+the rate is far below that of the routing filter.
 
 #### Partial deployment
 
 `dispatch_link_message` (`src/node/dataplane/dispatch.rs`) logs and
-drops unknown link types. A query therefore stops at a node that does
-not implement it, and service keys still flow through that node's
-filter. Discovery degrades to "providers reachable through upgraded
-nodes". No existing message changes, so the feature is additive
-rather than wire-format-breaking in the sense of
+drops unknown link types. Neither service filters nor queries are sent
+to a node that has not announced a service filter itself, so nothing
+is lost silently: discovery covers the part of the tree that is
+connected to the origin through upgraded nodes, the pre-check reports
+exactly that part, and a search ends with "no providers" instead of a
+row of timeouts. An old node between two upgraded regions separates
+them; non-tree links between upgraded nodes bridge that only for
+direct neighbours (ring 1).
+
+No existing message changes, so the feature is additive rather than
+wire-format-breaking in the sense of
 [../branching.md](../branching.md).
 
 ### Fetch: reading the records
@@ -444,18 +521,30 @@ FIPS has no group concept today; the closest thing is the peer ACL
 (`src/node/acl.rs`, `peers.allow` / `peers.deny`). This proposal adds
 two kinds of group and lets every announcement choose.
 
-| Scope | Locate | Fetch | Hidden from outsiders |
-| ----- | ------ | ----- | --------------------- |
-| `public` | Plain key, anyone is answered | Anyone | Nothing |
-| `allow: <group>` | Plain key, anyone is answered | Only session peers whose npub is in the group | Record contents (port, name, metadata) |
-| `secret: <group>` | Blinded key, only authenticated queries are answered, response sealed | Requester must prove knowledge of the group secret | That the service exists, its type, and who provides it |
-| both | As `secret` | Both checks | As `secret`, plus per-member revocation |
+| Scope | Locate | Fetch | Hidden from outsiders | Still visible |
+| ----- | ------ | ----- | --------------------- | ------------- |
+| `public` | Plain key, anyone is answered | Anyone | Nothing | — |
+| `allow: <group>` | **None.** Members ask the nodes they know directly | Only session peers whose npub is in the group | That the service exists, its type, and the record contents | On-path nodes see that a member opened a session to the provider |
+| `secret: <group>` | Blinded key, only authenticated queries are answered, response sealed | Requester must prove knowledge of the group secret | The service type, the record contents, and the provider's identity from everyone who is not next to it | A stable opaque key in service filters; the provider's tree neighbours can tell that the key originates in its subtree; query-then-session correlation |
+| both | As `secret` | Both checks | As `secret`, plus per-member revocation at Fetch | As `secret` |
 
 **npub-list groups** copy the peer ACL idiom: a file per group under
 `/etc/fips/groups/` (platform path as for `peers.allow`), one npub or
 host alias per line, hot-reloaded once per tick. Membership is checked
 against the Noise-authenticated session peer. Removing a member is
 deleting a line.
+
+An `allow` announcement stays out of the Locate plane entirely: no
+service key, no filter entry, no answer to a `ServiceQuery`. The
+link-layer query is unauthenticated, so a provider could not tell a
+member from a stranger there; answering would tell the whole mesh
+which node runs the family's Blossom server and fill everyone's
+`find blossom` with providers that then refuse the fetch. Instead a
+member finds the group's services by sending `LIST` to the nodes it
+already knows — by default every entry of its own copy of the group
+file, at most `max_group_poll` (64) of them. Groups of this kind are
+small, the sessions are cheap and the results are cached. An `allow`
+group that outgrows polling wants a secret.
 
 **Shared-secret groups** supply two 32-byte values: a *locate secret*
 that stays stable, and an *epoch secret* that may rotate. Keys are
@@ -466,24 +555,43 @@ two values come from is a provisioning choice:
 - **Static.** One file, mode 0600, distributed out of band. Both
   values derive from it and never change until the operator replaces
   the file on every member. Simple, no dependencies, no revocation.
-- **Marmot-managed.** The group is a
-  [Marmot](https://github.com/marmot-protocol/marmot) group, and MLS
-  supplies an epoch secret that changes whenever membership changes.
-  See [Marmot-managed groups](#marmot-managed-groups).
+- **Managed.** An external process pushes the values, and optionally
+  a roster, over the control socket and pushes them again when they
+  change; see
+  [Group files and provisioning](#group-files-and-provisioning). Any
+  group key agreement can sit behind that interface.
+  [fips-service-discovery-marmot.md](fips-service-discovery-marmot.md)
+  proposes Marmot (MLS with Nostr identities) for it.
 
 The discovery wire protocol is identical in both cases:
 
-- The bloom key is blinded:
+- The service key is blinded:
   `HMAC(k_key, type)[..16]`. Outsiders see an opaque key in filters
   and queries and cannot tell what it names or build it themselves.
 - The query carries `auth = HMAC(k_auth, request_id ‖ key ‖
-  origin)[..16]`. A provider answers only if it verifies. Without
-  this, any transit node could replay an observed key and learn who
-  answers.
-- The response body (`responder`, `coords`, `proof`) is sealed with an
-  AEAD key derived from `k_seal` and `request_id`. Transit nodes need
-  only `request_id` for reverse-path routing, and deduplicate sealed
+  timestamp)[..16]`. A provider answers only if it verifies and the
+  timestamp is within 30 seconds of its clock. Without `auth`, any
+  transit node could replay an observed key and learn that someone
+  answers; without the timestamp it could replay a whole observed
+  query after the dedup window and learn the direction and round-trip
+  time of a provider.
+- The response is sealed. After `path_mtu` it carries a random 12-byte
+  `nonce` and one ChaCha20-Poly1305 ciphertext over `responder ‖
+  coords ‖ issued_at`, under a key derived from `k_seal` and
+  `request_id`, with `version ‖ flags ‖ request_id ‖ key` as
+  associated data. Several providers answer the same `request_id`
+  under the same key by design, so the nonce is explicit and random;
+  it must never be derived from the request. Transit nodes need only
+  `request_id` for reverse-path routing, and deduplicate sealed
   responses by body hash.
+- **A sealed response carries no Schnorr proof.** The AEAD tag proves
+  the responder knows the group secret, and the Noise XK session that
+  follows proves it holds the claimed key. A signature over the
+  blinded key would be a transferable proof that the node serves this
+  group — exactly what the unsigned record avoids. The price: a member
+  can forge a locator that names another member. The session to that
+  node then finds no such service, and the forger has gained nothing
+  it could not do by lying in a record.
 - On the fetch port the requester adds `HMAC(k_auth, "fetch" ‖
   client pubkey ‖ provider pubkey ‖ req_id)`, binding the proof to
   this session.
@@ -493,99 +601,26 @@ The discovery wire protocol is identical in both cases:
 
 Limits that the document should not hide:
 
-- An on-path node still sees that origin *O* sent a query and shortly
-  afterwards opened a session to node *P*. Session traffic is opaque,
-  but the correlation exists. This is the same class of metadata
-  exposure described under "Privacy Considerations" in
+- An on-path node still sees a query and, shortly afterwards, a
+  session from the same direction to node *P*. Session traffic is
+  opaque, but the correlation exists. This is the same class of
+  metadata exposure described under "Privacy Considerations" in
   [fips-mesh-operation.md](fips-mesh-operation.md).
+- A blinded key is testable in filters. Whoever has seen it in a query
+  can test the service filters of its own peers for it, and the tree
+  neighbours of a provider see it appear in a filter that covers only
+  a small subtree. The key hides *what* is offered from everyone, and
+  *who* offers it only from nodes that are not adjacent.
 - A blinded key is stable, so an observer can track "the same unknown
-  thing" over time. A Marmot-managed group can rotate it; a static
-  group cannot without touching every member.
+  thing" over time. A managed group can rotate the locate secret; a
+  static group cannot without touching every member.
+- Every (secret group, type) pair is an entry that the whole mesh
+  carries. The announcement cap bounds honest nodes; the service
+  filter's inbound FPR cap bounds the total; a node that floods keys
+  degrades discovery, never routing.
 - Removing a member from a *static* group means replacing the file
-  everywhere. Combine it with an npub list, or use a Marmot-managed
-  group, when per-member revocation matters.
-
-#### Marmot-managed groups
-
-[Marmot](https://github.com/marmot-protocol/marmot) is an end-to-end
-encrypted group protocol that uses Nostr pubkeys as identity and MLS
-(RFC 9420) for continuous group key agreement. Its identity is the
-same secp256k1 key that is a FIPS node's identity, which makes it a
-natural fit. What it provides that the static mode lacks:
-
-| Need | Static file | Marmot-managed |
-| ---- | ----------- | -------------- |
-| Invite a member | Copy a file out of band | Admin commits an MLS Add against the invitee's published KeyPackage (kind `30443`); the Welcome (kind `444` rumor) arrives NIP-59 gift-wrapped (kind `1059`) |
-| Remove a member | Replace the file on every node | Admin commits a Remove, or the member sends SelfRemove; the group moves to a new epoch whose secrets the removed member cannot derive |
-| Key rotation | Manual | Every commit starts a new epoch; members also self-update (Marmot: SHOULD, soon after joining) for forward secrecy and post-compromise security |
-| Who may change membership | Whoever has the file | Only admins listed in the group's admin-policy component |
-| Authenticated member list | None | The MLS roster: one Nostr pubkey per member, proven by an account identity proof |
-
-Mapping onto discovery:
-
-- **Epoch secret** = an MLS exporter,
-  `MLS-Exporter("marmot", "fips-service-discovery", 32)` (label and
-  context tentative). Marmot requires every exporter use to have its
-  own registered label/context pair and forbids reusing the
-  `"group-event"` key for anything else, so this needs an entry in
-  Marmot's exporter registry.
-- **Locate secret** = a random 32-byte `discovery_id` kept in group
-  state as an application component. This copies Marmot's own split:
-  its relay routing handle `nostr_group_id` is random, explicitly
-  *not* derived from any key or epoch, and stays stable so that
-  members who lag an epoch still find the group, while the encryption
-  key underneath changes per epoch. `nostr_group_id` itself cannot be
-  reused here because it appears in clear in `h` tags on relays.
-- **Rotating the locate secret** follows Marmot's routing-rotation
-  rule: first commit the removal, then rotate in a *later* commit. A
-  rotation carried in the removal commit itself is readable by the
-  member being removed. Rotation is optional; without it a removed
-  member can still recognize the group's blinded keys in bloom
-  filters, but can no longer get a query answered.
-- **The roster doubles as the npub list.** `secret` and `allow`
-  collapse into one group: the fetch port checks the session peer
-  against the MLS roster.
-- **Lagging members** are handled as Marmot handles them — by trying
-  the retained epochs — which is the window rule above.
-
-Where MLS runs: not in the `fips` daemon. The proposal is a companion
-process (or any Marmot client) that holds the MLS state, talks to
-relays over `fips0`, and pushes `discovery_id`, the current and
-retained epoch secrets and the roster to the daemon over the control
-socket. The forwarding path stays free of MLS, and a node that never
-uses Marmot groups links nothing new. The pushed values are listed
-under [Group files and provisioning](#group-files-and-provisioning).
-
-What happens when an admin removes a member:
-
-1. The Remove commit moves the group to a new epoch, say 42 → 43.
-2. Each remaining member's companion pushes the epoch-43 secret and
-   the shorter roster to its daemon.
-3. The removed member cannot derive the epoch-43 secret. Its queries
-   are still answered while epoch 42 is inside the retained window,
-   and not afterwards. The fetch port refuses it immediately, because
-   it is no longer on the roster.
-4. Optionally, an admin rotates `discovery_id` in a *later* commit, so
-   that the removed member can no longer recognize the group's keys in
-   bloom filters.
-
-What it costs:
-
-- **It needs a delivery service inside the mesh.** Commits, Welcomes
-  and KeyPackages travel over Nostr relays, and those must be in-mesh
-  relays to honour the no-legacy-internet rule. Marmot's relay URL
-  profile allows `ws://`, so `ws://<npub>.fips:7777` is valid signed
-  group state. The relays are found with a *public* Locate for
-  `nostr-relay`, so the layering is: public discovery finds relays,
-  relays carry the group, the group keys secret discovery. If no relay
-  is reachable the group cannot change, but discovery keeps working on
-  the last known epoch.
-- **Epochs only advance on commits.** There is no time-based rotation;
-  a quiet group keeps its keys until someone self-updates.
-- **The node key signs for the group member.** The roster-as-allow-list
-  and the address binding only hold if the Marmot account *is* the
-  node npub, so the companion needs the node key or a signing command
-  on the control socket.
+  everywhere. Combine it with an npub list, or use a managed group,
+  when per-member revocation matters.
 
 ### Index: in-mesh directories
 
@@ -603,24 +638,11 @@ as a directory:
 
 Records from a directory are authentic (signed, address-bound) but say
 nothing about liveness, so they enter the cache as unverified until a
-Locate or a lookup confirms the provider is reachable.
+Locate or a lookup confirms the provider is reachable. A directory can
+withhold records but not forge them.
 
-Secret-group records are never published to a directory as plain
-events, because the author pubkey alone would reveal that a node
-belongs to *some* group. Records of npub-list and static secret groups
-therefore stay off relays entirely. A Marmot-managed group has a
-better channel: the record is sent as a Marmot application message
-(both layers are shown under [Records by scope](#records-by-scope)).
-The outer relay event is signed by a fresh ephemeral key, tagged only
-with the group's `h` routing id, and encrypted under the epoch's
-group-event key. A relay learns that *someone* posted to *some* group.
-
-Two consequences. Members of a Marmot-managed group learn the group's
-services from group messages alone, so Locate becomes optional for
-them and mainly adds nearest-first ordering and a liveness check. And
-because MLS application messages are forward-secret, a new member
-cannot read announcements sent before it joined — which is harmless,
-since records expire within the hour and are re-announced anyway.
+Restricted records never reach a directory: they are unsigned, and the
+author pubkey alone would reveal that a node belongs to *some* group.
 
 Directories are never required. Locate and Fetch work with zero
 relays, and that is what breaks the circle of needing a relay to find
@@ -659,12 +681,16 @@ node:
       family:     { members_file: /etc/fips/groups/family }
       lab-admins: { members_file: /etc/fips/groups/lab-admins }
       lab:        { secret_file: /etc/fips/groups/lab.key }   # static
-      guild:      { marmot: true }    # secrets and roster pushed by the
-                                      # Marmot companion at runtime
+      guild:      { managed: true }   # secrets and roster pushed over
+                                      # the control socket at runtime
     query:
-      ttl_steps: [2, 4, 8, 16, 64]
+      ttl_steps: [1, 2, 4, 8, 16, 64]
       max_responses: 8
       cache_ttl_secs: 300
+      prefetch: [nostr-relay]         # types kept warm in the cache
+      max_group_poll: 64
+    locator_refresh_secs: 30
+    locator_max_age_secs: 120
     publish_to_directories: false
     trust:
       providers: any          # any | known
@@ -683,8 +709,10 @@ baseline ([fips-security.md](fips-security.md)).
 Applications can also register at runtime over the control socket
 (`services_announce` / `services_withdraw`), with a lease that lapses
 if it is not renewed, so a relay that exits stops being announced. The
-daemon signs on the application's behalf, since the record must be
-signed by the node key.
+daemon signs on the application's behalf, since a public record must
+be signed by the node key. The control socket never offers a generic
+signing command; it signs specific statement types only — here,
+kind-37196 records and locators.
 
 ### Group files and provisioning
 
@@ -705,9 +733,11 @@ mum-phone           # alias from /etc/fips/hosts
 
 - The file contains nothing secret. A requester's identity is already
   proven by its FSP session; the provider only looks the pubkey up.
-- Only providers need the file. A client needs nothing, because the
-  provider decides.
-- Each provider keeps its own copy. Removing a member is deleting the
+- A provider uses the file to decide whom to serve. A client uses it
+  as the list of nodes to ask, because `allow` services are not in the
+  Locate plane. A client that only ever asks one node can name it
+  instead: `fipsctl services find blossom --from living-room`.
+- Each node keeps its own copy. Removing a member is deleting the
   line on the providers.
 - The `ALL` wildcard of `peers.allow` is deliberately **not**
   supported. It would silently turn a group scope into a public one.
@@ -725,18 +755,19 @@ public keys.
 - There is no member list. Whoever has the file is a member, and
   removing someone means replacing the file everywhere.
 
-**Marmot-managed group.** There is no file to edit; the configuration
-entry is only `guild: { marmot: true }`. The companion process pushes
-three things over the control socket (`services_group_update`), and
-pushes them again whenever the group changes:
+**Managed group.** There is no file to edit; the configuration entry
+is only `guild: { managed: true }`. An external process pushes three
+things over the control socket (`services_group_update`), and pushes
+them again whenever the group changes:
 
-| Pushed value | Source in the Marmot group | Used for |
-| ------------ | -------------------------- | -------- |
-| `discovery_id` | Application component in group state; stable across epochs | Blinding the bloom keys |
-| Epoch secrets | MLS exporter of the current epoch and a few retained ones | Authenticating queries, sealing responses |
-| Roster | Pubkeys of the current MLS members | The npub list checked on the fetch port |
+| Pushed value | Used for |
+| ------------ | -------- |
+| Locate secret | Blinding the service keys. Stable; may be rotated |
+| Epoch secrets, current and a few retained | Authenticating queries, sealing responses |
+| Roster (optional) | The npub list checked on the fetch port; with it, `secret` and `allow` collapse into one group |
 
-Every member runs the companion, providers and clients alike.
+Every member runs the managing process, providers and clients alike.
+The daemon links nothing for it and the forwarding path never sees it.
 
 `fipsctl show services --groups` lists what the daemon currently
 holds, without ever printing a secret:
@@ -746,7 +777,7 @@ $ fipsctl show services --groups
 GROUP   KIND     EPOCH  MEMBERS  SOURCE
 family  list     —      3        /etc/fips/groups/family
 lab     static   —      —        /etc/fips/groups/lab.key
-guild   marmot   42     7        companion (updated 3m ago)
+guild   managed  42     7        control socket (updated 3m ago)
 ```
 
 ### Finding
@@ -761,40 +792,54 @@ $ fipsctl services find blossom --group family --json
 ```
 
 `find` is asynchronous and follows the start/poll pattern of `fipsctl
-probe` (`src/control/probe.rs`, `src/control/commands.rs`). `fipsctl
-show services` lists local announcements and the discovery cache from
-the read-only snapshot path. The same commands over the control socket
-are the API for local applications
+probe` (`src/control/probe.rs`, `src/control/commands.rs`). With
+`--group` it runs a blinded Locate for a secret group and polls the
+members for an npub-list group. `fipsctl show services` lists local
+announcements and the discovery cache from the read-only snapshot
+path. The same commands over the control socket are the API for local
+applications
 ([../reference/control-socket.md](../reference/control-socket.md)).
 
 ### DNS view
 
 The `.fips` responder (`src/upper/dns.rs`) answers only AAAA today.
-Service discovery gives it a second data source:
+Service discovery gives it a second data source. The view is complete
+DNS-SD (RFC 6763) over unicast DNS, so that browsing clients work, and
+it also answers a plain RFC 2782 SRV query on the service name for
+applications that only know that.
 
 | Query | Type | Answer |
 | ----- | ---- | ------ |
-| `_nostr-relay._tcp.fips` | SRV | One record per provider: port, target `<npub>.fips`. Priority follows tree distance. |
-| `_nostr-relay._tcp.fips` | TXT | `scheme=`, `path=`, `name=` of the first provider |
-| `_blossom._tcp.family.fips` | SRV | Same, restricted to group `family` |
-| `nostr-relay.svc.fips` | AAAA | Address of the nearest verified provider, sticky for the DNS TTL |
 | `_services._dns-sd._udp.fips` | PTR | Known service types (DNS-SD browse) |
+| `_nostr-relay._tcp.fips` | PTR | One instance name per provider: `<instance>._nostr-relay._tcp.fips` |
+| `<instance>._nostr-relay._tcp.fips` | SRV | Port, target `<npub>.fips` |
+| `<instance>._nostr-relay._tcp.fips` | TXT | `scheme=`, `path=`, `name=` of *that* instance |
+| `_nostr-relay._tcp.fips` | SRV | One record per provider, as above. Priority follows tree distance |
+| `_blossom._tcp.family.group.fips` | any of the above | Same, restricted to group `family` |
+| `nostr-relay.svc.fips` | AAAA | Address of the nearest verified provider, sticky for the DNS TTL |
 
-An npub is 63 characters, exactly the DNS label limit, so `<npub>.fips`
-works as an SRV target and resolves through the existing path, which
-also primes the identity cache.
+`<instance>` is `<NodeAddr as 32 hex digits>-<port>`, which is unique,
+fits a label and is mapped back through the discovery cache. An npub
+is 63 characters, exactly the DNS label limit, so `<npub>.fips` works
+as an SRV target and resolves through the existing path, which also
+primes the identity cache.
+
+`svc` and `group` become reserved labels in `validate_hostname`, so a
+group label can never collide with a host alias.
 
 Points the implementation has to handle:
 
-- **Latency.** The responder answers from the discovery cache. On a
-  miss it starts a query and waits a bounded time (1–2 s) before
-  answering empty; the next lookup hits the cache.
+- **Latency.** An SRV answer needs a Locate *and* a Fetch per
+  provider, which does not fit into a resolver timeout. The responder
+  therefore answers from the discovery cache only. On a miss it starts
+  the search, waits a bounded time (1.5 s), and then answers empty
+  with a negative TTL of one second, so that the application's retry
+  hits the cache. Types listed under `query.prefetch` are always warm.
 - **Size.** The responder uses a 512-byte buffer and no EDNS0. An SRV
   answer is roughly 90 bytes, so about four providers fit. Either cap
   the answer count or add EDNS0.
 - **AAAA cannot carry a port.** `<type>.svc.fips` helps applications
-  that cannot do SRV only when the port is conventional. `svc` becomes
-  a reserved label in `validate_hostname`.
+  that cannot do SRV only when the port is conventional.
 - **Locality of the DNS view.** The responder keeps dropping queries
   that arrive on `fips0` (`is_mesh_interface_query`). DNS is a view of
   *this node's* discovery results, not a mesh-wide directory service.
@@ -806,39 +851,64 @@ Points the implementation has to handle:
 | Announcements per node | provider | 16 |
 | Record size | provider, consumer | 1024 bytes |
 | Record lifetime | provider | 1 h, refreshed at half-life |
-| Expanding ring | origin | `[2, 4, 8, 16, 64]` |
-| Responses relayed per request | transit | 8 |
-| Forward interval per key | transit | 2 s (as lookups) |
+| Locator signatures | provider | one per key per 30 s, and on coordinate change |
+| Locator lifetime | consumer, transit | 120 s, 30 s future skew |
+| Expanding ring | origin | `[1, 2, 4, 8, 16, 64]` |
+| `ttl`, `max_responses` clamp | transit | local lookup TTL, local `max_responses` |
+| Responses relayed per request | transit | 8, at most half from one downstream peer while others are pending |
+| Forward interval per (key, inbound peer) | transit | 2 s; suppressed plain queries are answered from cache |
+| Locator cache | transit | 8 per key, 256 keys, LRU |
 | Queries per link peer | transit | token bucket |
-| Proof signatures per link peer | provider | shared with `LookupSignRateLimiter` |
+| Service filter inbound FPR | every node | own cap, default as `node.bloom.max_inbound_fpr` |
 | Fetch requests per session | provider | token bucket |
+| Group members polled | origin | 64 |
 | Discovery cache | origin | 2048 records, expired-first eviction |
 | DNS wait on cache miss | responder | 1.5 s |
 
 ## Security and threat model
 
 - **Impersonation.** Not possible at the record level: the address is
-  derived from the signing key. A record can lie about *what* runs on
-  a port, never about *where*.
+  derived from the key that signs the record or terminates the
+  session. A record can lie about *what* runs on a port, never about
+  *where*.
 - **Spam and sybils.** Announcing is permissionless, so anyone can
-  claim to be a relay. Defences are ranking by tree distance,
-  `trust.providers: known` (only npubs from hosts, peers or groups),
-  group scopes, and optionally NIP-13 proof of work on records.
-  A reputation or web-of-trust layer is out of scope.
-- **Bloom poisoning.** Inserting many service keys is no stronger than
-  inserting many fake addresses, which is already possible and already
-  bounded by `node.bloom.max_inbound_fpr` (`src/node/bloom.rs`). The
-  per-node announcement cap keeps honest nodes small.
-- **Amplification.** One query can trigger many signed responses. The
-  ring search, `max_responses`, per-peer buckets and the provider-side
-  signing budget bound it; responses go back by reverse path, so a
-  forged `origin` does not redirect them.
-- **Interest privacy.** On-path nodes see `origin` and the key. For
-  public keys that reveals what the origin is looking for. Blinded
-  keys hide the *what* but not the *who*.
+  claim to be a relay. Defences are `trust.providers: known` (only
+  npubs from hosts, peers or groups), group scopes, and optionally
+  NIP-13 proof of work on records. Ranking by tree distance is a
+  convenience, *not* a defence: it favours whoever sits closest to the
+  victim. A reputation or web-of-trust layer is out of scope.
+- **Suppression and eclipse.** A transit node can drop responses, and
+  a sybil near the origin can answer first with many identities and
+  fill the `max_responses` counters downstream, so that honest answers
+  are dropped. The per-downstream-peer share of the counter limits
+  what one branch can crowd out, the origin prefers answers that
+  arrived over different first-hop peers when it has a choice, and a
+  client that needs more than "some provider" sets
+  `trust.providers: known`. Against a hostile node on the only path,
+  discovery has no more defence than routing has.
+- **Filter poisoning.** Inserting many service keys harms the service
+  filter only, and is bounded by its inbound FPR cap. The routing
+  filter is a separate object.
+- **Amplification.** A query triggers no signatures. One query can
+  still fan out over the tree; the clamps, the forward limiter per
+  (key, inbound peer), `max_responses`, the per-peer buckets and the
+  transit cache bound it. Responses go back by reverse path, and the
+  query names no origin that could be forged.
+- **Interest privacy.** On-path nodes see the key, not the origin. A
+  direct neighbour can usually tell that a query started next door.
+  For public keys that reveals what that neighbour is looking for;
+  blinded keys hide the *what*.
 - **Stale and replayed records.** Mandatory expiry, replaceable
   semantics on `created_at`, and the verified/unverified distinction
-  in the cache.
+  in the cache. A replayed locator is at most two minutes old and
+  leads to a session that either works or fails.
+- **Cache pressure.** Every verified locator primes the identity and
+  coordinate caches with a pubkey the requester did not choose.
+  Discovery entries are therefore evicted before entries that routing
+  or configuration created.
+- **Deniability of restricted scopes.** Neither the record nor the
+  sealed locator carries a signature, so a member cannot prove to an
+  outsider that a node serves a group.
 - **Exposure by announcement.** Announcing a port tells the mesh where
   to knock. The default-deny `fips0` firewall still decides who gets
   in; an announcement is not an access grant.
@@ -860,21 +930,46 @@ Points the implementation has to handle:
 - **Add a service list to the kind-37195 overlay advert.** It already
   exists and is signed, but it lives on public relays on the legacy
   internet, which this feature must not depend on.
+- **Service keys in the routing bloom filter.** The first draft of
+  this proposal. It needs no new announce message and old nodes carry
+  the keys without knowing. That second property is the problem: old
+  nodes *propagate* a key but *drop* the query, and because
+  `plan_forward` falls back to non-tree peers only when no tree peer
+  matches, a query dies at the first old tree peer while the pre-check
+  keeps promising providers. The capacity argument against sharing
+  (1 KB, k = 5, practical up to about 2,000 entries, 20 % inbound cap)
+  fades if routing filters grow as planned, but larger filters need a
+  protocol version of their own — v1 nodes must reject any other
+  `size_class` — so transparency through old nodes is lost either way,
+  a v1 `FilterAnnounce` is already about 1,071 bytes of a 1,243-byte
+  link budget, and constrained nodes that fold filters down would
+  carry the pollution at the worst FPR.
+- **A per-request proof, as in `LookupResponse`.** Signing
+  `request_id ‖ key ‖ coords` makes every answer fresh, but it cannot
+  be cached, costs a provider one signature per query per requester,
+  and for a blinded key it is a transferable proof of group service. A
+  lookup needs the freshness because the answer *is* the result; a
+  locator is followed by a session that proves more than the signature
+  did.
+- **Locating `allow` services with the plain key.** The first draft.
+  It reveals the provider and the type to the whole mesh and pollutes
+  public results with providers that refuse the fetch.
 
 ## Phasing
 
 | Phase | Content | Verified by |
 | ----- | ------- | ----------- |
-| 1 | Public scope: bloom keys, `ServiceQuery`/`ServiceResponse`, fetch port, `node.services.announce`, `fipsctl services find`, `fipsctl show services` | Sans-IO tests beside the new `src/proto/` subsystem, node tests in `src/node/tests/`, a `testing/service-discovery/` Docker suite asserting on `fipsctl` JSON (pattern: `testing/acl-allowlist/test.sh`) |
-| 2 | npub-list groups and static shared-secret groups | Same suite, with per-node group files mounted |
-| 2b | Marmot-managed groups: control-socket commands to push secrets and roster, companion process, records as group messages | Suite with an in-mesh relay container; add and remove a member and assert who can still discover |
-| 3 | DNS view (SRV, TXT, `svc` AAAA, DNS-SD browse) | Extend `testing/dns-resolver/` |
+| 1 | Public scope: service filter, `ServiceQuery`/`ServiceResponse` with locators, transit cache, fetch port, `node.services.announce`, `fipsctl services find`, `fipsctl show services` | Sans-IO tests beside the new `src/proto/` subsystem, node tests in `src/node/tests/`, a `testing/service-discovery/` Docker suite asserting on `fipsctl` JSON (pattern: `testing/acl-allowlist/test.sh`), including a mixed old/new topology |
+| 2 | npub-list groups (fetch-only) and static shared-secret groups (blinded keys, sealed responses) | Same suite, with per-node group files mounted |
+| 2b | Managed groups: `services_group_update` on the control socket. The Marmot companion is specified in [fips-service-discovery-marmot.md](fips-service-discovery-marmot.md) | Suite that pushes secrets and rosters from a test driver; add and remove a member and assert who can still discover |
+| 3 | DNS view (DNS-SD PTR/SRV/TXT, plain SRV, `svc` AAAA) | Extend `testing/dns-resolver/` |
 | 4 | Directory relays, `publish_to_directories` | Suite with an in-mesh relay container |
 | 5 | Local port mapping for unmodified apps, announcing LAN services behind `fips-gateway` ([fips-gateway.md](fips-gateway.md)) | — |
 
 A chaos scenario (`testing/chaos/scenarios/`) with many providers of
-one type should accompany phase 1 to measure the flooding bound in
-practice.
+one type and many concurrent clients should accompany phase 1 and be
+read *before* phase 2 is designed in detail: it measures the search
+bound, the cache hit rate and how long a new provider stays invisible.
 
 ## Open questions
 
@@ -882,35 +977,34 @@ practice.
   right, or should this be proposed as a NIP so other overlays can
   share it?
 - **Inline public records.** Put a compact record in
-  `ServiceResponse` when it fits, saving a session per provider?
-- **Transit caching.** Let transit nodes answer from cache? It cuts
-  flooding sharply but lets a node suppress competitors' answers.
-- **Own filter or shared filter.** Service keys share the routing
-  filter here. A second, smaller filter would keep routing FPR
-  untouched at the price of another announce message.
-- **Marmot registration.** The exporter label/context and the
-  `discovery_id` application component both need entries in Marmot's
-  registries. Is a FIPS-specific component acceptable upstream, or
-  should discovery derive everything from one exporter and accept that
-  lagging members miss until they catch up?
-- **Marmot identity.** Must the group member be the node npub, or can
-  a user npub join and delegate to one or more nodes? Delegation
-  breaks the simple roster-equals-allow-list rule.
-- **Marmot without relays.** Marmot's core is transport-agnostic (the
-  spec already has a second, experimental QUIC binding). A FIPS-native
-  binding that carries MLS bytes over FSP between members would remove
-  the relay dependency for small groups.
-- **Time-based rotation.** MLS epochs advance only on commits. Should
-  the companion self-update on a timer to bound how long a blinded key
-  and an epoch secret live?
-- **Persisting pushed group state.** Should the daemon keep the
-  secrets and roster of a Marmot-managed group across a restart?
-  Writing them under `/var/lib/fips/` keeps the group working when the
-  companion is down, but puts epoch secrets on disk. Memory-only
-  avoids that and requires the companion after every restart.
+  `ServiceResponse` when it fits, saving a session per provider? With
+  cacheable locators this would make transit nodes small directories.
+- **Ring schedule for rare keys.** A single far-away provider is found
+  only after every smaller ring has timed out, although the filter
+  already guides such a query down one branch. Should the origin skip
+  rings when few peers match, or should ring timeouts scale with
+  `ttl`?
+- **Service filter size and mixed size classes.** Size class 0 is a
+  guess. If routing filters move to mixed sizes with folding, does the
+  service filter follow or stay fixed?
+- **Cache stickiness.** A full transit cache is not refreshed for up
+  to two minutes. Is that the right trade between load on the first
+  eight providers and visibility of new ones, or should a node forward
+  one query in *n* regardless?
+- **Clocks.** Locators and sealed queries assume clocks within 30
+  seconds. Nostr events already assume roughly that; is it acceptable
+  for small devices without a battery-backed clock?
+- **Old nodes that split the tree.** Should upgraded nodes tunnel
+  service filters and queries to each other across an old tree peer
+  (as FSP datagrams), or is "upgrade the path" the answer?
 - **Retained-epoch window.** How many previous epoch secrets a
   provider accepts. It trades tolerance for lagging members against
   how long a removed member is still answered.
+- **Persisting pushed group state.** Should the daemon keep the
+  secrets and roster of a managed group across a restart? Writing them
+  under `/var/lib/fips/` keeps the group working when the managing
+  process is down, but puts epoch secrets on disk. Memory-only avoids
+  that and requires the process after every restart.
 - **Static secret file format**: encoding, a bech32 form for sharing.
 - **Service type registry**: who maintains it and where.
 - **Small-MTU transports** (BLE, serial): is a 1024-byte record cap
@@ -918,11 +1012,14 @@ practice.
 
 ## See also
 
+- [fips-service-discovery-marmot.md](fips-service-discovery-marmot.md)
+  — Marmot/MLS as the key agreement behind managed groups; a separate
+  proposal on top of this one.
 - [fips-mesh-operation.md](fips-mesh-operation.md) — the lookup
-  protocol this design borrows its forwarding, deduplication and rate
-  limiting from.
-- [fips-bloom-filters.md](fips-bloom-filters.md) — filter capacity,
-  FPR analysis and the inbound antipoison cap.
+  protocol this design borrows its forwarding and deduplication from.
+- [fips-bloom-filters.md](fips-bloom-filters.md) — filter format,
+  propagation rules, FPR analysis, size classes and the inbound
+  antipoison cap.
 - [fips-session-layer.md](fips-session-layer.md) — FSP port-based
   service dispatch, where the fetch port lives.
 - [fips-ipv6-adapter.md](fips-ipv6-adapter.md) — the `.fips` DNS
@@ -932,11 +1029,6 @@ practice.
   use the legacy internet.
 - [fips-security.md](fips-security.md) — the `fips0` default-deny
   baseline that still governs access to an announced service.
-- [Marmot protocol](https://github.com/marmot-protocol/marmot) — MLS
-  group key agreement with Nostr identities; see its
-  `foundation/mls-protocol.md`, `protocol-core/member-departure.md`,
-  `app-components/nostr-routing-v1.md` and `transports/nostr.md` for
-  the rules referenced under "Marmot-managed groups".
 - [../tutorials/host-a-service.md](../tutorials/host-a-service.md) —
   hosting a service today, without discovery.
 - [../reference/wire-formats.md](../reference/wire-formats.md) — the
