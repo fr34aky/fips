@@ -38,6 +38,35 @@ provides that the static mode lacks:
 | Who may change membership | Whoever has the file | Only admins listed in the group's admin-policy component |
 | Authenticated member list | None | The MLS roster: one Nostr pubkey per member, proven by an account identity proof |
 
+## Static or Marmot-managed?
+
+The table above lists what Marmot adds. This one sets the two kinds of
+shared-secret group side by side, costs included. The sections that
+follow explain each row.
+
+| | Static secret group | Marmot-managed group |
+| --- | ------------------- | -------------------- |
+| Setup | One 32-byte file copied to every member | Admin invites against a published KeyPackage; the Welcome arrives over in-mesh relays |
+| Dependencies | None beyond the daemon | At least one in-mesh Nostr relay, and a companion process with a second key on every member |
+| Remove a member | Replace the file everywhere | One commit; the removed member cannot derive the next epoch's secrets |
+| Key rotation | Manual only | Every commit starts a new epoch; nothing rotates on a timer |
+| Blinded key in service filters | Stable until the file is replaced, so it can be tracked over time | Can be rotated, in a separate commit after the removal |
+| Who controls membership | Anyone who holds the file | Only the group's admins |
+| Member list | None; add an npub-list group for per-member control | The MLS roster doubles as the npub list, through delegations |
+| How members learn services | Locate and Fetch only | Also as group messages over the relays, so Locate becomes optional for members |
+| Deniability among members | Full: records and sealed locators are unsigned | Records sent as group messages are signed by the sender's MLS leaf key, so members hold an attributable transcript |
+| What outsiders see | An opaque key in service filters; the provider's tree neighbours can tell where it originates | The same, plus relays see ciphertext posted to an opaque group id |
+| When infrastructure fails | Nothing to fail | With no relay reachable, membership freezes; discovery continues on the last known epoch |
+| Exposure of the node key | None | Avoided only through the delegated account key, which adds a signed delegation per node |
+| Work needed upstream in Marmot | None | An exporter label and a `discovery_id` component have to be registered |
+
+As a rule of thumb: a static group fits a small, stable set of nodes
+whose operator can reach every one of them by hand, and a group that
+values deniability over revocation. A Marmot-managed group fits
+membership that changes, or any group where removing a member must
+not depend on touching every other member. The two can coexist on one
+node, and the discovery wire protocol does not tell them apart.
+
 ## Under the covers
 
 ### Mapping onto discovery

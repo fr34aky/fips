@@ -581,7 +581,9 @@ two values come from is a provisioning choice:
   [Group files and provisioning](#group-files-and-provisioning). Any
   group key agreement can sit behind that interface.
   [fips-service-discovery-marmot.md](fips-service-discovery-marmot.md)
-  proposes Marmot (MLS with Nostr identities) for it.
+  proposes Marmot (MLS with Nostr identities) for it, and compares
+  the two kinds side by side, costs included, under
+  [Static or Marmot-managed?](fips-service-discovery-marmot.md#static-or-marmot-managed).
 
 The discovery wire protocol is identical in both cases:
 
