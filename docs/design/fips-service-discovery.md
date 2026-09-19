@@ -874,6 +874,70 @@ Points the implementation has to handle:
   that arrive on `fips0` (`is_mesh_interface_query`). DNS is a view of
   *this node's* discovery results, not a mesh-wide directory service.
 
+#### Trust in the DNS view
+
+A DNS answer is unsigned, and it is only as trustworthy as the node
+that serves it. That is acceptable because of where the two hops of a
+lookup run:
+
+```text
+app --DNS--> own daemon --ServiceQuery--> peers --> ... --> provider
+    (loopback, unsigned)  (mesh: ring search, forwarded hop by hop)
+                       <--ServiceResponse-- signed locator
+                       == FSP session ==> provider: fetch the record
+            discovery cache <-- verified record
+app <--DNS-- answer built from the cache
+```
+
+- **The DNS hop is local.** The responder binds to `::1` by default
+  and drops queries that arrive on `fips0`, so no node elsewhere in
+  the mesh can inject or alter a DNS answer.
+- **The mesh hop is verified by the node that runs the search.**
+  Locators and public records are signed, restricted records arrive
+  over an authenticated session, and only verified records enter the
+  cache the answer is built from. Transit nodes and other providers
+  can drop answers or compete for "nearest"; they cannot forge a
+  record.
+- **The DNS view then discards the proof.** An answer is a name, a
+  port and an address; the signatures stay in the daemon's cache.
+  Verification happens inside the node that searched, and DNS hands
+  out the result without evidence.
+
+DNSSEC does not fit. `.fips` is a synthetic zone without a delegation,
+so no validator has a trust anchor for it, and answers differ per node
+by design ("nearest to me"), so there is no one zone to sign. Signing
+answers on the fly would protect a loopback hop that only the local
+machine uses.
+
+The view therefore needs care wherever the answering node is *not* the
+client's own daemon: a LAN host behind `fips-gateway`
+([fips-gateway.md](fips-gateway.md)), or a responder whose
+`dns.bind_addr` was widened beyond loopback. What such a node can do:
+
+| Name | A malicious answering node can | Detectable by the client? |
+| ---- | ------------------------------ | ------------------------- |
+| `<npub>.fips` | Return another node's address | In principle: the address is `fd` plus the first 15 bytes of `SHA-256(pubkey)`. An unmodified application never checks, and behind a gateway the address is a virtual one from the NAT pool |
+| Host alias | Point it anywhere | No. Aliases come from the answering node's own hosts file |
+| `_<type>._tcp.fips`, `<type>.svc.fips` | Return its own node, omit or reorder providers | No |
+
+A host behind a gateway already trusts that gateway with all of its
+plaintext traffic, so DNS adds no new trust there. What limits the
+damage is the application layer: Nostr events are signed by their
+authors and Blossom blobs are addressed by their hash, so a false
+relay or server can withhold and observe but not forge. Plain HTTP has
+no such check, and no certificate authority exists for `.fips` names.
+
+Guidance:
+
+- A client that must not trust its resolver uses `fipsctl services
+  find`, the control socket of its *own* node, or the in-mesh
+  directories. All three carry records that the client's own node
+  verifies.
+- An application that knows an npub should compute the address rather
+  than ask for it.
+- `dns.bind_addr` stays on loopback unless the hosts it serves trust
+  this node as they would trust a gateway.
+
 ## Rate limits and safeguards
 
 | Guard | Where | Proposed default |
@@ -945,6 +1009,14 @@ Points the implementation has to handle:
 - **Deniability of restricted scopes.** Neither the record nor the
   sealed locator carries a signature, so a member cannot prove to an
   outsider that a node serves a group.
+- **The DNS view.** Answers are unsigned and carry no proof. They are
+  safe when the answering node is the client's own daemon, which
+  verified the records; a client that borrows another node's resolver
+  trusts that node completely. For service names the larger risk is
+  not packet forgery but provider selection: announcing is
+  permissionless, so a hostile node nearby can legitimately *be* the
+  answer for `<type>.svc.fips`. See
+  [Trust in the DNS view](#trust-in-the-dns-view).
 - **Exposure by announcement.** Announcing a port tells the mesh where
   to knock. The default-deny `fips0` firewall still decides who gets
   in; an announcement is not an access grant.
