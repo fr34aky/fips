@@ -263,6 +263,11 @@ FAILED_REPS=()
 # Failed reps whose per-node logs were not all saved.
 HARVEST_FAILS=0
 HARVEST_FAILED_REPS=()
+# Phase 5b outcomes over the reps that measured a control window (Phase
+# 1b ran): reps that abstained, and reps that re-measured at least once.
+STREAM_REPS=0
+ABSTAIN_REPS=0
+REMEASURE_REPS=0
 # Per-kind connectivity-failure tallies, summed across all failed reps.
 MIXED_FAILS=0
 SAME_FAILS=0
@@ -282,6 +287,20 @@ for ((rep = 1; rep <= REPS; rep++)); do
     FIPS_INTEROP_KEEP_UP=1 FIPS_INTEROP_NETEM="${FIPS_INTEROP_NETEM:-}" \
         bash "$DRIVER" "${DRIVER_ARGS[@]}" >"$driver_log" 2>&1
     rc=$?
+
+    # Tallied for every rep whatever its verdict: abstaining is the absence
+    # of a verdict rather than a failure, so without this count a run whose
+    # Phase 5b always abstains would pass unnoticed.
+    if grep -q '^Phase 1b: ' "$driver_log"; then
+        STREAM_REPS=$((STREAM_REPS + 1))
+        if grep -q '^  ABSTAIN  Data-plane continuity' "$driver_log"; then
+            ABSTAIN_REPS=$((ABSTAIN_REPS + 1))
+            echo "  Phase 5b abstained (no clean control window)"
+        fi
+        if grep -q 'control window attempt .*re-measuring' "$driver_log"; then
+            REMEASURE_REPS=$((REMEASURE_REPS + 1))
+        fi
+    fi
 
     if [ "$rc" -eq 0 ]; then
         PASS_COUNT=$((PASS_COUNT + 1))
@@ -386,6 +405,9 @@ fi
     fi
     if [ "$HARVEST_FAILS" -gt 0 ]; then
         echo "Harvest    : $HARVEST_FAILS failed rep(s) with incomplete per-node logs: ${HARVEST_FAILED_REPS[*]}"
+    fi
+    if [ "$STREAM_REPS" -gt 0 ]; then
+        echo "Phase 5b   : abstained in $ABSTAIN_REPS of $STREAM_REPS reps; re-measured in $REMEASURE_REPS of $STREAM_REPS reps"
     fi
     echo ""
     echo "-- Connectivity-failure attribution (summed over failed reps) --"
