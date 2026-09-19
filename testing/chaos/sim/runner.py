@@ -24,7 +24,12 @@ from .assertions import (
 )
 from .compose import generate_compose
 from .config_gen import write_configs
-from .control import snapshot_all_congestion, snapshot_all_mmp, snapshot_all_trees
+from .control import (
+    query_status,
+    snapshot_all_congestion,
+    snapshot_all_mmp,
+    snapshot_all_trees,
+)
 from .docker_exec import docker_compose, existing_containers, force_remove
 from .link_swap import LinkSwapManager
 from .links import LinkManager
@@ -40,6 +45,10 @@ from .traffic import TrafficManager
 from .veth import VethManager
 
 log = logging.getLogger(__name__)
+
+# Upper bound on the wait for restored nodes' control sockets before the
+# final snapshot. See _wait_control_sockets.
+CONTROL_WAIT_SECS = 60
 
 
 class SimRunner:
@@ -698,6 +707,11 @@ class SimRunner:
                 log.info("Restoring stopped nodes...")
                 self.node_mgr.restore_all()
 
+            # A node restarted just above can take several seconds to open
+            # its control socket, and a snapshot taken before then records
+            # it as absent. Wait for every node to answer first.
+            self._wait_control_sockets(CONTROL_WAIT_SECS)
+
             # Collect iperf3 throughput results before containers stop
             if self.traffic_mgr:
                 iperf_results = self.traffic_mgr.collect_results()
@@ -837,6 +851,32 @@ class SimRunner:
             self._release_network()
 
         return result
+
+    def _wait_control_sockets(self, timeout: float) -> None:
+        """Wait until every node's control socket answers, up to timeout.
+
+        Bounded, and it never fails the run itself: a node that still does
+        not answer is left to the final snapshot, where the assertions see
+        it as absent.
+        """
+        start = time.monotonic()
+        waiting = sorted(self.topology.nodes)
+        while True:
+            waiting = [
+                nid for nid in waiting
+                if query_status(self.topology.container_name(nid)) is None
+            ]
+            elapsed = time.monotonic() - start
+            if not waiting or elapsed >= timeout:
+                break
+            time.sleep(2)
+        if waiting:
+            log.warning(
+                "Control socket wait: %s still not answering after %.1fs",
+                ", ".join(waiting), elapsed,
+            )
+        else:
+            log.info("Control socket wait: all nodes answered after %.1fs", elapsed)
 
     def _take_snapshot(self, label: str):
         """Query all nodes via control socket and save tree/MMP/congestion snapshots."""
