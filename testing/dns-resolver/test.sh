@@ -73,8 +73,9 @@ cleanup_container() {
 build_image() {
     local tag="$1"
     shift
-    echo "$@" | run_quiet "docker build -t $tag" \
-        docker build -t "$tag" -f - "$REPO_ROOT"
+    local dockerfile="$*"
+    retry_build "docker build -t $tag" build_inline "$tag" "$dockerfile" "$REPO_ROOT" || return
+    return 0
 }
 
 # Start a systemd container in the background. Not privileged: see

@@ -587,8 +587,10 @@ jobs:
           chmod +x _bin/native-echo _bin/native-surface
           cp _bin/native-echo testing/docker/native-echo
           cp _bin/native-surface testing/docker/native-surface
-          docker build -t fips-test:latest testing/docker
-          docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker
+          # Retried: both builds pull from Docker Hub and the Debian mirrors.
+          source testing/lib/image-build.sh
+          retry_build "docker build fips-test" docker build -t fips-test:latest testing/docker
+          retry_build "docker build fips-test-app" docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker
 
       # ── Static topology ────────────────────────────────────────────────────
       - name: Generate configs (static)
