@@ -656,6 +656,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts, so the `.ipk` and `.apk` packages install the same bodies and the
   scenarios in `testing/openwrt/` run what ships.
 
+#### Packaging
+
+- The `.deb` now declares `libgcc-s1 (>= 4.2)`. All four binaries link
+  `libgcc_s.so.1`, but cargo-deb removes every libgcc entry from the
+  dependencies it derives, so the package never said so. `libc6` depends on
+  `libgcc-s1` on Debian 12 and Ubuntu 22.04, 24.04 and 26.04, so installs there
+  were not affected. A new check, `testing/check-deb-depends.sh`, runs
+  `dpkg-shlibdeps` over the package's binaries on every build and fails the
+  build when the declared `Depends` leaves out a library the binaries need, or
+  states a floor lower or higher than the one they need. A dependency the
+  packaging tool drops, including one it drops after only a warning when it
+  cannot resolve a binary, now fails the build instead of shipping.
+- `-V` on binaries built into the Linux packages now includes the source
+  revision, as `<version> (rev <git-hash>)`. The build image had no git, so
+  every container-built binary printed the version alone. A package built from
+  a git worktree still has no revision, because the worktree's git directory is
+  outside the tree the build sees. The build image's tag now includes a hash of
+  its Dockerfile, so a host with an older image cached builds a new one instead
+  of reusing it.
+
 ### Changed
 
 - The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
@@ -666,6 +686,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against `chacha20` at either version, and 0.10.1 was withdrawn by its
   maintainer rather than flagged by an advisory. What it buys is that a fresh
   checkout can resolve the lockfile without reaching for a yanked version.
+- The dns-resolver test suite's end-to-end scenarios now run the `fips` and
+  `fips-gateway` binaries from the Debian package rather than compiling their
+  own. The suite used to build both in a Debian 12 image with whatever Rust was
+  current, a second release build on every CI run with no cache, and not the
+  toolchain or the build that ships. It now takes `--deb PATH`, and CI hands it
+  the package the install suite installs, so one package build serves both; run
+  on its own it builds the package through the same container script the
+  release uses. The GitHub leg moves to a job of its own that waits for the
+  package build, with its check name unchanged, and a local CI run builds the
+  package once for both suites. The suite now needs `dpkg-deb` on the host.
+- The Linux release and CI package builds reuse their builder image across
+  GitHub runners instead of assembling it on every leg from apt, rustup and a
+  compile of `cargo-deb`. `build-deb-container.sh` gains `--print-image-tag` and
+  `--image-archive PATH`: the workflows key an Actions cache entry on the image
+  tag, load the image from it when present, and save it after a build. Only a
+  push to `maint`, `master` or `next` saves an entry; pull requests and topic
+  branches read the default branch's. A corrupt or mismatched archive is a
+  warning and a rebuild, never a failed build. A cached image is not refreshed
+  from apt or the base image until the base image name, the toolchain or
+  `Dockerfile.build` changes, as was already true of a developer's machine.
+- CI now builds the arm64 `.deb` on an arm64 runner and installs it on Ubuntu
+  22.04, the oldest supported distribution, starting the daemon, on every push
+  and pull request. Until now the arm64 package was floor-checked and never
+  installed anywhere in the pipeline. Its upgrade, purge and conffile paths
+  remain unexercised; those run on amd64 only. The parity check reads each
+  install leg's architecture, so the arm64 leg is reported as GitHub-only and
+  cannot stand in for a missing amd64 leg of the same distribution.
 
 ## [0.5.1] - 2026-09-06
 
