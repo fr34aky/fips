@@ -177,12 +177,17 @@ FIPS_INTEROP_NETEM="delay 10ms 5ms 25% loss 2%" \
   wants netem) but still runs a clean baseline loop.
 
 Each rep invokes `interop-test.sh` with netem set and captures its full
-output and exit code; a rep passes iff `interop-test.sh` exits 0. Artifacts
-land in `testing/interop/.stress-runs/<UTC-timestamp>/`:
+output and exit code; a rep passes iff `interop-test.sh` exits 0. Every rep
+runs with `FIPS_INTEROP_KEEP_UP=1`, because whether it failed is known only
+after the driver exits: the loop saves a failed rep's per-node logs and then
+tears the mesh down itself, including when the loop is interrupted.
+Artifacts land in `testing/interop/.stress-runs/<UTC-timestamp>/`:
 
 - `rep-NN/driver.log` — full driver output for every rep.
 - `rep-NN/docker-<container>.log` — per-container `docker logs` for **failed**
-  reps only.
+  reps only. The expected containers come from the generated manifest, and
+  the loop prints `harvest: k of n per-node logs written` for each failed
+  rep. A log that could not be read or came back empty counts as missing.
 - `summary.txt` — the aggregate report.
 
 The aggregate report gives reps run, passed/failed counts and an integer
@@ -193,9 +198,10 @@ pair kind (mixed vs same), and a verdict:
 - **both mixed and same pairs** → loss-induced general instability;
 - **same-version control pair only** → the build is unstable against itself.
 
-`interop-stress.sh` exits **non-zero only** for the interop-regression
-signal. A sub-100% pass rate under loss is expected and is not by itself a
-failure, so every other outcome exits 0.
+`interop-stress.sh` exits **1** for the interop-regression signal and **3**
+when a failed rep's per-node logs are incomplete (the run's diagnostics are
+missing; a regression keeps exit 1). A sub-100% pass rate under loss is
+expected and is not by itself a failure, so every other outcome exits 0.
 
 ### Options
 
@@ -203,7 +209,7 @@ failure, so every other outcome exits 0.
 | ---------------------------- | ------------------------------------------------- |
 | `FIPS_INTEROP_NETEM`         | tc-netem string applied to each container's eth0, e.g. `"delay 10ms 5ms 25% loss 1%"`. Passed through `interop-stress.sh` to `interop-test.sh`. |
 | `REKEY_AFTER_SECS`           | Rekey interval for generated configs (default 35).|
-| `FIPS_INTEROP_KEEP_UP`       | `1` = leave containers running after the test.    |
+| `FIPS_INTEROP_KEEP_UP`       | `1` = leave containers running after the test. The stress loop sets it for every rep and tears down itself. |
 | `FIPS_INTEROP_KEEP_WORKTREES`| `1` = keep `build-images.sh` worktrees (debug).   |
 | `FIPS_INTEROP_RUNS_DIR`      | Root for the three scratch dirs — see [Scratch directory location](#scratch-directory-location). |
 
