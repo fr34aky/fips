@@ -638,8 +638,12 @@ jobs:
         if: matrix.type == 'chaos'
         run: pip3 install --quiet pyyaml jinja2
 
+      # With FIPS_TEST_IMAGE set, the chaos runner uses the image the job built
+      # above instead of building fips-test:latest again (testing/chaos/sim/runner.py).
       - name: Run chaos scenario
         if: matrix.type == 'chaos'
+        env:
+          FIPS_TEST_IMAGE: fips-test:latest
         run: bash testing/chaos/scripts/chaos.sh ${{ matrix.scenario }} ${{ matrix.chaos_flags }}
 
       - name: Upload sim results on failure (chaos)
