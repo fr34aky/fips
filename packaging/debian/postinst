@@ -127,6 +127,19 @@ case "$1" in
             # is not a failure, but the units that require it are not started
             # either.
             if [ -n "$2" ]; then
+                # Reapply the firewall ruleset in place, before the daemon
+                # starts, and only where the operator has it running: "try"
+                # leaves a unit that is not active alone, so this never opts
+                # a host in. The daemon-reload above has loaded the unit's
+                # ExecReload, so this reloads rather than restarts; a restart
+                # would run ExecStop, which deletes the table. A reload that
+                # fails leaves the previous ruleset loaded, so it is reported
+                # and the upgrade goes on.
+                if ! systemctl try-reload-or-restart fips-firewall.service; then
+                    echo "fips: reloading fips-firewall.service failed; the ruleset loaded before the upgrade stays in force" >&2
+                    echo "fips: check /etc/fips/fips.nft and the rules in /etc/fips/fips.d/" >&2
+                fi
+
                 daemon_rc=0
                 unit_bounded start fips.service "$UNIT_START_LIMIT" || daemon_rc=$?
                 if [ "$daemon_rc" -eq 1 ]; then

@@ -744,6 +744,90 @@ check_active() {
     return 0
 }
 
+# Pass or fail on whether a unit the host never enabled is still neither
+# running nor enabled.
+check_left_off() {
+    local name="$1" unit="$2" what="$3" state
+    state=$(cexec "$name" systemctl is-enabled "$unit" 2>/dev/null || true)
+    if ! cexec "$name" systemctl is-active --quiet "$unit" && [ "$state" = "disabled" ]; then
+        pass "$what: $unit inactive and disabled"
+    else
+        fail "$what: $unit is $(cexec "$name" systemctl is-active "$unit" 2>/dev/null) and '$state' (want inactive and disabled)"
+    fi
+    return 0
+}
+
+# Start `nft monitor tables` in the background, writing to
+# /root/nft-monitor.log, and prove it is recording by adding and deleting a
+# table of its own. An empty log from a monitor that never ran would otherwise
+# read as a ruleset that was never removed. The probe table's name does not
+# begin with "fips", so it cannot match a check on the fips table.
+start_nft_monitor() {
+    local name="$1"
+    if ! timeout "$EXEC_TIMEOUT" docker exec -d "$name" \
+            sh -c 'exec nft monitor tables > /root/nft-monitor.log 2>&1'; then
+        return 1
+    fi
+    sleep 1
+    cexec "$name" sh -c 'nft add table inet monprobe && nft delete table inet monprobe' || return 1
+    local _i
+    for _i in 1 2 3 4 5; do
+        if cexec "$name" grep -Eq '^delete table inet monprobe( |$)' /root/nft-monitor.log; then
+            return 0
+        fi
+        sleep 1
+    done
+    cexec "$name" cat /root/nft-monitor.log 2>&1 | tail -10
+    return 1
+}
+
+# Host that opted in to the firewall: the upgrade must apply the new ruleset in
+# place, with no moment at which the fips table is absent.
+_upgrade_opted_in() {
+    local name="$1" image="$2" deb="$3"
+    log "upgrade on a host that opted in ($name)"
+    upgrade_boot "$name" "$image" "$deb" || { cleanup_container "$name"; return 0; }
+    make_next_package "$name" "$deb" || { cleanup_container "$name"; return 0; }
+    if ! cexec "$name" systemctl enable --now fips-firewall.service >/dev/null 2>&1 ||
+        ! start_daemon_units "$name"; then
+        fail "opted in: the firewall, fips and fips-dns did not all start before the upgrade"
+        cexec "$name" systemctl status --no-pager fips-firewall.service 2>&1 | tail -15
+        cleanup_container "$name"
+        return 0
+    fi
+    if ! start_nft_monitor "$name"; then
+        fail "opted in: nft monitor is not observing table changes"
+        cleanup_container "$name"
+        return 0
+    fi
+
+    run_apt "$name" install -y ./next.deb
+    echo "  upgrade took ${APT_SECS}s"
+    if [ "$APT_RC" -eq 0 ]; then
+        pass "opted in: upgrade exits 0"
+    else
+        fail "opted in: upgrade exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+    fi
+    check_active "$name" fips.service "opted in, after upgrade"
+    check_active "$name" fips-dns.service "opted in, after upgrade"
+    check_active "$name" fips-firewall.service "opted in, after upgrade"
+    if cexec "$name" nft list counter inet fips fips_upgrade_probe >/dev/null 2>&1; then
+        pass "opted in: the upgraded ruleset is loaded"
+    else
+        fail "opted in: the upgraded ruleset is not loaded (no fips_upgrade_probe counter)"
+    fi
+    if cexec "$name" grep -Eq '^delete table inet fips( |$)' /root/nft-monitor.log; then
+        fail "opted in: the fips table was deleted during the upgrade"
+        cexec "$name" cat /root/nft-monitor.log 2>&1 | tail -10
+    else
+        pass "opted in: the fips table was never deleted during the upgrade"
+    fi
+
+    cleanup_container "$name"
+    return 0
+}
+
 # Host that never opted in to the firewall or enabled the gateway: the upgrade
 # must leave both as they were. Then the package is reinstalled twice: with the
 # daemon masked, when apt must succeed and start nothing, and with a daemon
@@ -770,6 +854,12 @@ _upgrade_not_opted_in() {
     fi
     check_active "$name" fips.service "not opted in, after upgrade"
     check_active "$name" fips-dns.service "not opted in, after upgrade"
+    check_left_off "$name" fips-firewall.service "not opted in, after upgrade"
+    if cexec "$name" nft list table inet fips >/dev/null 2>&1; then
+        fail "not opted in, after upgrade: the fips firewall table is loaded"
+    else
+        pass "not opted in, after upgrade: no fips firewall table"
+    fi
 
     # A host that masked the daemon on purpose: the upgrade must skip it with a
     # message, not fail. The package before this change printed nothing for a
@@ -849,6 +939,7 @@ DOCKERFILE
 
     # Named under the install scenario's prefix, so a CI step that collects
     # that scenario's container logs on failure collects these too.
+    _upgrade_opted_in "fips-deb-test-${distro_label}-upg-a${FIPS_CI_NAME_SUFFIX:-}" "$image" "$deb"
     _upgrade_not_opted_in "fips-deb-test-${distro_label}-upg-b${FIPS_CI_NAME_SUFFIX:-}" "$image" "$deb"
     docker rmi "$image" >/dev/null 2>&1 || true
     return 0
