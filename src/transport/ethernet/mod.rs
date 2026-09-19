@@ -384,6 +384,42 @@ impl Transport for EthernetTransport {
 // Receive Loop
 // ============================================================================
 
+/// Why a received data frame was dropped by [`data_payload`].
+///
+/// Private and only logged at trace, so not a `thiserror` type.
+#[derive(Debug, PartialEq, Eq)]
+enum DataFrameError {
+    /// Fewer bytes than the type byte and the length field.
+    TooShort { len: usize },
+    /// The length field names more payload than the frame carries.
+    LengthExceeds {
+        payload_len: usize,
+        available: usize,
+    },
+}
+
+/// Extract the payload of a received data frame.
+///
+/// `frame` is the received bytes including the type byte, which the caller
+/// has already matched as `FRAME_TYPE_DATA`. The layout is
+/// `[type:1][length:2 LE][payload:N][padding]`: the length field is what
+/// trims Ethernet minimum-frame padding, which would otherwise be handed to
+/// AEAD verification as ciphertext.
+fn data_payload(frame: &[u8]) -> Result<&[u8], DataFrameError> {
+    if frame.len() < 3 {
+        return Err(DataFrameError::TooShort { len: frame.len() });
+    }
+    let payload_len = u16::from_le_bytes([frame[1], frame[2]]) as usize;
+    let available = frame.len() - 3;
+    if payload_len > available {
+        return Err(DataFrameError::LengthExceeds {
+            payload_len,
+            available,
+        });
+    }
+    Ok(&frame[3..3 + payload_len])
+}
+
 /// Ethernet receive loop — runs as a spawned task.
 async fn ethernet_receive_loop(
     socket: Arc<AsyncPacketSocket>,
@@ -411,29 +447,31 @@ async fn ethernet_receive_loop(
                 let frame_type = buf[0];
                 match frame_type {
                     FRAME_TYPE_DATA => {
-                        // Data frame: [type:1][length:2 LE][payload:N]
-                        // Use the length field to trim Ethernet minimum-frame padding.
-                        if len < 3 {
-                            trace!("Data frame too short ({len} bytes), ignoring");
-                            continue;
-                        }
-                        let payload_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-                        if payload_len > len - 3 {
-                            trace!(
-                                "Data frame length field ({payload_len}) exceeds \
-                                 available bytes ({}), ignoring",
-                                len - 3
-                            );
-                            continue;
-                        }
-                        let data = buf[3..3 + payload_len].to_vec();
+                        let data = match data_payload(&buf[..len]) {
+                            Ok(payload) => payload.to_vec(),
+                            Err(DataFrameError::TooShort { len }) => {
+                                trace!("Data frame too short ({len} bytes), ignoring");
+                                continue;
+                            }
+                            Err(DataFrameError::LengthExceeds {
+                                payload_len,
+                                available,
+                            }) => {
+                                trace!(
+                                    "Data frame length field ({payload_len}) exceeds \
+                                     available bytes ({available}), ignoring"
+                                );
+                                continue;
+                            }
+                        };
+                        let bytes = data.len();
                         let addr = TransportAddr::from_bytes(&src_mac);
                         let packet = ReceivedPacket::new(transport_id, addr, data);
 
                         trace!(
                             transport_id = %transport_id,
                             remote_mac = %format_mac(&src_mac),
-                            bytes = payload_len,
+                            bytes,
                             "Ethernet data frame received"
                         );
 
@@ -717,26 +755,62 @@ mod tests {
         assert_eq!(&frame[3..], &[1, 2, 3, 4]); // payload
     }
 
+    /// Build a data frame as the sender does: type, LE length, payload.
+    fn data_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(3 + payload.len());
+        frame.push(FRAME_TYPE_DATA);
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     #[test]
     fn test_data_frame_padding_trimmed() {
         // Simulate Ethernet minimum-frame padding: a 4-byte payload produces
         // a 7-byte frame (type + len + payload), padded to 46 bytes by NIC.
-        let payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let payload_len = payload.len() as u16;
-
-        // Build frame as sender would
-        let mut frame = Vec::with_capacity(3 + payload.len());
-        frame.push(FRAME_TYPE_DATA);
-        frame.extend_from_slice(&payload_len.to_le_bytes());
-        frame.extend_from_slice(&payload);
-
-        // Simulate NIC padding to 46 bytes
+        // Drives the receive loop's own parse, not a copy of it.
+        let mut frame = data_frame(&[0xAA, 0xBB, 0xCC, 0xDD]);
         frame.resize(46, 0x00);
 
-        // Receiver extracts using length field
-        let recv_len = u16::from_le_bytes([frame[1], frame[2]]) as usize;
-        let extracted = &frame[3..3 + recv_len];
-        assert_eq!(extracted, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(data_payload(&frame), Ok(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    #[test]
+    fn test_data_payload_unpadded_frame_returns_whole_payload() {
+        let payload: Vec<u8> = (0..200).map(|i| i as u8).collect();
+        let frame = data_frame(&payload);
+
+        assert_eq!(data_payload(&frame), Ok(&payload[..]));
+    }
+
+    #[test]
+    fn test_data_payload_zero_length_padded_frame_returns_empty() {
+        let mut frame = data_frame(&[]);
+        frame.resize(46, 0x00);
+
+        assert_eq!(data_payload(&frame), Ok(&[][..]));
+    }
+
+    #[test]
+    fn test_data_payload_frame_shorter_than_header_is_rejected() {
+        assert_eq!(
+            data_payload(&[FRAME_TYPE_DATA, 0x04]),
+            Err(DataFrameError::TooShort { len: 2 })
+        );
+    }
+
+    #[test]
+    fn test_data_payload_length_field_beyond_received_bytes_is_rejected() {
+        let mut frame = data_frame(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        frame.truncate(6);
+
+        assert_eq!(
+            data_payload(&frame),
+            Err(DataFrameError::LengthExceeds {
+                payload_len: 4,
+                available: 3
+            })
+        );
     }
 
     #[test]
