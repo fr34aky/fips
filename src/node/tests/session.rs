@@ -4998,6 +4998,24 @@ fn test_session_entry_size_stays_within_the_budget_the_cap_is_derived_from() {
 // Integration tests: a forged SessionAck against an in-flight initiation
 // ============================================================================
 
+/// A forged SessionAck of exactly the right length, carrying `from`'s tree
+/// coordinates.
+///
+/// The leading 33 bytes of its handshake payload are a valid compressed
+/// point, which is what makes it discriminate a rollback: random bytes
+/// usually fail `PublicKey::from_slice` before anything has been mixed into
+/// the symmetric state. The epoch ciphertext after it is zeroed, so the read
+/// fails only once the point has been mixed in.
+fn forged_session_ack(from: &TestNode) -> Vec<u8> {
+    let mut payload = Identity::generate().pubkey_full().serialize().to_vec();
+    payload.extend_from_slice(&[0u8; crate::noise::EPOCH_ENCRYPTED_SIZE]);
+    assert_eq!(payload.len(), crate::noise::XK_HANDSHAKE_MSG2_SIZE);
+    let coords = from.node.tree_state().my_coords().clone();
+    SessionAck::new(coords.clone(), coords)
+        .with_handshake(payload)
+        .encode()
+}
+
 #[tokio::test]
 async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_genuine_ack() {
     let mut nodes = make_rekey_disabled_pair().await;
@@ -5019,17 +5037,7 @@ async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_g
         .expect("initiating entry present")
         .last_activity();
 
-    // A forged ack of exactly the right length. The leading 33 bytes are a
-    // valid compressed point, which is the point of the test: random bytes
-    // usually fail `PublicKey::from_slice` before anything has been mixed
-    // into the symmetric state, so they would not discriminate the rollback.
-    let mut payload = Identity::generate().pubkey_full().serialize().to_vec();
-    payload.extend_from_slice(&[0u8; crate::noise::EPOCH_ENCRYPTED_SIZE]);
-    assert_eq!(payload.len(), crate::noise::XK_HANDSHAKE_MSG2_SIZE);
-    let coords = nodes[1].node.tree_state().my_coords().clone();
-    let forged = SessionAck::new(coords.clone(), coords)
-        .with_handshake(payload)
-        .encode();
+    let forged = forged_session_ack(&nodes[1]);
 
     nodes[0]
         .node
@@ -5078,6 +5086,196 @@ async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_g
             .expect("responder session present")
             .is_established(),
         "and the responder must reach Established too"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A SessionAck that fails to read must not end an FSP rekey the node
+/// initiated.
+///
+/// Nothing authenticates a SessionAck before its msg2 is read: the only tie
+/// to the rekey is the datagram's source address, which the sender chooses.
+/// So the rekey-initiator arm has to put its handshake back, rolled back to
+/// its pre-read state, and let the genuine ack complete the cycle, as the
+/// primary arm does for an initiation.
+#[tokio::test]
+async fn test_forged_session_ack_leaves_the_rekey_able_to_complete_on_the_genuine_ack() {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_ESTABLISHED};
+    use crate::transport::ReceivedPacket;
+
+    // node 0 rekeys after one message; node 1 never initiates.
+    let mut cfg0 = Config::new();
+    cfg0.node.rekey.after_messages = 1;
+    let mut cfg1 = Config::new();
+    cfg1.node.rekey.after_messages = u64::MAX;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    let mut nodes = run_tree_test_with_configs(vec![cfg0, cfg1], &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+
+    // One frame crosses node 0's rekey trigger.
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"before the rekey")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+
+    // node 0 sends its rekey SessionSetup; only node 1 is pumped, so node 1
+    // arms and its SessionAck waits in node 0's queue.
+    nodes[0].node.check_session_rekey().await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .is_some_and(|e| e.has_rekey_in_progress() && e.is_rekey_initiator()),
+        "node 0 must have initiated a rekey"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes[1..]).await;
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .is_some_and(|e| e.has_rekey_in_progress() && !e.is_rekey_initiator()),
+        "node 1 must have armed as the rekey responder"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let held: Vec<ReceivedPacket> =
+        std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
+    assert!(
+        !held.is_empty(),
+        "node 1's SessionAck must be queued at node 0"
+    );
+    for packet in &held {
+        assert_eq!(
+            CommonPrefix::parse(&packet.data).map(|p| p.phase),
+            Some(PHASE_ESTABLISHED),
+            "every held packet must be a link frame"
+        );
+    }
+
+    // The forgery arrives first, under node 1's address.
+    let forged = forged_session_ack(&nodes[1]);
+    nodes[0]
+        .node
+        .handle_session_payload(&node1_addr, &node1_addr, &forged, 1280, false)
+        .await;
+    let entry = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .expect("an unreadable ack must not remove the session");
+    assert!(
+        entry.has_rekey_in_progress() && entry.is_rekey_initiator(),
+        "the rekey must still be in flight after an ack that did not read"
+    );
+    assert_eq!(
+        nodes[0].node.stats().session.ack_handshake_failed,
+        1,
+        "the refusal must be counted"
+    );
+
+    // Release the genuine ack. This is the assertion that tells the outcomes
+    // apart: an initiator that abandoned on the forgery meets the genuine ack
+    // with no rekey in flight and completes nothing.
+    for packet in held {
+        nodes[0].node.handle_encrypted_frame(packet).await;
+    }
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 0 must complete the rekey on the genuine ack"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 1 must hold the new session after msg3"
+    );
+
+    // node 0 cuts over on its liveness timer, and data decodes both ways on
+    // the new epoch.
+    let now_ms = wall_clock_ms();
+    nodes[0]
+        .node
+        .sessions
+        .get_mut(&node1_addr)
+        .unwrap()
+        .set_rekey_completed_ms(now_ms - 10_000);
+    nodes[0].node.check_session_rekey().await;
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_none(),
+        "node 0 must have cut over"
+    );
+
+    let recv1_before = nodes[1]
+        .node
+        .get_session(&node0_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the rekey 0 to 1")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    let entry1 = nodes[1].node.get_session(&node0_addr).unwrap();
+    assert_eq!(
+        entry1.traffic_counters().1,
+        recv1_before + 1,
+        "node 0 to node 1 must decode on the new epoch"
+    );
+    assert!(
+        entry1.pending_new_session().is_none(),
+        "node 0's first new-epoch frame must complete node 1's cutover"
+    );
+
+    let recv0_before = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .unwrap()
+        .traffic_counters()
+        .1;
+    nodes[1]
+        .node
+        .send_session_data(&node0_addr, 0, 0, b"after the rekey 1 to 0")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .unwrap()
+            .traffic_counters()
+            .1,
+        recv0_before + 1,
+        "node 1 to node 0 must decode on the new epoch"
     );
 
     cleanup_nodes(&mut nodes).await;

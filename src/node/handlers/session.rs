@@ -898,7 +898,7 @@ impl Node {
         // never reaches for an entry holding a pending session; and
         // `set_pending_session` clears `rekey_state`, so a completed
         // initiator cycle leaves at most one of the two set. If that ever
-        // stops holding, these four sites become instances of the epoch
+        // stops holding, these three sites become instances of the epoch
         // discard the responder arm was fixed for.
         if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
@@ -909,13 +909,27 @@ impl Node {
                 }
             };
 
-            // Process XK msg2
-            if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XK msg2");
-                entry.abandon_rekey();
+            // Process XK msg2, for the same reason and in the same way as the
+            // primary arm below. Nothing here has been authenticated: the
+            // only tie to our rekey is the datagram's source address, which
+            // the sender chooses. Abandoning would let anyone able to name
+            // the session end the cycle, so the handshake goes back, rolled
+            // back to its pre-read state so it can still read the genuine
+            // ack, and the refusal is counted. The rollback matters because
+            // `read_xk_message_2` mixes the sender's ephemeral in before it
+            // authenticates.
+            if let Err(e) = handshake.try_read_xk_message_2(&ack.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XK msg2, keeping the rekey");
+                entry.set_rekey_state(handshake, true);
                 self.sessions.insert(*src_addr, entry);
+                self.stats_mut()
+                    .record_reject(RejectReason::Session(SessionReject::AckHandshakeFailed));
                 return;
             }
+
+            // The three abandons below stay abandons. Each follows a msg2
+            // that already authenticated, so they are local failures rather
+            // than possible forgeries.
 
             // Generate XK msg3
             let msg3 = match handshake.write_xk_message_3() {

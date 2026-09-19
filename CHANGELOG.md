@@ -67,6 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where before only the first one did; the msg1 resend budget bounds that. The
   wire format is unchanged.
 
+#### Session rekey
+
+- A SessionAck that fails to read no longer ends a session rekey this node
+  started. The handler took the rekey handshake off the session before reading
+  the ack's msg2 and abandoned the rekey when the read failed, although nothing
+  authenticates the ack before that read and the only tie to the rekey is the
+  datagram's source address. The handshake now goes back rolled back to its
+  state before the read, so the peer's genuine ack still completes the rekey,
+  and the refusal is counted as `ack_handshake_failed`, as it already was for a
+  first-contact session. The wire format is unchanged.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has
