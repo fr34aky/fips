@@ -4660,40 +4660,39 @@ async fn test_forged_setups_from_one_link_peer_stop_creating_session_entries_onc
     cleanup_nodes(&mut nodes).await;
 }
 
+/// The limiter's clock for the refill test: tokio's paused clock, which the
+/// test moves with `tokio::time::advance` and nothing else moves.
+fn paused_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 #[tokio::test]
 async fn test_a_drained_setup_bucket_refills_and_admits_the_next_legitimate_setup() {
-    // The refill has to be slow enough that the draining loop below cannot be
-    // outrun by the refill it is draining against. At the 50/s this test used
-    // to run at, a token returned every 20 ms, so on a loaded runner the loop
-    // outlived its own window, the third setup was admitted, and the
-    // precondition failed on arrangement rather than on behaviour. At 2/s a
-    // delivery would have to take 500 ms to lose that race.
-    let mut nodes = make_setup_limited_pair(2, 2.0).await;
+    const BURST: u32 = 2;
+    const RATE: f64 = 2.0;
+    let mut nodes = make_setup_limited_pair(BURST, RATE).await;
 
-    // Deliver until one is actually refused, rather than assuming three is
-    // enough: a delivery the refill absorbs costs one more iteration and
-    // nothing else. The cap is what a runner slow enough to lose even this
-    // race trips, and it says so rather than reporting a drained bucket that
-    // was never drained.
+    // From here the limiter reads a clock only the test moves, so the drain
+    // cannot race a refill however slowly each delivery runs, and the refill
+    // below is exactly the one the test grants.
+    tokio::time::pause();
+    nodes[1].node.setup_rate_limiter.set_clock(paused_now);
+
     let before = nodes[1].node.stats().session.setup_rate_limited;
-    let mut delivered = 0;
-    while nodes[1].node.stats().session.setup_rate_limited == before {
-        assert!(
-            delivered < 50,
-            "the bucket must actually be drained before the refill is tested; \
-             50 forged setups drew no refusal, so each delivery is outlasting \
-             the 500 ms refill interval"
-        );
+    for _ in 0..=BURST {
         deliver_forged_setup_over_link(&mut nodes).await;
-        delivered += 1;
     }
+    assert_eq!(
+        nodes[1].node.stats().session.setup_rate_limited,
+        before + 1,
+        "the burst must be admitted and the one setup past it refused"
+    );
 
-    // A full burst back from empty at 2/s, so the legitimate setup below meets
-    // the same bucket however many tokens the drain left behind. The point
-    // being made is that the denial is transient and clears on its own; the
-    // length of the window is a function of the configured rate, not of the
-    // claim.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // A full burst back from empty at the configured rate, so the legitimate
+    // setup below meets a bucket the refill alone has restored. The denial
+    // is transient and clears on its own; how long it lasts is a function of
+    // the configured rate.
+    tokio::time::advance(Duration::from_secs_f64(f64::from(BURST) / RATE)).await;
     establish_pair_session(&mut nodes).await;
 
     cleanup_nodes(&mut nodes).await;
