@@ -152,8 +152,18 @@ DEB="$DEST_ABS/$DEB_NAME"
 
 # Check the artifact here rather than in one workflow, so every producer is
 # gated: the release, the CI job, a local run and packaging/Makefile all reach
-# the check through this script.
+# both checks through this script. The glibc floor is read from the binaries
+# and runs on the host. The Depends check runs in the build image, because it
+# compares against dpkg-shlibdeps and has to read the same symbols files and C
+# library that cargo-deb's "$auto" read; a host of another distribution could
+# produce a difference of its own.
 "$REPO_ROOT/testing/check-glibc-floor.sh" "$DEB" >&2
+docker run --rm \
+    -v "$REPO_ROOT":/src:ro \
+    -v "$DEST_ABS":/out:ro \
+    -w /src \
+    "$IMAGE_TAG" \
+    testing/check-deb-depends.sh "/out/$DEB_NAME" >&2
 
 echo "=== Built $DEB ===" >&2
 printf '%s\n' "$DEB"

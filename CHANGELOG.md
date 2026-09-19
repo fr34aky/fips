@@ -233,6 +233,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scripts, so the `.ipk` and `.apk` packages install the same bodies and the
   scenarios in `testing/openwrt/` run what ships.
 
+#### Packaging
+
+- The `.deb` now declares `libgcc-s1 (>= 4.2)`. All four binaries link
+  `libgcc_s.so.1`, but cargo-deb removes every libgcc entry from the
+  dependencies it derives, so the package never said so. `libc6` depends on
+  `libgcc-s1` on Debian 12 and Ubuntu 22.04, 24.04 and 26.04, so installs there
+  were not affected. A new check, `testing/check-deb-depends.sh`, runs
+  `dpkg-shlibdeps` over the package's binaries on every build and fails the
+  build when the declared `Depends` leaves out a library the binaries need, or
+  states a floor lower or higher than the one they need. A dependency the
+  packaging tool drops, including one it drops after only a warning when it
+  cannot resolve a binary, now fails the build instead of shipping.
+
 ### Changed
 
 - The lockfile moves `chacha20` from 0.10.1 to 0.10.2, because 0.10.1 is yanked.
