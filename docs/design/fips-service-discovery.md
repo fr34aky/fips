@@ -113,6 +113,48 @@ client                         transit                      provider
 The next client that asks the same transit node within the locator's
 lifetime is answered from its cache.
 
+### Two kinds of service
+
+Services fall into two classes, and the planes serve them differently.
+
+| | Any-of-a-kind (infrastructure) | One-of-a-kind (destinations) |
+| --- | ------------------------------ | ---------------------------- |
+| Examples | Nostr relay, Blossom server, directory | A merchant, a wiki, a forum — almost anything behind `http` |
+| What the client wants | Any provider; the nearest is best | That particular one, or a search by meaning |
+| Vocabulary | Small and bounded: the service *type* names the protocol | Unbounded: what a site is about has no fixed depth |
+| Found through | Locate, then Fetch | The Index plane: search, tags and curation on in-mesh directories |
+
+A service type says which protocol to speak, and for infrastructure
+that is a complete description. For a web service it says almost
+nothing: `find http` returns the nearest eight web servers of any
+kind, and nobody wants the nearest arbitrary website. This is
+accepted, not fixed. The proposal does **not** try to classify
+destinations in the Locate plane:
+
+- Meaning has unlimited depth, and no fixed taxonomy survives it. UDDI
+  tried to register web services under industry classification codes
+  and was abandoned; the web's hand-built directories lost to search
+  and free tagging.
+- Every distinct Locate key is an entry in a filter that the whole
+  mesh carries and that is sized for a few hundred keys.
+- Locality, which is what Locate is good at, is worthless for a
+  destination.
+
+Instead the record stays small and says how to connect, plus a little
+free self-description (`about`, `t` tags; see
+[Service records](#service-records)). Everything about *meaning* lives
+in the Index plane, where search, policy and curation can differ from
+directory to directory. The chain is: Locate finds the nearest
+directories, which needs no configuration; the directories answer
+search and tag queries over destination records; the client connects
+by npub. Only the first step touches the service filter, so the key
+count stays bounded however rich the descriptions get.
+
+A destination is therefore expected to publish its record to
+directories. One that does not is still reachable by anyone who knows
+its npub, and still appears under its type, but it cannot be found by
+what it is.
+
 ### Service records
 
 A service record is a parameterized replaceable Nostr event, tentative
@@ -149,7 +191,36 @@ key.
 | `scheme` | no | URL scheme a client should use (`http`, `ws`, …). |
 | `path` | no | URL path prefix. |
 | `name` | no | Self-asserted display label. Not unique, not trusted. |
+| `about` | no | One or two sentences of free text on what the service is. At most 256 bytes. Not trusted. |
+| `t` | no | Free-form topic, lowercase, one per tag, at most eight. The Nostr hashtag convention, so directories index it and `{"#t": [...]}` filters work. There is no hierarchy and no registry: "merchant, coffee, lisbon" is three tags, not a path. |
 | `expiration` | yes | NIP-40 expiry. Records are short-lived and refreshed. |
+
+`about` and `t` describe; they never select. They are not part of any
+service key, play no role in Locate, and exist for the Index plane. A
+destination's record might read:
+
+```json
+{
+  "kind": 37196,
+  "pubkey": "<node pubkey>",
+  "created_at": 1790000000,
+  "tags": [
+    ["d", "http:tcp:80"],
+    ["s", "http"],
+    ["port", "80", "tcp"],
+    ["scheme", "http"],
+    ["name", "Café Atlântico"],
+    ["about", "Roasted coffee and brewing gear, paid in sats."],
+    ["t", "merchant"],
+    ["t", "coffee"],
+    ["t", "lisbon"],
+    ["expiration", "1790003600"]
+  ],
+  "content": "",
+  "id": "…",
+  "sig": "<signed by the node key>"
+}
+```
 
 `content` may hold service-specific JSON (for a relay, a subset of its
 NIP-11 document). A record is capped at 1024 bytes so that it always
@@ -664,7 +735,23 @@ as a directory:
   directories they discover, over `fips0`, with the `nostr-sdk` client
   that is already linked in for rendezvous.
 - Clients run ordinary filters, for example
-  `{"kinds":[37196],"#s":["blossom"]}`.
+  `{"kinds":[37196],"#s":["blossom"]}` or
+  `{"kinds":[37196],"#t":["coffee"]}`.
+- A directory SHOULD support NIP-50 search, so that a client can ask
+  for `{"kinds":[37196],"search":"coffee lisbon"}` over names, `about`
+  texts and tags. This is how destinations are found by meaning; see
+  [Two kinds of service](#two-kinds-of-service).
+
+A merchant on Nostr is content, not a service type. Stalls and
+products (NIP-15) and classified listings (NIP-99) are events that the
+merchant publishes to the same in-mesh relays; the web shop is one
+`http` endpoint those events point to. The service record does not
+repeat any of that.
+
+Directories may differ in policy — who may write, what gets dropped as
+spam, how results are ranked. That is deliberate: tag and description
+spam is a problem of the plane where policy can vary, not of the mesh
+protocol, where it cannot.
 
 Records from a directory are authentic (signed, address-bound) but say
 nothing about liveness, so they enter the cache as unverified until a
@@ -674,9 +761,11 @@ withhold records but not forge them.
 Restricted records never reach a directory: they are unsigned, and the
 author pubkey alone would reveal that a node belongs to *some* group.
 
-Directories are never required. Locate and Fetch work with zero
-relays, and that is what breaks the circle of needing a relay to find
-a relay.
+Directories are never required for infrastructure. Locate and Fetch
+work with zero relays, and that is what breaks the circle of needing a
+relay to find a relay. Finding a destination by what it is does need
+at least one directory; without one, a destination is found by npub or
+not at all.
 
 ### Names
 
@@ -701,6 +790,13 @@ node:
         scheme: ws
         name: "andre's relay"
         scope: public
+      - type: http                    # a destination: described, and
+        port: 80                      # published so it can be searched
+        name: "Café Atlântico"
+        about: "Roasted coffee and brewing gear, paid in sats."
+        topics: [merchant, coffee, lisbon]
+        scope: public
+        publish_to_directories: true  # overrides the default below
       - type: blossom
         port: 3000
         scope: { allow: family }
@@ -974,7 +1070,12 @@ Guidance:
   npubs from hosts, peers or groups), group scopes, and optionally
   NIP-13 proof of work on records. Ranking by tree distance is a
   convenience, *not* a defence: it favours whoever sits closest to the
-  victim. A reputation or web-of-trust layer is out of scope.
+  victim. `name`, `about` and `t` are self-asserted and as easy to
+  fake as a type; a tag says what a node claims to be, never who
+  stands behind the claim. Filtering them is directory policy, and
+  vouching for them is curation (see
+  [Open questions](#open-questions)). A reputation or web-of-trust
+  layer is out of scope.
 - **Suppression and eclipse.** A transit node can drop responses, and
   a sybil near the origin can answer first with many identities and
   fill the `max_responses` counters downstream, so that honest answers
@@ -1063,6 +1164,15 @@ Guidance:
   lookup needs the freshness because the answer *is* the result; a
   locator is followed by a session that proves more than the signature
   did.
+- **A category taxonomy, or categories as Locate keys.** Web services
+  can be anything, so a hierarchy of categories looks like the way to
+  get hold of them. It is not: a fixed taxonomy never keeps up with
+  what people build (UDDI, the hand-built web directories), a coarse
+  category such as "storage" helps a person browsing but not a client
+  that speaks exactly one protocol, and as a Locate key a category is
+  the flooding worst case — more widespread than any type. Free tags,
+  search and curation on the Index plane cover the need; see
+  [Two kinds of service](#two-kinds-of-service).
 - **Locating `allow` services with the plain key.** The first draft.
   It reveals the provider and the type to the whole mesh and pollutes
   public results with providers that refuse the fetch.
@@ -1088,6 +1198,18 @@ bound, the cache hit rate and how long a new provider stays invisible.
 - **Event kind.** 37196 is a placeholder. Is a FIPS-specific kind
   right, or should this be proposed as a NIP so other overlays can
   share it?
+- **Curation.** Nostr lists (NIP-51) let anyone publish a signed set
+  such as "wikis on this mesh" or "merchants I vouch for", and a
+  client can rank or filter directory results by the curators its
+  user follows. That answers "who stands behind this claim" better
+  than any category scheme. Which list kind, and does the daemon need
+  to know about it at all, or only the browsing tools?
+- **Operator link.** An optional tag naming the operator's npub would
+  tie an endpoint to a human or merchant identity with its own
+  reputation, profile and listings. The claim must hold in both
+  directions — the operator's profile has to list the node — or anyone
+  could claim a well-known operator. Where does the reverse claim
+  live?
 - **Inline public records.** Put a compact record in
   `ServiceResponse` when it fits, saving a session per provider? With
   cacheable locators this would make transit nodes small directories.
