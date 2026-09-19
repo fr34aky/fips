@@ -9,6 +9,7 @@ BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 TOPOLOGY_SCRIPT="$SCRIPT_DIR/setup-topology.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
+RELAY_LIB="$ROOT_DIR/testing/lib/relay-verdict.sh"
 # Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts: the
 # npubs are read back here after the containers are up, so reading a different
 # directory than the one the generator wrote pings an npub no node owns.
@@ -42,6 +43,10 @@ if [ -n "${FIPS_NAT_EXTRA_COMPOSE:-}" ]; then
 fi
 
 source "$WAIT_LIB"
+# shellcheck disable=SC1090
+source "$RELAY_LIB"
+
+RELAY_CONTAINER="fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}"
 
 cleanup() {
     "${COMPOSE[@]}" --profile cone --profile symmetric --profile lan \
@@ -250,6 +255,9 @@ dump_stun_udp_probe() {
 
 dump_cone_diagnostics() {
     echo ""
+    echo "=== relay verdict ==="
+    relay_verdict "$RELAY_CONTAINER" || true
+    echo ""
     echo "=== cone diagnostics ==="
     dump_fips_state fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} ${NAT_WAN}.30 7777 ${NAT_WAN}.40 3478
     dump_node_udp_probe fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-}
@@ -267,6 +275,9 @@ dump_cone_diagnostics() {
 
 dump_symmetric_diagnostics() {
     echo ""
+    echo "=== relay verdict ==="
+    relay_verdict "$RELAY_CONTAINER" || true
+    echo ""
     echo "=== symmetric diagnostics ==="
     dump_fips_state fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} ${NAT_WAN}.30 7777 ${NAT_WAN}.40 3478
     dump_fips_state fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-} ${NAT_WAN}.30 7777 ${NAT_WAN}.40 3478
@@ -277,6 +288,9 @@ dump_symmetric_diagnostics() {
 }
 
 dump_lan_diagnostics() {
+    echo ""
+    echo "=== relay verdict ==="
+    relay_verdict "$RELAY_CONTAINER" || true
     echo ""
     echo "=== lan diagnostics ==="
     dump_fips_state fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} ${NAT_LAN}.30 7777 ${NAT_LAN}.40 3478
@@ -434,6 +448,15 @@ ping_peer() {
     fi
 }
 
+# A relay that faulted while a scenario's assertions still passed is a finding
+# about the relay, not about the scenario, so it is reported and not made a
+# failure: the scenario proved what it set out to prove.
+note_relay_event() {
+    if relay_verdict "$RELAY_CONTAINER"; then
+        echo "NOTE: the assertions above passed despite that." >&2
+    fi
+}
+
 run_cone() {
     echo "=== NAT lab: cone ==="
     cleanup
@@ -474,6 +497,7 @@ run_cone() {
         dump_cone_diagnostics
         return 1
     }
+    note_relay_event
     cleanup
 }
 
@@ -519,6 +543,7 @@ run_symmetric() {
         dump_symmetric_diagnostics
         return 1
     }
+    note_relay_event
     cleanup
 }
 
@@ -561,6 +586,7 @@ run_lan() {
         dump_lan_diagnostics
         return 1
     }
+    note_relay_event
     # Skip the final teardown when the mesh-lab harness wraps this
     # script: it needs to docker-logs the containers before teardown,
     # and will run its own cleanup after capture. Failure paths above
