@@ -169,6 +169,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or that no source is readable and session pinning is off. An operator on a
   kernel with no readable source learned this only from a warning at the first
   failed tick.
+- The gateway counts sessions on a kernel without `/proc/net/nf_conntrack`.
+  When the file is absent it dumps the conntrack table over netlink, as
+  `conntrack -L` does, so a mapping carrying traffic is pinned instead of
+  being reclaimed on its TTL and grace period alone. Kernels built without
+  `CONFIG_NF_CONNTRACK_PROCFS`, such as Ubuntu's, had session pinning off.
 - The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
   `fips_gateway` table in a batch of its own, discarded that batch's result,
   and only then sent the batch that recreated the table, the chains, the

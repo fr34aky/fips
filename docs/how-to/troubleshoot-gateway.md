@@ -167,14 +167,19 @@ virtual IP. At startup it reads conntrack once, the same way each
 
 - `Conntrack source: proc; session pinning is on`: sessions are read
   from `/proc/net/nf_conntrack`.
+- `Conntrack source: netlink; session pinning is on`: the proc file
+  is absent, and sessions are read by dumping the conntrack table over
+  netlink, as `conntrack -L` does. The dump needs `CAP_NET_ADMIN`.
 - `No conntrack source is readable; session pinning is off`: no
-  source could be read, and the line carries the error. Every mapping
-  then reads zero sessions, so a mapping is reclaimed on its TTL and
-  grace period alone, even while a client that has not re-queried DNS
-  still has traffic flowing through it.
+  source could be read, and the line carries the error from each
+  source it tried. Every mapping then reads zero sessions, so a
+  mapping is reclaimed on its TTL and grace period alone, even while a
+  client that has not re-queried DNS still has traffic flowing through
+  it.
 
 The proc file exists only on a kernel built with
-`CONFIG_NF_CONNTRACK_PROCFS`, and only once `nf_conntrack` is loaded:
+`CONFIG_NF_CONNTRACK_PROCFS`, and only once `nf_conntrack` is loaded.
+Without it the gateway uses the netlink dump:
 
 ```sh
 ls /proc/net/nf_conntrack

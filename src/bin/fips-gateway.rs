@@ -65,9 +65,9 @@ fn elapsed_us(started: Instant) -> u64 {
 /// A failed read yields an empty snapshot, so every mapping reads zero
 /// sessions, which is what the pool did with an unreadable source before. The
 /// alternative, treating "unknown" as "in use", would pin every mapping forever
-/// on a kernel with no conntrack proc file and turn a read error into a pool
-/// that never reclaims. The cost is the opposite error: a mapping carrying live
-/// traffic can be reclaimed early while the source is unreadable.
+/// on a kernel with no readable conntrack source and turn a read error into a
+/// pool that never reclaims. The cost is the opposite error: a mapping carrying
+/// live traffic can be reclaimed early while the source is unreadable.
 #[cfg(target_os = "linux")]
 async fn read_conntrack(log: &mut pool::ConntrackReadLog) -> pool::ConntrackSnapshot {
     use fips::gateway::pool::ConntrackQuerier;
@@ -119,16 +119,27 @@ async fn report_conntrack_source() {
             .unwrap_or_else(|e| {
                 pool::ConntrackProbe::Missing(pool::ConntrackUnreadable {
                     proc: std::io::Error::other(e.to_string()),
+                    netlink: None,
                 })
             });
     match probe {
         pool::ConntrackProbe::Found(pool::ConntrackSource::Proc) => {
             info!("Conntrack source: proc; session pinning is on")
         }
-        pool::ConntrackProbe::Missing(e) => warn!(
-            proc_error = %e.proc,
-            "No conntrack source is readable; session pinning is off"
-        ),
+        pool::ConntrackProbe::Found(pool::ConntrackSource::Netlink) => {
+            info!("Conntrack source: netlink; session pinning is on")
+        }
+        pool::ConntrackProbe::Missing(e) => match e.netlink {
+            Some(netlink) => warn!(
+                proc_error = %e.proc,
+                netlink_error = %netlink,
+                "No conntrack source is readable; session pinning is off"
+            ),
+            None => warn!(
+                proc_error = %e.proc,
+                "No conntrack source is readable; session pinning is off"
+            ),
+        },
     }
 }
 
