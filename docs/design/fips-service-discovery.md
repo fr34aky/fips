@@ -453,7 +453,21 @@ process (or any Marmot client) that holds the MLS state, talks to
 relays over `fips0`, and pushes `discovery_id`, the current and
 retained epoch secrets and the roster to the daemon over the control
 socket. The forwarding path stays free of MLS, and a node that never
-uses Marmot groups links nothing new.
+uses Marmot groups links nothing new. The pushed values are listed
+under [Group files and provisioning](#group-files-and-provisioning).
+
+What happens when an admin removes a member:
+
+1. The Remove commit moves the group to a new epoch, say 42 → 43.
+2. Each remaining member's companion pushes the epoch-43 secret and
+   the shorter roster to its daemon.
+3. The removed member cannot derive the epoch-43 secret. Its queries
+   are still answered while epoch 42 is inside the retained window,
+   and not afterwards. The fetch port refuses it immediately, because
+   it is no longer on the roster.
+4. Optionally, an admin rotates `discovery_id` in a *later* commit, so
+   that the removed member can no longer recognize the group's keys in
+   bloom filters.
 
 What it costs:
 
@@ -573,6 +587,69 @@ Applications can also register at runtime over the control socket
 if it is not renewed, so a relay that exits stops being announced. The
 daemon signs on the application's behalf, since the record must be
 signed by the node key.
+
+### Group files and provisioning
+
+The three kinds of group are provisioned differently, and who needs
+what differs too.
+
+**npub-list group.** A plain list of public keys, one member per line:
+an npub, or a host alias that `/etc/fips/hosts` maps to an npub. The
+format is that of `peers.allow` (`src/node/acl.rs`): `#` starts a
+comment, the file is hot-reloaded.
+
+```text
+# /etc/fips/groups/family
+npub1q7x…k3m        # andre laptop
+npub1zx4…9ua        # living-room server
+mum-phone           # alias from /etc/fips/hosts
+```
+
+- The file contains nothing secret. A requester's identity is already
+  proven by its FSP session; the provider only looks the pubkey up.
+- Only providers need the file. A client needs nothing, because the
+  provider decides.
+- Each provider keeps its own copy. Removing a member is deleting the
+  line on the providers.
+- The `ALL` wildcard of `peers.allow` is deliberately **not**
+  supported. It would silently turn a group scope into a public one.
+
+**Static secret group.** The file holds the 32-byte secret and no
+public keys.
+
+```text
+# /etc/fips/groups/lab.key   (mode 0600)
+9f2c…64 hex characters…e1
+```
+
+- Every member needs a copy, clients included, because a client has to
+  compute the blinded key and authenticate its query.
+- There is no member list. Whoever has the file is a member, and
+  removing someone means replacing the file everywhere.
+
+**Marmot-managed group.** There is no file to edit; the configuration
+entry is only `guild: { marmot: true }`. The companion process pushes
+three things over the control socket (`services_group_update`), and
+pushes them again whenever the group changes:
+
+| Pushed value | Source in the Marmot group | Used for |
+| ------------ | -------------------------- | -------- |
+| `discovery_id` | Application component in group state; stable across epochs | Blinding the bloom keys |
+| Epoch secrets | MLS exporter of the current epoch and a few retained ones | Authenticating queries, sealing responses |
+| Roster | Pubkeys of the current MLS members | The npub list checked on the fetch port |
+
+Every member runs the companion, providers and clients alike.
+
+`fipsctl show services --groups` lists what the daemon currently
+holds, without ever printing a secret:
+
+```text
+$ fipsctl show services --groups
+GROUP   KIND     EPOCH  MEMBERS  SOURCE
+family  list     —      3        /etc/fips/groups/family
+lab     static   —      —        /etc/fips/groups/lab.key
+guild   marmot   42     7        companion (updated 3m ago)
+```
 
 ### Finding
 
@@ -728,6 +805,14 @@ practice.
 - **Time-based rotation.** MLS epochs advance only on commits. Should
   the companion self-update on a timer to bound how long a blinded key
   and an epoch secret live?
+- **Persisting pushed group state.** Should the daemon keep the
+  secrets and roster of a Marmot-managed group across a restart?
+  Writing them under `/var/lib/fips/` keeps the group working when the
+  companion is down, but puts epoch secrets on disk. Memory-only
+  avoids that and requires the companion after every restart.
+- **Retained-epoch window.** How many previous epoch secrets a
+  provider accepts. It trades tolerance for lagging members against
+  how long a removed member is still answered.
 - **Static secret file format**: encoding, a bech32 form for sharing.
 - **Service type registry**: who maintains it and where.
 - **Small-MTU transports** (BLE, serial): is a 1024-byte record cap
