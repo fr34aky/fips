@@ -108,6 +108,24 @@ pub struct UdpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dial_prefixes: Option<Vec<String>>,
 
+    /// Port sharing (`share_port`): this instance deliberately binds a port
+    /// that a sibling UDP instance of the SAME node also binds — typically a
+    /// wildcard instance plus a dial-scoped one on a secondary interface
+    /// address, so a single advertised port is valid on every interface
+    /// (unicast delivery prefers the most specific bound address). Every
+    /// instance sharing the port must set it. Default: false.
+    ///
+    /// It exists because the listen socket's reuse flags are otherwise set
+    /// AFTER `bind()` — deliberately, so that a second bind of an occupied
+    /// port fails loudly instead of silently splitting the inbound stream.
+    /// That default also makes two instances of one node fail against each
+    /// other with `EADDRINUSE`: Linux only lets a socket join a held port if
+    /// the joiner set `SO_REUSEPORT` before its own bind. Setting this moves
+    /// the flags before bind for this instance only, and turns a failure to
+    /// set them into a start failure, since the bind cannot succeed without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_port: Option<bool>,
+
     /// Accept inbound handshake msg1 from new peers. Default: true.
     /// Setting this to false combined with `auto_connect: true` on
     /// peer-side configurations gives a "client" posture: this node
@@ -152,6 +170,12 @@ impl UdpConfig {
     /// unscoped). Parsing/validation happens at transport construction.
     pub fn dial_prefixes(&self) -> &[String] {
         self.dial_prefixes.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether this instance shares its port with a sibling instance (see
+    /// the field). Default: false.
+    pub fn share_port(&self) -> bool {
+        self.share_port.unwrap_or(false)
     }
 
     /// Whether this UDP transport should be advertised on Nostr discovery.

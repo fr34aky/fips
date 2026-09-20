@@ -37,6 +37,18 @@ impl UdpRawSocket {
         recv_buf_size: usize,
         send_buf_size: usize,
     ) -> Result<Self, TransportError> {
+        Self::open_with(bind_addr, recv_buf_size, send_buf_size, false)
+    }
+
+    /// [`Self::open`], optionally sharing the port with a sibling instance
+    /// (`UdpConfig::share_port`). Windows has no SO_REUSEPORT; SO_REUSEADDR
+    /// before bind is what permits the second bind there.
+    pub fn open_with(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        share_port: bool,
+    ) -> Result<Self, TransportError> {
         let domain = if bind_addr.is_ipv4() {
             Domain::IPV4
         } else {
@@ -47,6 +59,11 @@ impl UdpRawSocket {
 
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
+
+        if share_port {
+            sock.set_reuse_address(true)
+                .map_err(|e| TransportError::StartFailed(format!("set reuse address: {}", e)))?;
+        }
 
         sock.bind(&bind_addr.into())
             .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;

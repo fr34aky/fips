@@ -349,10 +349,11 @@ impl UdpTransport {
             .map_err(|e| TransportError::StartFailed(format!("invalid bind address: {}", e)))?;
 
         // Create, bind, and configure UDP socket
-        let raw_socket = UdpRawSocket::open(
+        let raw_socket = UdpRawSocket::open_with(
             bind_addr,
             self.config.recv_buf_size(),
             self.config.send_buf_size(),
+            self.config.share_port(),
         )?;
 
         // Protect before the recv loop spawns / any send happens.

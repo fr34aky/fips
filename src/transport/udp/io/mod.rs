@@ -99,6 +99,44 @@ mod tests {
         );
     }
 
+    /// The embedder seam `UdpConfig::share_port` exists for: one node, two UDP
+    /// instances on one port — a dial-scoped instance on an interface address
+    /// and the wildcard instance — so the single advertised port is valid on
+    /// every interface. With the flags only set after bind (the default), the
+    /// second instance fails with EADDRINUSE and the node starts degraded with
+    /// no general-purpose transport; this is the shape that regressed.
+    #[cfg(unix)]
+    #[test]
+    fn two_instances_that_ask_to_share_a_port_both_bind() {
+        let scoped = UdpRawSocket::open_with("127.0.0.1:0".parse().unwrap(), 65536, 65536, true)
+            .expect("failed to bind the interface-address instance");
+        let port = scoped.local_addr().port();
+        let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+
+        let main = UdpRawSocket::open_with(wildcard, 65536, 65536, true);
+        assert!(
+            main.is_ok(),
+            "the wildcard instance must join the shared port: {:?}",
+            main.err().map(|e| e.to_string()),
+        );
+    }
+
+    /// Sharing is opt-in per instance: a socket that did not ask still fails
+    /// loudly against a holder that did, exactly as without the option.
+    #[cfg(unix)]
+    #[test]
+    fn an_instance_that_did_not_ask_cannot_join_a_shared_port() {
+        let scoped = UdpRawSocket::open_with("127.0.0.1:0".parse().unwrap(), 65536, 65536, true)
+            .expect("failed to bind the interface-address instance");
+        let port = scoped.local_addr().port();
+        let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+
+        let Err(err) = UdpRawSocket::open(wildcard, 65536, 65536) else {
+            panic!("a socket that never asked to share must not get the port");
+        };
+        assert!(err.to_string().contains("bind failed"), "unexpected error: {err}");
+    }
+
     #[tokio::test]
     async fn test_async_udp_socket_send_recv() {
         let sock1 = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 65536, 65536)

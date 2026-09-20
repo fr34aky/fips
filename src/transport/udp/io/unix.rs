@@ -46,6 +46,17 @@ impl UdpRawSocket {
         recv_buf_size: usize,
         send_buf_size: usize,
     ) -> Result<Self, TransportError> {
+        Self::open_with(bind_addr, recv_buf_size, send_buf_size, false)
+    }
+
+    /// [`Self::open`], optionally as one of several sockets of this node that
+    /// deliberately share `bind_addr`'s port (`UdpConfig::share_port`).
+    pub fn open_with(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        share_port: bool,
+    ) -> Result<Self, TransportError> {
         let domain = if bind_addr.is_ipv4() {
             Domain::IPV4
         } else {
@@ -56,6 +67,19 @@ impl UdpRawSocket {
 
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
+
+        // A socket that shares its port with a sibling instance must carry the
+        // flags BEFORE its own bind: that is the half of their meaning ("the
+        // kernel may give me a port another socket already holds") the
+        // after-bind placement below deliberately withholds, and without it
+        // the second of the two instances fails with EADDRINUSE. Opt-in only,
+        // and fatal when it cannot be set — the bind would fail right after.
+        if share_port {
+            sock.set_reuse_port(true)
+                .map_err(|e| TransportError::StartFailed(format!("set reuse port: {}", e)))?;
+            sock.set_reuse_address(true)
+                .map_err(|e| TransportError::StartFailed(format!("set reuse address: {}", e)))?;
+        }
 
         sock.bind(&bind_addr.into())
             .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
