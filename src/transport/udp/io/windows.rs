@@ -32,6 +32,9 @@ impl UdpRawSocket {
     /// Sets non-blocking mode and configures buffer sizes. The socket
     /// is bound immediately so `local_addr()` returns the actual
     /// assigned address (important when binding to port 0).
+    // Test convenience: the transport itself always goes through
+    // [`Self::open_with`], so outside tests this would be dead code.
+    #[cfg(test)]
     pub fn open(
         bind_addr: SocketAddr,
         recv_buf_size: usize,

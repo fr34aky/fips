@@ -41,6 +41,9 @@ impl UdpRawSocket {
     ///
     /// Enables `SO_RXQ_OVFL` for kernel drop counting (non-fatal if
     /// unsupported). Sets non-blocking mode for async integration.
+    // Test convenience: the transport itself always goes through
+    // [`Self::open_with`], so outside tests this would be dead code.
+    #[cfg(test)]
     pub fn open(
         bind_addr: SocketAddr,
         recv_buf_size: usize,

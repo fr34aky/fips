@@ -111,7 +111,7 @@ mod tests {
         let scoped = UdpRawSocket::open_with("127.0.0.1:0".parse().unwrap(), 65536, 65536, true)
             .expect("failed to bind the interface-address instance");
         let port = scoped.local_addr().port();
-        let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let wildcard: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
 
         let main = UdpRawSocket::open_with(wildcard, 65536, 65536, true);
         assert!(
@@ -129,12 +129,15 @@ mod tests {
         let scoped = UdpRawSocket::open_with("127.0.0.1:0".parse().unwrap(), 65536, 65536, true)
             .expect("failed to bind the interface-address instance");
         let port = scoped.local_addr().port();
-        let wildcard: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let wildcard: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
 
         let Err(err) = UdpRawSocket::open(wildcard, 65536, 65536) else {
             panic!("a socket that never asked to share must not get the port");
         };
-        assert!(err.to_string().contains("bind failed"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("bind failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
