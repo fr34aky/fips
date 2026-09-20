@@ -50,16 +50,41 @@ impl UdpRawSocket {
         Self::open_on_interface(bind_addr, recv_buf_size, send_buf_size, None)
     }
 
+    /// [`Self::open`], optionally as one of several sockets of this node that
+    /// deliberately share `bind_addr`'s port (`UdpConfig::share_port`).
+    #[cfg(test)]
+    pub fn open_with(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        share_port: bool,
+    ) -> Result<Self, TransportError> {
+        Self::open_shared_on_interface(bind_addr, recv_buf_size, send_buf_size, None, share_port)
+    }
+
     /// [`open`](Self::open), bound to `interface` if one is named.
     ///
     /// Linux: `SO_BINDTODEVICE`, both directions. macOS: `IP_BOUND_IF` /
     /// `IPV6_BOUND_IF`, egress only. Elsewhere naming an interface is an
     /// error rather than a silent no-op.
+    #[cfg(test)]
     pub fn open_on_interface(
         bind_addr: SocketAddr,
         recv_buf_size: usize,
         send_buf_size: usize,
         interface: Option<&str>,
+    ) -> Result<Self, TransportError> {
+        Self::open_shared_on_interface(bind_addr, recv_buf_size, send_buf_size, interface, false)
+    }
+
+    /// [`Self::open_on_interface`], optionally sharing the port with a
+    /// sibling instance ([`Self::open_with`]).
+    pub fn open_shared_on_interface(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        interface: Option<&str>,
+        share_port: bool,
     ) -> Result<Self, TransportError> {
         let domain = if bind_addr.is_ipv4() {
             Domain::IPV4
@@ -81,6 +106,19 @@ impl UdpRawSocket {
                         TransportError::StartFailed(e.to_string())
                     }
                 })?;
+        }
+
+        // A socket that shares its port with a sibling instance must carry the
+        // flags BEFORE its own bind: that is the half of their meaning ("the
+        // kernel may give me a port another socket already holds") the
+        // after-bind placement below deliberately withholds, and without it
+        // the second of the two instances fails with EADDRINUSE. Opt-in only,
+        // and fatal when it cannot be set — the bind would fail right after.
+        if share_port {
+            sock.set_reuse_port(true)
+                .map_err(|e| TransportError::StartFailed(format!("set reuse port: {}", e)))?;
+            sock.set_reuse_address(true)
+                .map_err(|e| TransportError::StartFailed(format!("set reuse address: {}", e)))?;
         }
 
         sock.bind(&bind_addr.into())

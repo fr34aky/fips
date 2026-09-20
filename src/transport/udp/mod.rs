@@ -387,11 +387,12 @@ impl UdpTransport {
             .map_err(|e| TransportError::StartFailed(format!("invalid bind address: {}", e)))?;
 
         // Create, bind, and configure UDP socket
-        let raw_socket = UdpRawSocket::open_on_interface(
+        let raw_socket = UdpRawSocket::open_shared_on_interface(
             bind_addr,
             self.config.recv_buf_size(),
             self.config.send_buf_size(),
             self.config.interface.as_deref(),
+            self.config.share_port(),
         )?;
 
         let actual_recv = raw_socket.recv_buffer_size()?;
