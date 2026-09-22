@@ -335,6 +335,12 @@ impl Node {
             }
         };
 
+        // A frame that authenticates on this session, in any epoch slot,
+        // proves the peer completed the handshake, so a msg3 still held for
+        // resend has arrived. Only an established initiator holds one; for
+        // every other entry this is a no-op.
+        entry.clear_handshake_payload();
+
         // React to the epoch the frame decrypted against. The shell opened
         // the frame; the core classifies the post-decrypt reaction over the
         // plain-data slot + session flags, and the shell applies the
@@ -1044,7 +1050,7 @@ impl Node {
         let msg3_wire = SessionMsg3::new(msg3);
         let msg3_payload = msg3_wire.encode();
         let my_addr = *self.node_addr();
-        let mut datagram = SessionDatagram::new(my_addr, *src_addr, msg3_payload)
+        let mut datagram = SessionDatagram::new(my_addr, *src_addr, msg3_payload.clone())
             .with_ttl(self.config().node.session.default_ttl);
 
         if let Err(e) = self.send_session_datagram(&mut datagram).await {
@@ -1062,11 +1068,19 @@ impl Node {
         };
 
         let now_ms = Self::now_ms();
+        let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
         entry.set_state(EndToEndState::Established(session));
         entry.set_coords_warmup_remaining(self.config().node.session.coords_warmup_packets);
         entry.mark_established(now_ms);
         entry.init_mmp(&self.config().node.session_mmp);
-        entry.clear_handshake_payload();
+        // Keep msg3 for resend. This end is established once msg3 leaves, the
+        // responder only once it arrives, and nothing else repairs a lost
+        // msg3: the responder's resent SessionAck lands on the not-initiating
+        // arm above and is refused. `resend_pending_session_handshakes`
+        // resends it until a frame from the peer authenticates on this
+        // session or the resend budget is spent. The rekey arm keeps its
+        // msg3 for the same reason.
+        entry.set_handshake_payload(msg3_payload, now_ms + resend_interval);
         entry.touch(now_ms);
         self.sessions.insert(*src_addr, entry);
         self.insert_coord_hint(*src_addr, ack.src_coords.clone(), now_ms);

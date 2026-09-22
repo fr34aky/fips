@@ -2,8 +2,8 @@
 //!
 //! Pure, runtime-agnostic decisions for the FSP end-to-end session lifecycle:
 //! the per-tick rekey choreography (initiator cutover, drain completion, rekey
-//! trigger), msg3 retransmission classification, and the post-decrypt epoch
-//! reaction. The async I/O adapters in `node::handlers::{rekey,session}` build
+//! trigger), rekey and initial-handshake msg3 resend classification, and the
+//! post-decrypt epoch reaction. The async I/O adapters in `node::handlers::{rekey,session}` build
 //! the plain-data snapshots (pre-computing every clock read into `u64`/`bool`),
 //! call these decisions, and drive the returned effects — the sends, the
 //! `SessionEntry` mutations, metrics, and logging. No I/O, no clock, no crypto,
@@ -68,6 +68,14 @@ pub(crate) enum FspAction {
     /// Retransmit `addr`'s retained rekey msg3 (the shell re-reads the payload
     /// from the entry, sends it, then records the retransmission on success).
     ResendSessionMsg3 { addr: NodeAddr },
+    /// Resend `addr`'s retained initial-handshake msg3 (the shell re-reads the
+    /// payload from the entry's handshake resend slot, sends it, then records
+    /// the resend on success).
+    ResendInitialMsg3 { addr: NodeAddr },
+    /// Stop retaining `addr`'s initial-handshake msg3: the resend budget is
+    /// spent without an inbound frame showing the peer received it. The session
+    /// itself is kept; only the retained payload is dropped.
+    ReleaseInitialMsg3 { addr: NodeAddr },
     /// Cache `coords` for `addr` in the shared coordinate cache
     /// (`coord_cache.insert`).
     CacheCoords {
@@ -156,6 +164,18 @@ pub(crate) struct RekeyMsg3ResendSnapshot {
     pub resend_count: u32,
     /// The retained msg3 is due for retransmission as of the shell's `now_ms`
     /// (pre-evaluated: `next_resend_ms != 0 && now_ms >= next_resend_ms`).
+    pub resend_due: bool,
+}
+
+/// A snapshot of one established session whose initiator still retains its
+/// initial-handshake msg3, taken by the shell for the resend decision.
+pub(crate) struct InitialMsg3ResendSnapshot {
+    /// The session's remote node address (release/resend target).
+    pub addr: NodeAddr,
+    /// How many msg3 resends have already happened.
+    pub resend_count: u32,
+    /// The retained msg3 is due as of the shell's `now_ms` (pre-evaluated:
+    /// `next_resend_at_ms != 0 && now_ms >= next_resend_at_ms`).
     pub resend_due: bool,
 }
 
@@ -290,6 +310,33 @@ impl Fsp {
         }
         abandons.extend(resends);
         abandons
+    }
+
+    /// Decide the initial-handshake msg3 resends for the established sessions
+    /// the shell snapshotted as retaining one. A due candidate whose budget is
+    /// spent is released; an in-budget due candidate is resent; a candidate not
+    /// yet due gets nothing this tick. Releases come first, as abandons do in
+    /// [`poll_rekey_msg3_resends`](Self::poll_rekey_msg3_resends); the shell
+    /// commits a resend's count and reschedule only on a successful send.
+    pub(crate) fn poll_initial_msg3_resends(
+        &self,
+        candidates: Vec<InitialMsg3ResendSnapshot>,
+        max_resends: u32,
+    ) -> Vec<FspAction> {
+        let mut releases = Vec::new();
+        let mut resends = Vec::new();
+        for c in candidates {
+            if !c.resend_due {
+                continue;
+            }
+            if c.resend_count >= max_resends {
+                releases.push(FspAction::ReleaseInitialMsg3 { addr: c.addr });
+                continue;
+            }
+            resends.push(FspAction::ResendInitialMsg3 { addr: c.addr });
+        }
+        releases.extend(resends);
+        releases
     }
 
     /// Classify the reaction to a frame that authenticated against `slot`. Pure

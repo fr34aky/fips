@@ -2,9 +2,9 @@
 
 use crate::FipsAddress;
 use crate::proto::fsp::core::{
-    DecryptSlot, EpochReaction, Fsp, FspAction, RekeyCfg, RekeyMsg3ResendSnapshot, SessionSnapshot,
-    cutover_timer_elapsed, initiation_winner, mark_ipv6_ecn_ce, push_bounded_pending,
-    should_apply_path_mtu,
+    DecryptSlot, EpochReaction, Fsp, FspAction, InitialMsg3ResendSnapshot, RekeyCfg,
+    RekeyMsg3ResendSnapshot, SessionSnapshot, cutover_timer_elapsed, initiation_winner,
+    mark_ipv6_ecn_ce, push_bounded_pending, should_apply_path_mtu,
 };
 use crate::proto::fsp::limits::FSP_CUTOVER_DELAY_MS;
 use crate::proto::stp::TreeCoordinate;
@@ -438,6 +438,85 @@ fn poll_msg3_abandons_first() {
             },
         ],
         "abandons are grouped before resends"
+    );
+}
+
+// ===== poll_initial_msg3_resends =====
+
+/// Build an initial-handshake msg3 resend snapshot for the decision under test.
+fn initial_msg3_snapshot(
+    addr_byte: u8,
+    resend_count: u32,
+    resend_due: bool,
+) -> InitialMsg3ResendSnapshot {
+    InitialMsg3ResendSnapshot {
+        addr: make_node_addr(addr_byte),
+        resend_count,
+        resend_due,
+    }
+}
+
+/// A candidate that is not yet due gets nothing, whether or not its budget is
+/// spent.
+#[test]
+fn poll_initial_msg3_not_due_is_noop() {
+    let fsp = Fsp::new();
+    assert!(
+        fsp.poll_initial_msg3_resends(vec![initial_msg3_snapshot(1, 0, false)], 3)
+            .is_empty()
+    );
+    assert!(
+        fsp.poll_initial_msg3_resends(vec![initial_msg3_snapshot(1, 99, false)], 3)
+            .is_empty()
+    );
+}
+
+/// A due candidate within its budget is resent.
+#[test]
+fn poll_initial_msg3_resends_when_due_in_budget() {
+    let fsp = Fsp::new();
+    assert_eq!(
+        fsp.poll_initial_msg3_resends(vec![initial_msg3_snapshot(2, 1, true)], 3),
+        vec![FspAction::ResendInitialMsg3 {
+            addr: make_node_addr(2)
+        }]
+    );
+}
+
+/// A due candidate whose budget is spent is released, not resent.
+#[test]
+fn poll_initial_msg3_releases_when_due_at_budget() {
+    let fsp = Fsp::new();
+    assert_eq!(
+        fsp.poll_initial_msg3_resends(vec![initial_msg3_snapshot(3, 3, true)], 3),
+        vec![FspAction::ReleaseInitialMsg3 {
+            addr: make_node_addr(3)
+        }]
+    );
+}
+
+/// Releases are returned before resends.
+#[test]
+fn poll_initial_msg3_releases_before_resends() {
+    let fsp = Fsp::new();
+    let actions = fsp.poll_initial_msg3_resends(
+        vec![
+            initial_msg3_snapshot(1, 0, true),
+            initial_msg3_snapshot(2, 5, true),
+        ],
+        3,
+    );
+    assert_eq!(
+        actions,
+        vec![
+            FspAction::ReleaseInitialMsg3 {
+                addr: make_node_addr(2)
+            },
+            FspAction::ResendInitialMsg3 {
+                addr: make_node_addr(1)
+            },
+        ],
+        "releases are grouped before resends"
     );
 }
 

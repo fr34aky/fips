@@ -5090,6 +5090,302 @@ async fn test_forged_session_ack_leaves_the_initiation_able_to_complete_on_the_g
     cleanup_nodes(&mut nodes).await;
 }
 
+// ============================================================================
+// Integration tests: a lost initial msg3
+// ============================================================================
+
+/// Build a two-node pair where node 0's initial msg3 was sent and dropped, so
+/// node 0 is established and node 1 is still waiting for msg3.
+///
+/// Periodic rekey is off on both nodes: that is the configuration with no
+/// other recovery, and it keeps the rekey drivers out of the picture. Every
+/// step asserts its packet count, so a harness surprise fails loudly instead
+/// of being read as the defect.
+async fn pair_with_lost_initial_msg3() -> Vec<TestNode> {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_ESTABLISHED};
+
+    let mut nodes = make_rekey_disabled_pair().await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .expect("initiate_session failed");
+
+    assert_eq!(
+        process_available_packets(&mut nodes[1..]).await,
+        1,
+        "node 1 must have exactly node 0's SessionSetup queued"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .expect("responder entry present")
+            .is_awaiting_msg3(),
+        "node 1 must be awaiting msg3 after answering the SessionSetup"
+    );
+
+    assert_eq!(
+        process_available_packets(&mut nodes[..1]).await,
+        1,
+        "node 0 must have exactly node 1's SessionAck queued"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .expect("initiator entry present")
+            .is_established(),
+        "node 0 must be established once it has sent msg3"
+    );
+
+    // Drop msg3: take it out of node 1's queue instead of processing it.
+    let dropped: Vec<_> = std::iter::from_fn(|| nodes[1].packet_rx.try_recv().ok()).collect();
+    assert_eq!(
+        dropped.len(),
+        1,
+        "node 1 must have only node 0's msg3 queued"
+    );
+    assert_eq!(
+        CommonPrefix::parse(&dropped[0].data).map(|p| p.phase),
+        Some(PHASE_ESTABLISHED),
+        "the dropped packet must be a link data frame carrying the msg3"
+    );
+
+    pump_until_quiet(&mut nodes).await;
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .expect("responder entry present")
+            .is_awaiting_msg3(),
+        "node 1 must still be awaiting msg3 after the drop"
+    );
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "nothing may be left queued at node 1"
+    );
+
+    nodes
+}
+
+/// One lost initial msg3 must cost one resend, not the session, and the
+/// recovery must not depend on periodic rekey.
+#[tokio::test]
+async fn a_lost_initial_msg3_is_resent_and_the_responder_completes_the_session() {
+    let mut nodes = pair_with_lost_initial_msg3().await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+
+    let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun0_tx);
+    let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
+    nodes[1].node.supervisor.tun_tx = Some(tun1_tx);
+    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
+    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+
+    let interval_ms = nodes[0]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_resend_interval_ms;
+    nodes[0]
+        .node
+        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .await;
+    pump_until_quiet(&mut nodes).await;
+
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .expect("responder entry present")
+            .is_established(),
+        "node 1 must complete the session once node 0 resends its msg3"
+    );
+
+    let fwd = build_ipv6_packet(&fips0, &fips1, b"after msg3 resend 0 to 1");
+    let rev = build_ipv6_packet(&fips1, &fips0, b"after msg3 resend 1 to 0");
+    nodes[0].node.handle_tun_outbound(fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![fwd], "node 0 to node 1 must decode");
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![rev], "node 1 to node 0 must decode");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// Drain and count the packets queued at `node` without processing them.
+fn drain_queued(node: &mut TestNode) -> usize {
+    std::iter::from_fn(|| node.packet_rx.try_recv().ok()).count()
+}
+
+/// On a healthy session the retained msg3 is released by the responder's
+/// first frame, so the resend window is one round trip wide and a later tick
+/// sends nothing.
+#[tokio::test]
+async fn an_initiator_stops_resending_msg3_once_a_responder_frame_authenticates() {
+    let mut nodes = make_rekey_disabled_pair().await;
+    establish_pair_session(&mut nodes).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun0_tx);
+    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
+    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let interval_ms = nodes[0]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_resend_interval_ms;
+
+    // Control: before the responder has sent anything, the sweep does resend,
+    // so a silent sweep at the end is the release and not a dead driver.
+    let t1 = Node::now_ms() + interval_ms + 1;
+    nodes[0].node.resend_pending_session_handshakes(t1).await;
+    assert_eq!(
+        drain_queued(&mut nodes[1]),
+        1,
+        "control: the sweep must resend msg3 while the responder is unheard"
+    );
+
+    let rev = build_ipv6_packet(&fips1, &fips0, b"responder's first frame");
+    nodes[1].node.handle_tun_outbound(rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![rev],
+        "the responder's frame must authenticate at node 0"
+    );
+    assert_eq!(nodes[1].packet_rx.len(), 0, "nothing may be left queued");
+
+    nodes[0]
+        .node
+        .resend_pending_session_handshakes(t1 + 64_000)
+        .await;
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        0,
+        "a msg3 the responder has answered must not be resent"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The resend is harmless to a responder that already completed: it is
+/// refused as a bad-state reject and both directions keep decoding. This is
+/// the wire-neutrality claim, observed rather than argued.
+#[tokio::test]
+async fn a_resent_msg3_reaching_an_established_responder_is_refused_and_the_session_keeps_working()
+{
+    let mut nodes = make_rekey_disabled_pair().await;
+    establish_pair_session(&mut nodes).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun0_tx);
+    let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
+    nodes[1].node.supervisor.tun_tx = Some(tun1_tx);
+    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
+    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+    let interval_ms = nodes[0]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_resend_interval_ms;
+    let before = nodes[1].node.stats().session.bad_state;
+
+    nodes[0]
+        .node
+        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .await;
+    assert_eq!(
+        nodes[1].packet_rx.len(),
+        1,
+        "precondition: node 0 must have resent its msg3 to node 1"
+    );
+    pump_until_quiet(&mut nodes).await;
+
+    assert_eq!(
+        nodes[1].node.stats().session.bad_state,
+        before + 1,
+        "the duplicate msg3 must be refused as a bad-state reject"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .expect("responder session present")
+            .is_established(),
+        "the duplicate msg3 must not disturb the responder's session"
+    );
+
+    let fwd = build_ipv6_packet(&fips0, &fips1, b"after duplicate msg3 0 to 1");
+    let rev = build_ipv6_packet(&fips1, &fips0, b"after duplicate msg3 1 to 0");
+    nodes[0].node.handle_tun_outbound(fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![fwd], "node 0 to node 1 must decode");
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![rev], "node 1 to node 0 must decode");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The resend ladder is bounded in count and in time: after
+/// `handshake_max_resends` resends nothing more is sent and the payload is no
+/// longer held, while the session itself is kept.
+#[tokio::test]
+async fn initial_msg3_resends_stop_at_the_budget_and_release_the_payload() {
+    let mut nodes = pair_with_lost_initial_msg3().await;
+    let node1_addr = *nodes[1].node.node_addr();
+    let max_resends = nodes[0].node.config().node.rate_limit.handshake_max_resends;
+
+    // 64 s steps pass any single backoff interval at stock settings, so each
+    // step is due. Node 0 holds only its established entry, so the sweep's
+    // timeout pass cannot remove anything on it.
+    let mut now = Node::now_ms();
+    let mut sent = Vec::new();
+    for _ in 0..(max_resends + 2) {
+        now += 64_000;
+        nodes[0].node.resend_pending_session_handshakes(now).await;
+        sent.push(drain_queued(&mut nodes[1]));
+    }
+    let mut expected = vec![1; max_resends as usize];
+    expected.extend([0, 0]);
+    assert_eq!(
+        sent, expected,
+        "one resend per due tick up to the budget, then none"
+    );
+
+    let entry = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .expect("the release must not tear the session down");
+    assert!(
+        entry.handshake_payload().is_none(),
+        "the msg3 must no longer be held once the budget is spent"
+    );
+    assert!(
+        entry.is_established(),
+        "node 0's session must stay established after the release"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// A SessionAck that fails to read must not end an FSP rekey the node
 /// initiated.
 ///

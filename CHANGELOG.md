@@ -101,6 +101,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
 
+#### Session setup
+
+- A session whose last handshake message is lost no longer stays one-sided.
+  The initiator sent msg3 once and treated the session as established at once;
+  when that one datagram was lost, the responder kept waiting for it and
+  dropped every frame the initiator sent, and nothing sent msg3 again, because
+  the responder's repeated SessionAck was refused as arriving in the wrong
+  state. The session stayed that way until the next session rekey, or with
+  periodic rekey switched off, indefinitely. The initiator now keeps its msg3
+  and resends it on the handshake resend interval, with backoff, until a frame
+  from the responder authenticates or `handshake_max_resends` resends have gone
+  out. The wire format is unchanged: the resend carries the same msg3, and a
+  responder that already completed the session refuses the duplicate as before.
+
 #### Link and session rekey
 
 - A forged rekey msg2 no longer takes the link down. The rekey initiator gave

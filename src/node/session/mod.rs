@@ -123,8 +123,11 @@ pub(crate) struct SessionEntry {
     bytes_recv: u64,
 
     // === Handshake Resend ===
-    /// Encoded session-layer payload for resend (SessionSetup or SessionAck).
-    /// Cleared on Established transition.
+    /// The last initial-handshake message this side sent and has no proof the
+    /// peer received: SessionSetup while initiating, SessionAck while awaiting
+    /// msg3, and on an established initiator its SessionMsg3 until an inbound
+    /// frame authenticates on the session or the resend budget is spent. The
+    /// state says which one it is, and which sweep resends it.
     handshake_payload: Option<Vec<u8>>,
     /// Number of resends performed.
     resend_count: u32,
@@ -408,6 +411,8 @@ impl SessionEntry {
     ///
     /// For initiators, this is the SessionSetup payload bytes.
     /// For responders, this is the SessionAck payload bytes.
+    /// For an initiator that has just become established, this is its
+    /// SessionMsg3 payload bytes, held until the responder is heard from.
     /// The payload is re-wrapped in a fresh SessionDatagram on each resend
     /// so routing can adapt to topology changes.
     pub(crate) fn set_handshake_payload(&mut self, payload: Vec<u8>, next_resend_at_ms: u64) {
@@ -421,7 +426,8 @@ impl SessionEntry {
         self.handshake_payload.as_deref()
     }
 
-    /// Clear the stored handshake payload (called on Established transition).
+    /// Clear the stored handshake payload (an inbound frame authenticated on
+    /// the session, or the msg3 resend budget is spent).
     pub(crate) fn clear_handshake_payload(&mut self) {
         self.handshake_payload = None;
         self.next_resend_at_ms = 0;
