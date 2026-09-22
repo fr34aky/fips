@@ -126,13 +126,14 @@ impl Node {
         };
 
         // The shell snapshots each healthy peer's rekey ages/flags (every clock
-        // read resolved here); the core decides cutover/drain/trigger with no
-        // clock, phase-grouped to preserve the pre-refactor execution order.
-        // The batch `poll_rekey` + snapshots STAY SHELL-SIDE and BYTE-UNCHANGED:
-        // the cross-peer phase-grouping (all Cutover → all Drain →
-        // all InitiateRekey) governs the shared `index_allocator` free-then-alloc
-        // SEQUENCE that appears on the wire. The machine must NOT re-poll; it
-        // CONSUMES each decided `ConnAction` in the same order the batch returned.
+        // read resolved here); the core decides cutover, drain, retirement and
+        // trigger with no clock and returns the actions phase-grouped: all
+        // Cutover, then all Drain, then all RetirePending, then all
+        // InitiateRekey. That grouping fixes the shared `index_allocator`
+        // free-then-allocate sequence that appears on the wire, so the batch
+        // `poll_rekey` call stays here in the shell. The machine must NOT
+        // re-poll; it CONSUMES each decided `ConnAction` in the order the batch
+        // returned.
         let snapshots = self.rekey_peers();
         for action in self.fmp.poll_rekey(snapshots, &cfg) {
             match action {
