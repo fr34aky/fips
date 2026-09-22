@@ -65,6 +65,16 @@ pub(crate) enum FspAction {
     /// Discarding it would make every later frame from that peer
     /// undecryptable, so the handshake alone is dropped.
     AbandonHandshake { addr: NodeAddr },
+    /// Drop only `addr`'s handshake that this node armed by sending a setup
+    /// message never answered within the handshake timeout
+    /// (`SessionEntry::abandon_handshake`). The trigger starts a fresh rekey
+    /// on a later tick.
+    ///
+    /// The handshake only, not [`AbandonRekey`](Self::AbandonRekey): an
+    /// entry whose handshake this node armed holds no pending session, and
+    /// dropping only the handshake keeps any such session safe even if that
+    /// ever stops holding.
+    ExpireInitiation { addr: NodeAddr },
     /// Retransmit `addr`'s retained rekey msg3 (the shell re-reads the payload
     /// from the entry, sends it, then records the retransmission on success).
     ResendSessionMsg3 { addr: NodeAddr },
@@ -143,9 +153,14 @@ pub(crate) struct SessionSnapshot {
     /// A handshake armed by the peer's setup message has passed the handshake
     /// timeout without its msg3 (pre-evaluated: `last_peer_rekey_ms != 0 &&
     /// now - last_peer_rekey_ms > handshake_timeout`). False when the entry
-    /// carries no peer-rekey stamp, so a handshake this side armed is never
-    /// aged out on the peer's clock.
+    /// carries no peer-rekey stamp. A handshake this side armed is never
+    /// aged out on the peer's clock; it has its own deadline,
+    /// [`initiation_expired`](Self::initiation_expired).
     pub armed_handshake_expired: bool,
+    /// This node's own armed handshake has passed the handshake timeout
+    /// measured from the setup message it sent (pre-evaluated: `now -
+    /// initiated_ms > handshake_timeout`).
+    pub initiation_expired: bool,
     /// Monotonic session age in seconds (`(now - session_start_ms) / 1000`).
     pub elapsed_secs: u64,
     /// Current Noise send counter.
@@ -219,18 +234,22 @@ impl Fsp {
     ///   in-flight rekey, and an elapsed liveness timer cuts over and is
     ///   considered for nothing else.
     /// - Otherwise an expired drain window is completed, and — independently —
-    ///   a handshake the peer armed and never finished is abandoned, which is
-    ///   the last word on that session this tick.
+    ///   a handshake the peer armed and never finished, or a handshake this
+    ///   node armed and never got an answer to, is abandoned, which is the
+    ///   last word on that session this tick.
     /// - Failing both, the rekey trigger fires when the session is neither
     ///   mid-rekey, holding a pending session, retaining a msg3 payload, nor
     ///   dampened, and its jittered time threshold or send counter is reached.
-    ///   Only this last decision is gated on `cfg.enabled`: the other three
-    ///   maintain state a peer's setup message can create with periodic rekey
-    ///   switched off.
+    ///   Only this last decision is gated on `cfg.enabled`: the cutover, the
+    ///   drain and the abandon of a peer-armed handshake maintain state a
+    ///   peer's setup message can create with periodic rekey switched off.
+    ///   A handshake this node armed exists only when the trigger fired, but
+    ///   its expiry sits above the gate too, so whether an existing
+    ///   handshake is retired does not depend on whether new ones may start.
     ///
     /// Actions are returned phase-grouped (all cutovers, then all drains, then
-    /// all abandoned handshakes, then all rekey initiations) to preserve the
-    /// pre-refactor execution order.
+    /// all abandoned or expired handshakes, then all rekey initiations) to
+    /// preserve the pre-refactor execution order.
     pub(crate) fn poll_rekey(
         &self,
         sessions: Vec<SessionSnapshot>,
@@ -262,6 +281,15 @@ impl Fsp {
             //    `pending` beside it survives (see `AbandonHandshake`).
             if !s.is_rekey_initiator && s.rekey_in_progress && s.armed_handshake_expired {
                 abandons.push(FspAction::AbandonHandshake { addr: s.addr });
+                continue;
+            }
+            // 3b. Retire a handshake this node armed whose setup or
+            //     SessionAck was lost. Arm 3 cannot: it runs on the peer's
+            //     clock, which says nothing about our own setup. Only the
+            //     handshake goes; the trigger below starts a fresh rekey on a
+            //     later tick.
+            if s.is_rekey_initiator && s.rekey_in_progress && s.initiation_expired {
+                abandons.push(FspAction::ExpireInitiation { addr: s.addr });
                 continue;
             }
             // 4. Rekey trigger.

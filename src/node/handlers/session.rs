@@ -899,13 +899,15 @@ impl Node {
         // arm of `handle_session_msg3`, and the difference rests on an
         // invariant rather than on a different judgement: an entry with
         // `rekey_initiator` set holds no pending session, so the two calls
-        // are the same action here. `set_rekey_state(_, true)` has one
-        // caller, `initiate_session_rekey`, which `check_session_rekey`
-        // never reaches for an entry holding a pending session; and
-        // `set_pending_session` clears `rekey_state`, so a completed
-        // initiator cycle leaves at most one of the two set. If that ever
-        // stops holding, these three sites become instances of the epoch
-        // discard the responder arm was fixed for.
+        // are the same action here. Arming as initiator has one caller,
+        // `initiate_session_rekey` through `begin_rekey`, and
+        // `set_rekey_state(_, true)` remains only at the restore below;
+        // `check_session_rekey` never reaches `initiate_session_rekey` for
+        // an entry holding a pending session; and `set_pending_session`
+        // clears `rekey_state`, so a completed initiator cycle leaves at
+        // most one of the two set. If that ever stops holding, these three
+        // sites become instances of the epoch discard the responder arm was
+        // fixed for.
         if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
                 Some(hs) => hs,
@@ -923,7 +925,9 @@ impl Node {
             // back to its pre-read state so it can still read the genuine
             // ack, and the refusal is counted. The rollback matters because
             // `read_xk_message_2` mixes the sender's ephemeral in before it
-            // authenticates.
+            // authenticates. The restore does not restamp the deadline, which
+            // runs from the setup this node sent, so an unreadable ack cannot
+            // hold the rekey open.
             if let Err(e) = handshake.try_read_xk_message_2(&ack.handshake_payload) {
                 debug!(error = %e, "Failed to process rekey XK msg2, keeping the rekey");
                 entry.set_rekey_state(handshake, true);
