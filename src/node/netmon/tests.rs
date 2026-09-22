@@ -78,6 +78,28 @@ fn scripted(samples: Vec<NetFingerprint>) -> (impl Fn() -> NetFingerprint, Arc<A
     (sampler, calls)
 }
 
+/// A sampler that answers `before` until `at` has elapsed on the clock and
+/// `after` from then on: a route swap landing at a known moment, for the
+/// tests where *when* a sample is taken is the point.
+fn switching_at(
+    before: NetFingerprint,
+    after: NetFingerprint,
+    at: Duration,
+) -> (impl Fn() -> NetFingerprint, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let epoch = tokio::time::Instant::now();
+    let sampler = move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        if epoch.elapsed() < at {
+            before.clone()
+        } else {
+            after.clone()
+        }
+    };
+    (sampler, calls)
+}
+
 #[tokio::test(start_paused = true)]
 async fn steady_attachment_reports_nothing() {
     let steady = all_from(&[peer(1), peer(2)], Some(v4(192, 168, 1, 10)));
@@ -634,7 +656,7 @@ async fn a_poke_before_the_detector_waits_is_not_lost() {
     let (tx, mut rx) = mpsc::channel(1);
     let trigger = NetmonTrigger::new();
     trigger.poke();
-    trigger.poke(); // a burst coalesces into one wake-up
+    trigger.poke(); // nothing is waiting, so the burst is held as one wake-up
 
     let wake = WakeSource::timer_only(Duration::from_secs(3600)).with_push(trigger.clone());
     tokio::spawn(run_detector(tx, cfg(3600, 0), sampler, wake));
@@ -653,14 +675,14 @@ async fn a_poke_before_the_detector_waits_is_not_lost() {
 /// A kernel source would be woken again by the route message itself, but a
 /// push is a single shot, so the detector looks once more a debounce period
 /// later rather than spending the poke on the old picture and leaving the
-/// change to an hour-long timer.
+/// change to an hour-long timer. The swap lands on the paused clock 100 ms
+/// after the poke, so this passes only if the second look really waits: a
+/// second look taken at once would still see the old source.
 #[tokio::test(start_paused = true)]
 async fn a_poke_that_runs_ahead_of_the_route_change_still_catches_it() {
     let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
     let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
-    // Baseline, the sample the poke buys (still the old picture), then the
-    // second look.
-    let (sampler, _) = scripted(vec![wlan.clone(), wlan, cell]);
+    let (sampler, calls) = switching_at(wlan, cell, Duration::from_millis(100));
     let (tx, mut rx) = mpsc::channel(1);
     let trigger = NetmonTrigger::new();
 
@@ -672,6 +694,70 @@ async fn a_poke_that_runs_ahead_of_the_route_change_still_catches_it() {
 
     let change = expect_change(&mut rx).await;
     assert_eq!(change.summary.moved[0].after, Some(v4(10, 40, 0, 7)));
+    // The baseline, the sample the poke bought (still the old picture), the
+    // second look that caught the swap, and the one debounce round that
+    // found it settled.
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+/// A poke when nothing moved is the spurious-callback case, and the sampler
+/// underneath the push is what keeps it from becoming a spurious socket
+/// rebind: the detector samples, takes its second look, and reports nothing.
+/// Those two samples are the whole cost.
+#[tokio::test(start_paused = true)]
+async fn a_poke_when_nothing_moved_reports_nothing() {
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let (sampler, calls) = scripted(vec![wlan]);
+    let (tx, mut rx) = mpsc::channel(1);
+    let trigger = NetmonTrigger::new();
+
+    let wake = WakeSource::timer_only(Duration::from_secs(3600)).with_push(trigger.clone());
+    tokio::spawn(run_detector(tx, cfg(3600, 250), sampler, wake));
+    tokio::task::yield_now().await;
+
+    trigger.poke();
+
+    expect_quiet(
+        &mut rx,
+        "a poke that finds nothing moved must report nothing",
+    )
+    .await;
+    // The baseline, then the sample the poke bought and its second look.
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// The push sits beside the platform source, not instead of it: on a host
+/// whose kernel source did open, the kernel's own event and an embedder's
+/// poke must each still wake the detector.
+#[tokio::test(start_paused = true)]
+async fn a_push_beside_an_event_source_leaves_both_live() {
+    let wlan = all_from(&[peer(1)], Some(v4(192, 168, 1, 10)));
+    let cell = all_from(&[peer(1)], Some(v4(10, 40, 0, 7)));
+    let wired = all_from(&[peer(1)], Some(v4(172, 16, 0, 5)));
+    let (sampler, _) = scripted(vec![wlan, cell, wired]);
+    let (tx, mut rx) = mpsc::channel(1);
+    let (pings, ping_rx) = mpsc::channel(1);
+    let trigger = NetmonTrigger::new();
+
+    let wake = WakeSource::events(ping_rx, Duration::from_secs(3600)).with_push(trigger.clone());
+    tokio::spawn(run_detector(tx, cfg(3600, 0), sampler, wake));
+    tokio::task::yield_now().await;
+
+    pings.send(()).await.expect("the backend can ping");
+    let change = expect_change(&mut rx).await;
+    assert_eq!(
+        change.summary.moved[0].after,
+        Some(v4(10, 40, 0, 7)),
+        "the kernel's event must still wake it"
+    );
+
+    trigger.poke();
+    let change = expect_change(&mut rx).await;
+    assert_eq!(
+        change.summary.moved[0].after,
+        Some(v4(172, 16, 0, 5)),
+        "the embedder's poke must wake it too"
+    );
 }
 
 /// The second look belongs to a push alone. A timer tick that finds nothing

@@ -3708,8 +3708,9 @@ impl Node {
     /// Callable before or after [`Self::start`], from any thread, and the
     /// same handle keeps working across a [`Self::stop`] and another
     /// [`Self::start`]; a poke while no detector is running is held for the
-    /// next one. A new `Node` has a new trigger — an embedder that rebuilds
-    /// the node must fetch it again.
+    /// next one — and with `node.netmon.enabled: false` there is no next one,
+    /// so the poke does nothing. A new `Node` has a new trigger — an embedder
+    /// that rebuilds the node must fetch it again.
     pub fn netmon_trigger(&self) -> NetmonTrigger {
         self.netmon_trigger.clone()
     }

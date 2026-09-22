@@ -578,17 +578,22 @@ enum Woke {
 /// is meant to be called straight from a platform network callback (an
 /// Android `ConnectivityManager` one, say). A poke while the detector is
 /// mid-sample is not lost: one wake-up is held until the detector next waits,
-/// and a burst of pokes coalesces into that one. The same holds for a poke
-/// while no detector is running — before `start()`, or between a `stop()` and
-/// the next `start()`: it is held, and costs the detector one extra sample
-/// when it next starts. With `node.netmon.enabled: false` no detector ever
-/// runs and a poke does nothing.
+/// and further pokes in that window coalesce into the one held. A poke that
+/// finds the detector waiting wakes it at once, so a burst that starts there
+/// costs two wake-ups — the one that woke it and the one held — and never
+/// more. A poke while no detector is running — before `start()`, or between
+/// a `stop()` and the next `start()` — is held the same way and spent at the
+/// next start, where it costs the two samples below, since nothing will have
+/// moved since the baseline taken moments earlier. With
+/// `node.netmon.enabled: false` no detector ever runs and a poke does
+/// nothing.
 ///
 /// A poke costs a sample — five syscalls per probed peer — and, when that
 /// sample shows nothing moved, one more a debounce period later, because a
-/// platform callback can run ahead of the routing table it reports on. Wire it
-/// to the callbacks that mean the
-/// attachment moved (on Android: `onAvailable`, `onLost` and
+/// platform callback can run ahead of the routing table it reports on; so a
+/// spurious poke costs two samples at the default debounce. Wire it to the
+/// callbacks that mean the attachment moved (on Android: `onAvailable`,
+/// `onLost` and
 /// `onLinkPropertiesChanged` of the default network) rather than to
 /// `onCapabilitiesChanged`, which fires every few seconds on cellular for
 /// signal and bandwidth estimates and would turn the push into a faster poll.
