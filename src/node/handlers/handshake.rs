@@ -716,9 +716,11 @@ impl Node {
                     }
                 }
 
-                // Store pending session on the existing peer.
+                // Store the new session as the responder's pending session. It
+                // is promoted by the initiator's first new-epoch frame, not by
+                // our own tick.
                 if let Some(existing) = self.peers.get_mut(&peer) {
-                    existing.set_pending_session(noise_session, our_new_index, wire.their_index);
+                    existing.answer_rekey(noise_session, our_new_index, wire.their_index);
                     existing.record_peer_rekey();
                 }
 
@@ -1241,14 +1243,16 @@ impl Node {
                         }
                         // Nothing authenticated this msg2 before the read, and the
                         // index it names travels in cleartext in our msg1, so it
-                        // may be a forgery. The responder committed its new
-                        // session when it answered that msg1 and cuts over on its
-                        // own tick, so abandoning here would leave the two ends on
-                        // different keys. The read rolled the handshake back:
-                        // keep the cycle and its dispatch entry so the genuine
-                        // msg2 can still complete it. If no readable msg2 ever
-                        // arrives, the msg1 resend budget abandons the cycle as
-                        // it would for a lost one.
+                        // may be a forgery. The responder holds the session it
+                        // answered with until our first new-epoch frame reaches
+                        // it, so giving up the cycle here would throw away a
+                        // cycle the genuine msg2 can still complete, and the
+                        // responder would then hold that session until its
+                        // retirement hold passes. The read rolled the handshake
+                        // back: keep the cycle and its dispatch entry so the
+                        // genuine msg2 can still complete it. If no readable msg2
+                        // ever arrives, the msg1 resend budget abandons the cycle
+                        // as it would for a lost one.
                         Err(e) if peer.awaits_msg2() => {
                             debug!(
                                 peer = %display_name,

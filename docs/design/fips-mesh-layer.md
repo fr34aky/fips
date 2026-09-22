@@ -388,10 +388,13 @@ the responder consumes msg1, builds msg2, and replies. After both sides
 have exchanged messages and finalised the new keys, traffic transitions
 from the old session to the new one.
 
-Cutover is signalled in-band by the **K-bit** in the FMP flags byte. Each
-side starts emitting frames under the new session with K set; on receipt
-of the first K-marked frame the peer accepts the cutover and follows
-suit. A new pair of session indices is allocated as part of the new
+Cutover is signalled in-band by the **K-bit** in the FMP flags byte. The
+initiator switches first, on its own schedule once it has read msg2, and
+marks its frames under the new session with K; the responder follows on
+the first K-marked frame that authenticates against its new session. A
+responder drops a pending session the initiator never adopts after a hold
+(the drain ceiling, 120 s at stock settings), so the next rekey can
+proceed. A new pair of session indices is allocated as part of the new
 session, replacing the old indices on subsequent frames (see
 [Index Properties](#index-properties)).
 

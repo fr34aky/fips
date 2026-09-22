@@ -7,7 +7,7 @@ use super::util::{
 use crate::NodeAddr;
 use crate::proto::fmp::{
     ConnAction, Fmp, InboundDecision, InboundReject, OutboundDecision, OutboundSnapshot, RekeyCfg,
-    cross_connection_winner,
+    RekeyRole, cross_connection_winner,
 };
 use crate::testutil::make_node_addr;
 use crate::transport::LinkId;
@@ -122,6 +122,7 @@ fn rekey_cutover_takes_precedence_over_trigger() {
     let fmp = Fmp::new();
     let mut p = peer_snapshot(0x10);
     p.has_pending = true;
+    p.pending_role = Some(RekeyRole::Initiator);
     // Wildly over the time threshold, but cutover wins and nothing else fires.
     p.elapsed_secs = 10_000;
     p.counter = 10_000;
@@ -229,6 +230,7 @@ fn rekey_actions_are_phase_grouped_across_peers() {
     a.elapsed_secs = 200;
     let mut b = peer_snapshot(0x02);
     b.has_pending = true;
+    b.pending_role = Some(RekeyRole::Initiator);
     let mut c = peer_snapshot(0x03);
     c.is_draining = true;
     c.drain_expired = true;
@@ -606,4 +608,102 @@ fn test_cross_connection_symmetric() {
 
     // Exactly one survives
     assert!(a_outbound_wins != a_inbound_wins);
+}
+
+// --- rekey role gate: a pending session this node answered ---
+
+/// A pending session this node answered, held past the responder hold, is
+/// retired, and the tick neither cuts it over nor starts a rekey of its own.
+#[test]
+fn a_responder_held_pending_past_its_hold_is_retired_and_nothing_else_fires() {
+    let fmp = Fmp::new();
+    let mut p = peer_snapshot(0x20);
+    p.has_pending = true;
+    p.pending_role = Some(RekeyRole::Responder);
+    p.pending_expired = true;
+    p.elapsed_secs = 10_000;
+    p.counter = 10_000;
+    let actions = fmp.poll_rekey(vec![p], &cfg());
+    assert_eq!(actions.len(), 1);
+    assert!(
+        matches!(actions[0], ConnAction::RetirePending { peer } if peer == make_node_addr(0x20))
+    );
+}
+
+/// A pending session this node answered, still inside its hold, is left
+/// alone: no cutover, no retirement, and no rekey trigger even with both
+/// thresholds met, since a new cycle would overwrite the held slot.
+#[test]
+fn a_responder_held_pending_inside_its_hold_is_neither_cut_over_nor_allowed_to_trigger() {
+    let fmp = Fmp::new();
+    let mut p = peer_snapshot(0x21);
+    p.has_pending = true;
+    p.pending_role = Some(RekeyRole::Responder);
+    p.pending_expired = false;
+    p.elapsed_secs = 10_000;
+    p.counter = 10_000;
+    assert!(fmp.poll_rekey(vec![p], &cfg()).is_empty());
+}
+
+/// A pending session this node initiated is cut over even when its hold
+/// reads as passed: retirement never touches the initiator's pending.
+#[test]
+fn an_initiator_held_pending_cuts_over_even_when_its_hold_has_passed() {
+    let fmp = Fmp::new();
+    let mut p = peer_snapshot(0x22);
+    p.has_pending = true;
+    p.pending_role = Some(RekeyRole::Initiator);
+    p.pending_expired = true;
+    let actions = fmp.poll_rekey(vec![p], &cfg());
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], ConnAction::Cutover { peer } if peer == make_node_addr(0x22)));
+}
+
+/// A pending session with no recorded role fails safe: it is held like a
+/// responder's, never cut over by the tick, and vetoes the rekey trigger.
+#[test]
+fn a_pending_with_no_recorded_role_is_held_and_never_cut_over_by_the_tick() {
+    let fmp = Fmp::new();
+    let mut p = peer_snapshot(0x23);
+    p.has_pending = true;
+    p.pending_role = None;
+    p.pending_expired = false;
+    p.elapsed_secs = 10_000;
+    p.counter = 10_000;
+    assert!(fmp.poll_rekey(vec![p], &cfg()).is_empty());
+}
+
+/// Retirements free an index, so they are grouped after drains (which free)
+/// and before rekey initiations (which allocate): cutovers, drains,
+/// retirements, rekeys.
+#[test]
+fn retirements_are_grouped_after_drains_and_before_rekey_initiations() {
+    let fmp = Fmp::new();
+    // a: trigger only. b: initiator cutover. c: drain and trigger. d: retire.
+    let mut a = peer_snapshot(0x01);
+    a.elapsed_secs = 200;
+    let mut b = peer_snapshot(0x02);
+    b.has_pending = true;
+    b.pending_role = Some(RekeyRole::Initiator);
+    let mut c = peer_snapshot(0x03);
+    c.is_draining = true;
+    c.drain_expired = true;
+    c.counter = 5_000;
+    let mut d = peer_snapshot(0x04);
+    d.has_pending = true;
+    d.pending_role = Some(RekeyRole::Responder);
+    d.pending_expired = true;
+    let actions = fmp.poll_rekey(vec![a, b, c, d], &cfg());
+    assert_eq!(actions.len(), 5);
+    assert!(matches!(actions[0], ConnAction::Cutover { peer } if peer == make_node_addr(0x02)));
+    assert!(matches!(actions[1], ConnAction::Drain { peer } if peer == make_node_addr(0x03)));
+    assert!(
+        matches!(actions[2], ConnAction::RetirePending { peer } if peer == make_node_addr(0x04))
+    );
+    assert!(
+        matches!(actions[3], ConnAction::InitiateRekey { peer } if peer == make_node_addr(0x01))
+    );
+    assert!(
+        matches!(actions[4], ConnAction::InitiateRekey { peer } if peer == make_node_addr(0x03))
+    );
 }

@@ -7,6 +7,7 @@ use crate::config::MmpConfig;
 use crate::node::REKEY_JITTER_SECS;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
+use crate::proto::fmp::RekeyRole;
 use crate::proto::mmp::MmpPeerState;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
@@ -15,7 +16,7 @@ use crate::{FipsAddress, NodeAddr, PeerIdentity};
 use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Draw a fresh per-session rekey jitter from `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`.
 fn draw_rekey_jitter() -> i64 {
@@ -268,6 +269,11 @@ pub struct ActivePeer {
     rekey_msg1_next_resend: u64,
     /// In-progress rekey: number of msg1 retransmissions performed so far.
     rekey_msg1_resend_count: u32,
+    /// Which side installed the pending session (`None` when no pending is
+    /// held). Set with the pending slot and cleared with it.
+    pending_role: Option<RekeyRole>,
+    /// When the pending session was installed, for the responder hold.
+    pending_since: Option<Instant>,
 
     // === Published active-send-state (two-tier boundary) ===
     /// The send-critical subset read (and, on roam/responder-cutover, written)
@@ -309,6 +315,8 @@ impl ActivePeer {
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
             rekey_msg1_resend_count: 0,
+            pending_role: None,
+            pending_since: None,
             send: PeerSendState::new(link_id, now, authenticated_at),
         }
     }
@@ -388,6 +396,8 @@ impl ActivePeer {
             rekey_msg1: None,
             rekey_msg1_next_resend: 0,
             rekey_msg1_resend_count: 0,
+            pending_role: None,
+            pending_since: None,
             send,
         }
     }
@@ -917,6 +927,16 @@ impl ActivePeer {
             .unwrap_or_else(Instant::now);
     }
 
+    /// Test-only seam: backdate the pending session's install time so a test
+    /// can make the responder hold read as passed. Shifts only the private
+    /// timestamp; compiled out of release builds.
+    #[cfg(test)]
+    pub(crate) fn backdate_pending(&mut self, age: Duration) {
+        self.pending_since = self
+            .pending_since
+            .map(|t| t.checked_sub(age).unwrap_or_else(Instant::now));
+    }
+
     /// Test-only seam: install link-layer MMP state with a chosen operating
     /// mode on a peer that was constructed without a Noise session (the bare
     /// `new` constructor leaves `mmp` as `None`). This only attaches the same
@@ -1024,19 +1044,62 @@ impl ActivePeer {
         self.send.pending_new_session.as_mut()
     }
 
+    /// Which side of the rekey handshake produced the pending session; `None`
+    /// when no pending session is held.
+    pub(crate) fn pending_role(&self) -> Option<RekeyRole> {
+        self.pending_role
+    }
+
+    /// Check whether the pending session has been held for at least `hold`
+    /// since it was installed. False when no pending session is held.
+    pub(crate) fn pending_expired(&self, hold: Duration) -> bool {
+        self.pending_since.is_some_and(|t| t.elapsed() >= hold)
+    }
+
     /// Store a completed rekey session and its indices.
     ///
     /// Called when the rekey handshake completes. The session is held
     /// as pending until the initiator flips the K-bit on the next outbound packet.
+    /// Records this node as the initiator; a pending session answered for the
+    /// peer is stored with [`answer_rekey`](Self::answer_rekey).
     pub fn set_pending_session(
         &mut self,
         session: NoiseSession,
         our_index: SessionIndex,
         their_index: SessionIndex,
     ) {
+        self.install_pending(session, our_index, their_index, RekeyRole::Initiator);
+    }
+
+    /// Store the session this node produced by answering the peer's rekey
+    /// msg1. It is held until a frame on the new epoch from the peer
+    /// authenticates against it ([`handle_peer_kbit_flip`](Self::handle_peer_kbit_flip)),
+    /// or until the responder hold passes and the node retires it
+    /// ([`retire_pending`](Self::retire_pending)); it is never cut over on this
+    /// node's own schedule.
+    pub(crate) fn answer_rekey(
+        &mut self,
+        session: NoiseSession,
+        our_index: SessionIndex,
+        their_index: SessionIndex,
+    ) {
+        self.install_pending(session, our_index, their_index, RekeyRole::Responder);
+    }
+
+    /// Store a pending session with the role that produced it and the time it
+    /// was installed; the one writer that fills the pending slot.
+    fn install_pending(
+        &mut self,
+        session: NoiseSession,
+        our_index: SessionIndex,
+        their_index: SessionIndex,
+        role: RekeyRole,
+    ) {
         self.send.pending_new_session = Some(session);
         self.send.pending_our_index = Some(our_index);
         self.send.pending_their_index = Some(their_index);
+        self.pending_role = Some(role);
+        self.pending_since = Some(Instant::now());
         self.rekey_in_progress = false;
         // Clear initiator handshake state (index now lives in pending_our_index)
         self.rekey_our_index = None;
@@ -1044,6 +1107,11 @@ impl ActivePeer {
         self.rekey_msg1 = None;
         self.rekey_msg1_next_resend = 0;
         self.rekey_msg1_resend_count = 0;
+        debug_assert_eq!(
+            self.pending_role.is_some(),
+            self.send.pending_new_session.is_some(),
+            "install_pending: pending role out of step with the pending slot"
+        );
     }
 
     /// Cut over to the pending new session (initiator side).
@@ -1055,6 +1123,8 @@ impl ActivePeer {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
+        self.pending_role = None;
+        self.pending_since = None;
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
@@ -1081,6 +1151,11 @@ impl ActivePeer {
             mmp.reset_for_rekey(now_ms);
         }
 
+        debug_assert_eq!(
+            self.pending_role.is_some(),
+            self.send.pending_new_session.is_some(),
+            "cutover_to_new_session: pending role out of step with the pending slot"
+        );
         self.send.previous_our_index
     }
 
@@ -1092,6 +1167,8 @@ impl ActivePeer {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
+        self.pending_role = None;
+        self.pending_since = None;
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
@@ -1118,6 +1195,11 @@ impl ActivePeer {
             mmp.reset_for_rekey(now_ms);
         }
 
+        debug_assert_eq!(
+            self.pending_role.is_some(),
+            self.send.pending_new_session.is_some(),
+            "handle_peer_kbit_flip: pending role out of step with the pending slot"
+        );
         self.send.previous_our_index
     }
 
@@ -1144,6 +1226,26 @@ impl ActivePeer {
         self.send.previous_our_index.take()
     }
 
+    /// Drop a pending session this node did not initiate, which the
+    /// initiator never adopted. Returns its index so the caller can
+    /// unregister and free it; `None` if no such pending is held. A pending
+    /// this node initiated is left alone: that one is cut over, not retired.
+    pub(crate) fn retire_pending(&mut self) -> Option<SessionIndex> {
+        if self.pending_role == Some(RekeyRole::Initiator) {
+            return None;
+        }
+        self.send.pending_new_session.take()?;
+        self.send.pending_their_index = None;
+        self.pending_role = None;
+        self.pending_since = None;
+        debug_assert_eq!(
+            self.pending_role.is_some(),
+            self.send.pending_new_session.is_some(),
+            "retire_pending: pending role out of step with the pending slot"
+        );
+        self.send.pending_our_index.take()
+    }
+
     /// Abandon an in-progress rekey.
     ///
     /// Returns the rekey our_index so the caller can free it.
@@ -1156,11 +1258,19 @@ impl ActivePeer {
         self.rekey_msg1_resend_count = 0;
         self.rekey_in_progress = false;
         // Return whichever index needs freeing
-        self.rekey_our_index.take().or_else(|| {
+        let freed = self.rekey_our_index.take().or_else(|| {
             self.send.pending_new_session = None;
             self.send.pending_their_index = None;
+            self.pending_role = None;
+            self.pending_since = None;
             self.send.pending_our_index.take()
-        })
+        });
+        debug_assert_eq!(
+            self.pending_role.is_some(),
+            self.send.pending_new_session.is_some(),
+            "abandon_rekey: pending role out of step with the pending slot"
+        );
+        freed
     }
 
     // === Rekey Handshake State (Initiator) ===
@@ -1728,5 +1838,68 @@ mod tests {
                 .ok()
         });
         assert_eq!(cur_pt.as_deref(), Some(&b"steady"[..]));
+    }
+
+    /// Retiring a pending session this node answered hands back its index for
+    /// the caller to free, empties the pending slot and its role, and leaves
+    /// the current session alone.
+    #[test]
+    fn retiring_an_answered_pending_returns_its_index_and_empties_the_slot() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert_eq!(peer.pending_role(), Some(RekeyRole::Responder));
+
+        assert_eq!(peer.retire_pending(), Some(SessionIndex::new(3)));
+        assert!(peer.pending_new_session().is_none());
+        assert_eq!(peer.pending_role(), None);
+        assert_eq!(peer.pending_their_index(), None);
+        assert_eq!(peer.pending_our_index(), None);
+        assert!(peer.noise_session().is_some());
+        assert_eq!(peer.our_index(), Some(SessionIndex::new(1)));
+    }
+
+    /// Retirement leaves a pending session this node initiated in place: that
+    /// one is cut over on this node's schedule, never retired.
+    #[test]
+    fn retire_leaves_a_pending_this_node_initiated_in_place() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert_eq!(peer.pending_role(), Some(RekeyRole::Initiator));
+
+        assert_eq!(peer.retire_pending(), None);
+        assert!(peer.pending_new_session().is_some());
+        assert_eq!(peer.pending_role(), Some(RekeyRole::Initiator));
+    }
+
+    /// Promoting an answered pending session on the peer's first new-epoch
+    /// frame clears its role and install time with the slot.
+    #[test]
+    fn promotion_on_the_peers_new_epoch_frame_clears_the_pending_role() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+
+        assert!(peer.handle_peer_kbit_flip().is_some());
+        assert_eq!(peer.pending_role(), None);
+        assert!(!peer.pending_expired(Duration::ZERO));
+    }
+
+    /// The pending hold is measured from the install time: not expired inside
+    /// the hold, expired once the install time is older than it.
+    #[test]
+    fn pending_expiry_reads_the_install_time_against_the_hold() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+
+        assert!(!peer.pending_expired(Duration::from_secs(60)));
+        peer.backdate_pending(Duration::from_secs(61));
+        assert!(peer.pending_expired(Duration::from_secs(60)));
     }
 }

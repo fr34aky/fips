@@ -494,10 +494,10 @@ echo ""
 # the log count is monotone over a container's lifetime, so a released
 # wait means the later count cannot lose the timing race.
 #
-# What the count measures: the counted line is emitted by the cadence
-# path on whichever side(s) flip first, so a completed link rekey yields
-# one or two lines (a side promoted by receiving a flipped-K frame logs
-# only a DEBUG on a target the test's log filter suppresses). With rekey
+# What the count measures: the initiator logs the counted line once per
+# completed link rekey; the responder is promoted by the initiator's first
+# new-epoch frame and logs only a DEBUG on a target the test's log filter
+# suppresses. With rekey
 # timers resetting at each cutover, the events landing inside this
 # test's window are first-cycle cutovers spread across the topology's
 # links, not a second cycle on one link.

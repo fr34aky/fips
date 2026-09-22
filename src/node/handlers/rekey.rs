@@ -4,6 +4,7 @@
 //! 1. Rekey trigger (time elapsed or send counter exceeded)
 //! 2. Drain window expiry (clean up previous session after cutover)
 //! 3. Initiator-side cutover (first send after handshake completion)
+//! 4. Retirement of a responder's pending session the initiator never adopted
 
 use crate::NodeAddr;
 use crate::node::Node;
@@ -59,16 +60,50 @@ const DRAIN_MAX_RETENTION_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SE
 /// the configured handshake timers imply, so the ceiling always clears
 /// the recovery it is supposed to leave room for.
 pub(in crate::node) fn drain_max_retention_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
-    let mut ladder_ms: u64 = 0;
-    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
-    for _ in 0..rate_limit.handshake_max_resends {
-        ladder_ms = ladder_ms.saturating_add(interval as u64);
-        interval *= rate_limit.handshake_resend_backoff;
-    }
-    let recovery_budget_ms = ladder_ms
+    let recovery_budget_ms = ladder_ms(rate_limit)
         .saturating_add(rate_limit.handshake_timeout_secs.saturating_mul(1000))
         .saturating_add(crate::proto::fsp::limits::REKEY_DAMPENING_SECS * 1000);
     (DRAIN_MAX_RETENTION_SECS * 1000).max(recovery_budget_ms)
+}
+
+/// Sum of the handshake resend intervals, in milliseconds: the initial
+/// interval, multiplied by the backoff factor after each resend, over the
+/// configured number of resends.
+fn ladder_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
+    let mut total: u64 = 0;
+    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
+    for _ in 0..rate_limit.handshake_max_resends {
+        total = total.saturating_add(interval as u64);
+        interval *= rate_limit.handshake_resend_backoff;
+    }
+    total
+}
+
+/// How long a rekey responder holds a pending session its initiator has
+/// not adopted before retiring it.
+///
+/// The initiator reads a msg2 only while it holds its handshake, so the
+/// msg1 resend ladder, one tick to the abandon and one tick to the
+/// cutover bound the in-flight age of a msg2 it can still adopt. That
+/// assumes its sends succeed: a resend that fails to send does not
+/// advance the ladder. After the cutover the hold must also outlast the
+/// longer of the two ways the cutover reaches this node, or fails to:
+/// the first frame on the new epoch on an idle link, up to one heartbeat
+/// interval later, and the link-dead reap if every frame from the
+/// initiator is lost. Both are allowed one more tick. Retiring before
+/// either turns a late but legitimate adoption into a split. That floor
+/// is 64 s at stock settings; the drain ceiling, which bounds residence
+/// for the same recovering-peer reason, is 120 s and is used unless the
+/// configured timers push the floor above it.
+pub(in crate::node) fn pending_hold(node: &crate::config::NodeConfig) -> std::time::Duration {
+    let after_ms = node
+        .heartbeat_interval_secs
+        .max(node.link_dead_timeout_secs)
+        .saturating_mul(1000);
+    let floor_ms = ladder_ms(&node.rate_limit)
+        .saturating_add(node.tick_interval_secs.saturating_mul(3000))
+        .saturating_add(after_ms);
+    std::time::Duration::from_millis(drain_max_retention_ms(&node.rate_limit).max(floor_ms))
 }
 
 impl Node {
@@ -77,6 +112,8 @@ impl Node {
     /// For each active peer with a session:
     /// - If the initiator has a pending session, perform K-bit cutover
     /// - If the drain window has expired, clean up the previous session
+    /// - If a responder's pending session was never adopted by the initiator
+    ///   within the hold, retire it
     /// - If the rekey timer/counter fires, initiate a new handshake
     pub(in crate::node) async fn check_rekey(&mut self) {
         if !self.config().node.rekey.enabled {
@@ -121,6 +158,12 @@ impl Node {
                 ConnAction::InitiateRekey { peer: node_addr } => {
                     self.initiate_rekey(&node_addr).await;
                     self.observe_rekey_initiated(&node_addr);
+                }
+                // Retire a responder pending the initiator never adopted. Stays
+                // inline: the peer machine models only the initiator's pending
+                // (`on_rekey_msg2`), so there is nothing for it to consume.
+                ConnAction::RetirePending { peer: node_addr } => {
+                    self.retire_unadopted(&node_addr);
                 }
                 #[allow(unreachable_patterns)]
                 _ => {}
@@ -250,6 +293,28 @@ impl Node {
         let _ = did_cutover;
     }
 
+    /// Retire `node_addr`'s responder-held pending session: unregister its
+    /// index and free it. The index was registered in `peers_by_index` when
+    /// the msg2 was sent and was never given to the decrypt worker, which
+    /// sees a session only once it is current.
+    fn retire_unadopted(&mut self, node_addr: &NodeAddr) {
+        let retired = self
+            .peers
+            .get_mut(node_addr)
+            .and_then(|peer| peer.retire_pending().map(|idx| (idx, peer.transport_id())));
+        if let Some((idx, transport_id)) = retired {
+            if let Some(tid) = transport_id {
+                self.peers_by_index.remove(&(tid, idx.as_u32()));
+            }
+            let _ = self.index_allocator.free(idx);
+            debug!(
+                peer = %self.peer_display_name(node_addr),
+                index = %idx,
+                "Rekey pending session retired: the initiator never adopted it"
+            );
+        }
+    }
+
     /// Pre-refactor drain-completion body, retained as the release fallback for
     /// the (should-be-impossible) missing-machine case. Byte-identical to the old
     /// inline `ConnAction::Drain` arm and to the executor's `CompleteDrain` arm.
@@ -300,6 +365,8 @@ impl Node {
                     .map(|s| s.current_send_counter())
                     .unwrap_or(0),
                 jitter_secs: peer.rekey_jitter_secs(),
+                pending_role: peer.pending_role(),
+                pending_expired: peer.pending_expired(pending_hold(&self.config().node)),
             })
             .collect()
     }
@@ -642,6 +709,9 @@ impl Node {
     ///   out, abandon it (the handshake only — a completed rekey session
     ///   is never discarded on a timer, see
     ///   [`FspAction::AbandonHandshake`])
+    /// - If a handshake this node initiated got no SessionAck within the
+    ///   handshake timeout, drop it so the trigger can start a fresh one
+    ///   (see [`FspAction::ExpireInitiation`])
     /// - If the rekey timer/counter fires, initiate a new XK handshake
     ///   (this last one only when `node.rekey.enabled`)
     ///
@@ -707,6 +777,24 @@ impl Node {
                         );
                     }
                 }
+                FspAction::ExpireInitiation { addr } => {
+                    // The handshake only: the trigger starts a fresh rekey
+                    // on a later tick.
+                    let age_ms = self
+                        .sessions
+                        .get(&addr)
+                        .map(|entry| now_ms.saturating_sub(entry.initiated_ms()))
+                        .unwrap_or(0);
+                    if let Some(entry) = self.sessions.get_mut(&addr) {
+                        entry.abandon_handshake();
+                        self.stats_mut().session.rekey_unanswered += 1;
+                        info!(
+                            peer = %self.peer_display_name(&addr),
+                            age_ms,
+                            "FSP rekey we initiated got no answer within the handshake timeout, retrying, session retained"
+                        );
+                    }
+                }
                 FspAction::InitiateRekey { addr } => {
                     self.initiate_session_rekey(&addr).await;
                 }
@@ -726,6 +814,14 @@ impl Node {
         // finished, anchored on the peer's last accepted setup message, which
         // is the only stamp that path writes. A *completed* rekey has no such
         // bound and must not acquire one: see `FspAction::AbandonHandshake`.
+        //
+        // A handshake this node initiated has its own deadline, measured from
+        // the setup this node sent, and neither clock may stand in for the
+        // other: the peer's stamp says nothing about our setup, and ours
+        // says nothing about the peer's. Unlike the peer predicate, ours has
+        // no `!= 0` conjunct, deliberately: an initiator handshake armed
+        // without the stamp reads as expired, because dropping one costs a
+        // retry and keeping one stops rotation.
         let stale_handshake_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
         // Absolute ceiling on `previous`-slot retention, measured from the
         // cutover. The sliding drain deadline is peer-progress-aware, so an
@@ -749,6 +845,8 @@ impl Node {
                 is_dampened: entry.is_rekey_dampened(now_ms, dampening_ms),
                 armed_handshake_expired: entry.last_peer_rekey_ms() != 0
                     && now_ms.saturating_sub(entry.last_peer_rekey_ms()) > stale_handshake_ms,
+                initiation_expired: now_ms.saturating_sub(entry.initiated_ms())
+                    > stale_handshake_ms,
                 elapsed_secs: now_ms.saturating_sub(entry.session_start_ms()) / 1000,
                 counter: entry.send_counter(),
                 jitter_secs: entry.rekey_jitter_secs(),
@@ -759,7 +857,8 @@ impl Node {
     /// Initiate an FSP session rekey.
     ///
     /// Creates a new XK handshake as initiator, sends SessionSetup msg1
-    /// through the mesh, and stores the handshake state on the existing entry.
+    /// through the mesh, and stores the handshake state on the existing entry,
+    /// stamping the deadline by which a SessionAck must complete it.
     async fn initiate_session_rekey(&mut self, dest_addr: &NodeAddr) {
         // Check route availability before paying crypto cost
         if self.find_next_hop(dest_addr).is_none() {
@@ -826,9 +925,10 @@ impl Node {
             return;
         }
 
-        // Store rekey state on the existing session entry
+        // Store rekey state on the existing session entry. The deadline is
+        // stamped only now, so it runs from the setup actually on the wire.
         if let Some(entry) = self.sessions.get_mut(dest_addr) {
-            entry.set_rekey_state(handshake, true);
+            entry.begin_rekey(handshake, Self::now_ms());
         }
 
         debug!(
