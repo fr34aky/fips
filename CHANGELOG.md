@@ -117,6 +117,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Link and session rekey
 
+- A session rekey this node started no longer stays in flight forever when its
+  setup or the peer's ack is lost. Nothing resends a rekey setup, and the only
+  expiry covered a rekey the peer started, so one lost datagram left the
+  rekey pending and blocked every later one: the session kept its current keys
+  and stopped rotating them. The rekey now expires on the handshake timeout,
+  timed from when this node sent its setup, and the next tick starts a fresh
+  one. A forged ack cannot extend it. Expiries are counted as
+  `rekey_unanswered`. The wire format is unchanged.
 - A forged rekey msg2 no longer takes the link down. The rekey initiator gave
   up its handshake before reading msg2 and abandoned the cycle when the read
   failed, although nothing authenticates a msg2 ahead of that read. Anyone on
