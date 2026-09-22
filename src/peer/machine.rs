@@ -62,7 +62,7 @@ use crate::noise::{self, NoiseError, NoiseSession};
 use crate::proto::fmp::{
     ConnAction, ConnSnapshot, ConnectionState, EstablishSnapshot, Fmp, InboundDecision,
     OutboundDecision, OutboundSnapshot, PeerSnapshot, PromotionResult, RekeyCfg,
-    RekeyResendSnapshot, WireOutcome,
+    RekeyResendSnapshot, RekeyRole, WireOutcome,
 };
 use crate::proto::link::LinkMessageType;
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
@@ -1836,6 +1836,9 @@ impl PeerMachine {
             elapsed_secs,
             counter: 0,
             jitter_secs: self.rekey_jitter_secs,
+            pending_role: (phase == Some(RekeyPhase::PendingCutover))
+                .then_some(RekeyRole::Initiator),
+            pending_expired: false,
         }
     }
 }

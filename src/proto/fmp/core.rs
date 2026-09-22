@@ -131,6 +131,19 @@ pub(crate) struct ConnSnapshot {
     pub msg1: Vec<u8>,
 }
 
+/// Which side of a link rekey handshake produced a pending session.
+///
+/// Only the side that initiated may commit to the new keys on its own
+/// schedule: it holds proof that the peer derived them. The responder
+/// learns that only when a frame sealed on the new epoch authenticates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RekeyRole {
+    /// This node sent the rekey msg1 and read the peer's msg2.
+    Initiator,
+    /// This node answered the peer's rekey msg1 with a msg2.
+    Responder,
+}
+
 /// A snapshot of one active peer's rekey-relevant state, taken by the shell.
 ///
 /// Every clock read is resolved shell-side into a plain `u64`/`bool` before the
@@ -143,8 +156,15 @@ pub(crate) struct ConnSnapshot {
 pub(crate) struct PeerSnapshot {
     /// The peer's node address (cutover/drain/rekey target).
     pub addr: NodeAddr,
-    /// A pending post-rekey session is ready to cut over to.
+    /// A pending post-rekey session is held (cut over by the initiator,
+    /// promoted on the peer's first new-epoch frame by the responder).
     pub has_pending: bool,
+    /// Which role installed the pending session; `Some` exactly when
+    /// `has_pending`.
+    pub pending_role: Option<RekeyRole>,
+    /// The pending session has been held past the responder hold
+    /// (pre-evaluated shell-side against the hold, as `drain_expired` is).
+    pub pending_expired: bool,
     /// A rekey handshake is currently in flight.
     pub rekey_in_progress: bool,
     /// The peer is in its post-cutover drain window.
@@ -295,6 +315,10 @@ pub(crate) enum ConnAction {
     /// Complete `peer`'s drain window: erase the previous session, free its
     /// index, and unregister its decrypt-worker entry.
     Drain { peer: NodeAddr },
+    /// Retire `peer`'s pending session that this node did not initiate and the
+    /// initiator never adopted: drop it, unregister its index from
+    /// `peers_by_index`, and free the index.
+    RetirePending { peer: NodeAddr },
     /// Initiate a fresh outbound rekey to `peer` (`initiate_rekey`: allocates a
     /// new index, builds and sends msg1, inserts `pending_outbound`). The msg1
     /// construction is the establish leaf and stays shell-side; the action
@@ -504,33 +528,47 @@ impl Fmp {
     /// snapshotted. Reproduces the pre-refactor priority and phase grouping
     /// exactly:
     ///
-    /// - **Cutover** takes precedence: a peer with a pending session and no
-    ///   in-flight rekey cuts over and is considered for nothing else.
-    /// - Otherwise an expired drain window is completed, and — independently —
-    ///   the rekey trigger fires when the peer is neither mid-rekey nor
-    ///   dampened and its jittered time threshold or send counter is reached.
-    ///   A draining peer can thus both drain and re-trigger in the same tick,
-    ///   as before.
+    /// - **Cutover** takes precedence: a peer with a pending session this node
+    ///   initiated and no in-flight rekey cuts over and is considered for
+    ///   nothing else.
+    /// - A pending session this node answered is held, never cut over by the
+    ///   tick: the peer's first frame on the new epoch promotes it. Once its
+    ///   hold has passed it is retired.
+    /// - An expired drain window is completed, and — independently — the rekey
+    ///   trigger fires when the peer is neither mid-rekey, dampened, nor
+    ///   holding a pending session, and its jittered time threshold or send
+    ///   counter is reached. A draining peer can thus both drain and
+    ///   re-trigger in the same tick, as before.
     ///
     /// Actions are returned phase-grouped (all cutovers, then all drains, then
-    /// all rekey initiations) to preserve the pre-refactor global execution
-    /// order across peers, which the shared `index_allocator` observes.
+    /// all retirements, then all rekey initiations) to preserve the global
+    /// execution order across peers, which the shared `index_allocator`
+    /// observes: retirements free an index, so they run before initiations
+    /// allocate.
     pub(crate) fn poll_rekey(&self, peers: Vec<PeerSnapshot>, cfg: &RekeyCfg) -> Vec<ConnAction> {
         let mut cutovers = Vec::new();
         let mut drains = Vec::new();
+        let mut retires = Vec::new();
         let mut rekeys = Vec::new();
         for p in peers {
-            // 1. Initiator-side cutover.
-            if p.has_pending && !p.rekey_in_progress {
+            let initiated = p.pending_role == Some(RekeyRole::Initiator);
+            // 1. Initiator-side cutover. A pending this node answered is promoted
+            //    by the peer's first frame on the new epoch, never by this tick.
+            if p.has_pending && !p.rekey_in_progress && initiated {
                 cutovers.push(ConnAction::Cutover { peer: p.addr });
                 continue;
+            }
+            // 1b. A pending the initiator never adopted is retired at its hold.
+            if p.has_pending && !initiated && p.pending_expired {
+                retires.push(ConnAction::RetirePending { peer: p.addr });
             }
             // 2. Drain window expiry (does not preclude a trigger below).
             if p.is_draining && p.drain_expired {
                 drains.push(ConnAction::Drain { peer: p.addr });
             }
-            // 3. Rekey trigger.
-            if p.rekey_in_progress || p.is_dampened {
+            // 3. Rekey trigger. A held pending vetoes it: a new cycle's msg2 would
+            //    overwrite the held slot.
+            if p.rekey_in_progress || p.is_dampened || p.has_pending {
                 continue;
             }
             let effective_after = cfg.after_secs.saturating_add_signed(p.jitter_secs);
@@ -539,6 +577,7 @@ impl Fmp {
             }
         }
         cutovers.extend(drains);
+        cutovers.extend(retires);
         cutovers.extend(rekeys);
         cutovers
     }

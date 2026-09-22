@@ -38,6 +38,8 @@ pub(super) fn peer_snapshot(addr_byte: u8) -> PeerSnapshot {
         elapsed_secs: 0,
         counter: 0,
         jitter_secs: 0,
+        pending_role: None,
+        pending_expired: false,
     }
 }
 

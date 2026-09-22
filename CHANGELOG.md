@@ -148,6 +148,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state before the read, so the peer's genuine ack still completes the rekey,
   and the refusal is counted as `ack_handshake_failed`, as it already was for a
   first-contact session. The wire format is unchanged.
+- A link rekey whose reply is lost no longer splits the link. The node that
+  answered a rekey used to switch to the new keys on its own next tick, before
+  the other side had them; when the reply was lost, frames from the answering
+  side were dropped until the link was torn down. The answering side now
+  switches only when a frame on the new keys arrives from the side that started
+  the rekey, and drops keys that were never adopted after a hold (120 s by
+  default) so the next rekey can proceed.
 
 #### Session coordinates
 
