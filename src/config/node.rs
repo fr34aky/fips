@@ -485,7 +485,10 @@ pub struct NostrRendezvousConfig {
     /// connected — beyond which the sweep enqueues nothing more. `0` (the
     /// default) means no ceiling of its own: `node.limits.max_peers` is the
     /// only bound, which is right for a server but lets a phone fill every
-    /// slot it has with ambient adverts. Only used under `policy: open`.
+    /// slot it has with ambient adverts. Bounds what this node dials from
+    /// adverts; links other nodes open toward this one (inbound traversal
+    /// offers, dials of our own advert) are not counted and remain bounded
+    /// by `max_peers`. Only used under `policy: open`.
     #[serde(default)]
     pub open_discovery_max_peers: usize,
     /// Max concurrent inbound traversal offers processed at once.

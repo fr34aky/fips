@@ -359,7 +359,7 @@ inert otherwise.
 | `node.rendezvous.nostr.enabled` | bool | `false` | Enable Nostr-mediated overlay discovery |
 | `node.rendezvous.nostr.policy` | string | `"configured_only"` | Advert discovery policy: `disabled`, `configured_only`, `open` |
 | `node.rendezvous.nostr.open_discovery_max_pending` | usize | `64` | Max open-discovery peers queued in outbound retry/connection state at once |
-| `node.rendezvous.nostr.open_discovery_max_peers` | usize | `0` | Ceiling on open-discovery peers in total (queued + connecting + connected); `0` = bounded only by `node.limits.max_peers`. For small nodes such as phones |
+| `node.rendezvous.nostr.open_discovery_max_peers` | usize | `0` | Ceiling on peers this node dials from adverts, in total (queued + connecting + connected); inbound links are not counted. `0` = no ceiling of its own (`node.limits.max_peers` still applies). For small nodes such as phones |
 | `node.rendezvous.nostr.max_concurrent_incoming_offers` | usize | `16` | Max concurrent inbound traversal offers processed at once (rate limit against offer spam) |
 | `node.rendezvous.nostr.max_concurrent_offers_per_npub` | usize | `4` | Max concurrent inbound traversal offers accepted from any one sender npub, so a single identity cannot hold the whole pool. Sits inside `max_concurrent_incoming_offers`, which stays the outer bound; a larger value is inert. Zero is rejected, since it refuses every inbound offer rather than disabling the limit |
 | `node.rendezvous.nostr.advert_cache_max_entries` | usize | `2048` | Max cached overlay adverts retained from relay traffic |

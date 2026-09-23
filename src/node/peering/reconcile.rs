@@ -341,8 +341,10 @@ pub(crate) struct PeeringReconciler {
     pub(in crate::node) retry_pending: HashMap<NodeAddr, RetryState>,
     /// Peers the overlay sweep enqueued, so `open_discovery_max_peers` can
     /// count the ones still queued, connecting or connected. Pruned to that
-    /// live set on every sweep; an entry that dropped out of all three is
-    /// forgotten and may be rediscovered like any other advert.
+    /// live set on every sweep — knob or no knob, or it would grow by one
+    /// entry per advertised npub for the life of the process — so an entry
+    /// that dropped out of all three is forgotten and may be rediscovered
+    /// like any other advert.
     overlay_peers: HashSet<NodeAddr>,
 }
 
@@ -608,16 +610,18 @@ impl PeeringReconciler {
             .saturating_sub(current_open_discovery_pending);
         let available_outbound = budget.handshake_slots.min(budget.peer_slots);
         let mut enqueue_budget = cap_remaining.min(available_outbound);
+        // Always pruned, even with no ceiling configured: the set is fed by
+        // remote input (anyone can publish adverts under fresh npubs).
+        self.overlay_peers.retain(|addr| {
+            observed.connected.contains(addr)
+                || observed.connecting.contains(addr)
+                || self.retry_pending.contains_key(addr)
+        });
         if policy.open_discovery_max_peers > 0 {
             // Ceiling on the overlay pool as a whole. `max_pending` above
             // bounds the queue, and a queued peer leaves it the moment it
             // connects, so on its own it bounds the *rate* of growth, not the
             // size: a phone would go on collecting links until max_peers.
-            self.overlay_peers.retain(|addr| {
-                observed.connected.contains(addr)
-                    || observed.connecting.contains(addr)
-                    || self.retry_pending.contains_key(addr)
-            });
             enqueue_budget = enqueue_budget.min(
                 policy
                     .open_discovery_max_peers
@@ -629,7 +633,16 @@ impl PeeringReconciler {
             return;
         }
 
-        for (npub, endpoints, created_at_secs) in &pools.overlay {
+        // Freshest advert first. The pool is a cache drained in map order,
+        // and an advert may be up to an hour old; a node that advertised a
+        // minute ago is far likelier to answer an offer than one that did
+        // an hour ago. That matters most to a small node with a ceiling of
+        // a few peers, which used to fill it with whichever stale entries
+        // came first and then wait out their retries.
+        let mut overlay: Vec<&(String, Vec<OverlayEndpointAdvert>, u64)> =
+            pools.overlay.iter().collect();
+        overlay.sort_by(|a, b| b.2.cmp(&a.2));
+        for (npub, endpoints, created_at_secs) in overlay {
             if enqueue_budget == 0 {
                 break;
             }
@@ -1417,6 +1430,98 @@ mod tests {
             r.retry_pending.contains_key(&other.0),
             "slot freed once the peer is gone"
         );
+    }
+
+    /// With no ceiling configured the bookkeeping must still not grow:
+    /// after the enqueued peers have left the queue (connected, then gone)
+    /// the set holds nothing.
+    #[test]
+    fn overlay_bookkeeping_does_not_grow_without_a_ceiling() {
+        let mut policy = base_policy();
+        policy.open_discovery_enabled = true;
+        assert_eq!(policy.open_discovery_max_peers, 0);
+        let mut r = PeeringReconciler::default();
+        for round in 0..3u64 {
+            let (_, _, npub) = mk_peer();
+            let pools = DiscoveryPools {
+                overlay: vec![(
+                    npub,
+                    vec![OverlayEndpointAdvert {
+                        transport: crate::nostr::OverlayTransportKind::Udp,
+                        addr: "203.0.113.7:2121".to_string(),
+                    }],
+                    0,
+                )],
+                ..DiscoveryPools::default()
+            };
+            let now = 10_000 + round * 1_000;
+            r.reconcile(
+                &policy,
+                &Observed::default(),
+                &ample_budget(),
+                &pools,
+                now,
+                Gate::Reconciling,
+            );
+            assert_eq!(
+                r.overlay_peers.len(),
+                1,
+                "round {round}: only the live entry"
+            );
+            // The peer connects (leaves the queue) and later drops off.
+            r.retry_pending.clear();
+        }
+        r.reconcile(
+            &policy,
+            &Observed::default(),
+            &ample_budget(),
+            &DiscoveryPools::default(),
+            20_000,
+            Gate::Reconciling,
+        );
+        assert!(
+            r.overlay_peers.is_empty(),
+            "nothing live, nothing remembered"
+        );
+    }
+
+    /// Under a ceiling the freshest advert wins, whatever order the cache
+    /// hands them over in.
+    #[test]
+    fn overlay_enqueues_freshest_advert_first() {
+        let (_, addr_old, npub_old) = mk_peer();
+        let (_, addr_new, npub_new) = mk_peer();
+        let advert = |npub: &str, at: u64| {
+            (
+                npub.to_string(),
+                vec![OverlayEndpointAdvert {
+                    transport: crate::nostr::OverlayTransportKind::Udp,
+                    addr: "203.0.113.7:2121".to_string(),
+                }],
+                at,
+            )
+        };
+        let mut policy = base_policy();
+        policy.open_discovery_enabled = true;
+        policy.open_discovery_max_peers = 1;
+        let pools = DiscoveryPools {
+            overlay: vec![advert(&npub_old, 100), advert(&npub_new, 3_000)],
+            ..DiscoveryPools::default()
+        };
+        let mut r = PeeringReconciler::default();
+        r.reconcile(
+            &policy,
+            &Observed::default(),
+            &ample_budget(),
+            &pools,
+            4_000_000,
+            Gate::Reconciling,
+        );
+        assert!(
+            r.retry_pending.contains_key(&addr_new),
+            "the fresh advert took the slot"
+        );
+        assert!(!r.retry_pending.contains_key(&addr_old));
     }
 
     // ---- Parity: per-peer parallel cap (4 legs max) ------------------------
