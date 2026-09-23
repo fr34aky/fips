@@ -3835,12 +3835,12 @@ async fn dns_responder_serves_a_proxying_embedder() {
 ///
 /// Scoped to the helper deliberately, and named for that rather than for the
 /// scenario: no responder dies here, and deleting the `run_rx_loop` call site
-/// leaves this green. Driving a real exit through the loop needs the node moved
-/// into a task, which puts `dns_local_addr()` out of reach — and the producer
-/// side cannot deliver `Child::Dns` today regardless, since `run_dns_responder`
-/// never returns.
+/// leaves this green. The rx-loop wiring is pinned separately, by
+/// `a_dns_exit_on_the_child_channel_degrades_the_node_and_retracts_its_address`.
+/// The producer side reports `Child::Dns` only when the responder panics, since
+/// `run_dns_responder` has no ordinary exit.
 ///
-/// What it does pin is the behavior the eventual wiring depends on: the FSM's
+/// What it does pin is the behavior the wiring depends on: the FSM's
 /// `ChildExited` handling only republishes node health, so without this
 /// retraction `dns_local_addr()` would keep naming a socket nobody is listening
 /// on, and a proxying embedder would see `.fips` queries silently time out
@@ -3867,6 +3867,192 @@ async fn retract_child_publications_clears_the_dns_address() {
         node.dns_local_addr().is_none(),
         "a dead responder must not keep publishing an address to dial",
     );
+
+    node.stop().await.unwrap();
+}
+
+/// A supervised task that panics is still reported to the supervisor.
+///
+/// Without the report the panic ends the task silently: the `JoinError` sits
+/// on a handle nobody reads until `stop()`, and the node stays `Running` with
+/// the child gone.
+#[tokio::test]
+async fn report_exit_reports_a_body_that_panics() {
+    use crate::node::lifecycle::report_exit;
+    use crate::node::lifecycle::supervisor::Child;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let handle = tokio::spawn(report_exit(
+        Child::Dns,
+        async { panic!("the supervised body died") },
+        Some(tx),
+    ));
+    let joined = handle.await;
+
+    assert_eq!(
+        rx.recv().await,
+        Some(Child::Dns),
+        "a panicking child must still report its exit",
+    );
+    assert!(
+        joined.is_ok(),
+        "the panic must be contained by the reporter"
+    );
+}
+
+/// A supervised task whose body returns is reported, so a future ordinary
+/// exit from the DNS responder needs no further wiring.
+#[tokio::test]
+async fn report_exit_reports_a_body_that_returns() {
+    use crate::node::lifecycle::report_exit;
+    use crate::node::lifecycle::supervisor::Child;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(report_exit(Child::Dns, async {}, Some(tx)))
+        .await
+        .unwrap();
+
+    assert_eq!(rx.recv().await, Some(Child::Dns));
+}
+
+/// A deliberate teardown aborts a running child, and that must not read as a
+/// death: the abort drops the whole reporting future before any send.
+#[tokio::test]
+async fn report_exit_stays_silent_when_the_task_is_aborted() {
+    use crate::node::lifecycle::report_exit;
+    use crate::node::lifecycle::supervisor::Child;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(report_exit(
+        Child::Dns,
+        async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        },
+        Some(tx),
+    ));
+    // The body is running, as a live responder is when `stop()` aborts it.
+    started_rx.await.unwrap();
+    handle.abort();
+
+    assert!(handle.await.unwrap_err().is_cancelled());
+    assert_eq!(rx.recv().await, None, "an aborted child must not report");
+}
+
+/// A supervised thread that panics is still reported to the supervisor.
+#[test]
+fn report_thread_reports_a_body_that_panics() {
+    use crate::node::lifecycle::report_thread;
+    use crate::node::lifecycle::supervisor::Child;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let joined = std::thread::spawn(move || {
+        report_thread(
+            Child::Tun,
+            || panic!("the supervised thread died"),
+            Some(&tx),
+        )
+    })
+    .join();
+
+    assert_eq!(
+        rx.try_recv(),
+        Ok(Child::Tun),
+        "a panicking thread must still report its exit",
+    );
+    assert!(
+        joined.is_ok(),
+        "the panic must be contained by the reporter"
+    );
+}
+
+/// A supervised thread whose body returns is reported.
+#[test]
+fn report_thread_reports_a_body_that_returns() {
+    use crate::node::lifecycle::report_thread;
+    use crate::node::lifecycle::supervisor::Child;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    std::thread::spawn(move || report_thread(Child::Tun, || {}, Some(&tx)))
+        .join()
+        .unwrap();
+
+    assert_eq!(rx.try_recv(), Ok(Child::Tun));
+}
+
+/// A node with a UDP transport and a DNS responder on an ephemeral port, and
+/// no control socket for the rx loop to bind.
+fn dns_config() -> crate::Config {
+    let mut config = crate::Config::new();
+    config.node.control.enabled = false;
+    config.transports.udp = crate::config::TransportInstances::Single(crate::config::UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    });
+    config.dns.enabled = true;
+    config.dns.bind_addr = Some("::1".to_string());
+    config.dns.port = Some(0);
+    config
+}
+
+/// A DNS exit reaching the child channel degrades the node and retracts the
+/// responder's published address, through the real rx loop.
+///
+/// The exit is queued before the loop starts and the loop is driven in place
+/// under a bound, so the node's state is readable afterwards. The shutdown
+/// future never fires, which keeps the loop out of the drain path.
+#[tokio::test]
+async fn a_dns_exit_on_the_child_channel_degrades_the_node_and_retracts_its_address() {
+    let mut node = make_node_with(dns_config());
+    node.start().await.unwrap();
+    assert_eq!(node.state(), NodeState::Running);
+    assert!(node.dns_local_addr().is_some(), "responder came up");
+
+    node.child_exit_tx
+        .clone()
+        .unwrap()
+        .send(crate::node::lifecycle::supervisor::Child::Dns)
+        .await
+        .unwrap();
+    let drive = tokio::time::timeout(
+        Duration::from_millis(500),
+        node.run_rx_loop_with_shutdown(std::future::pending()),
+    )
+    .await;
+    assert!(
+        drive.is_err(),
+        "the rx loop must still be running: {drive:?}"
+    );
+
+    assert_eq!(node.state(), NodeState::Degraded);
+    assert!(
+        node.dns_local_addr().is_none(),
+        "a dead responder must not keep publishing an address to dial",
+    );
+
+    node.stop().await.unwrap();
+}
+
+/// The healthy side of the wiring test: the same drive with no exit queued
+/// leaves the node `Running` and its responder's address published.
+#[tokio::test]
+async fn an_rx_loop_with_no_child_exit_leaves_the_node_running_and_its_dns_address_published() {
+    let mut node = make_node_with(dns_config());
+    node.start().await.unwrap();
+
+    let drive = tokio::time::timeout(
+        Duration::from_millis(500),
+        node.run_rx_loop_with_shutdown(std::future::pending()),
+    )
+    .await;
+    assert!(
+        drive.is_err(),
+        "the rx loop must still be running: {drive:?}"
+    );
+
+    assert_eq!(node.state(), NodeState::Running);
+    assert!(node.dns_local_addr().is_some());
 
     node.stop().await.unwrap();
 }
