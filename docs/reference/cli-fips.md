@@ -87,6 +87,10 @@ writes, on first start) the identity files:
 When `node.identity.persistent` is `false` (the default), a fresh
 keypair is written to these files on every start.
 
+On Windows the service writes its log to `C:\ProgramData\fips\fips.log`,
+rolled at 10 MiB with four old files kept; a foreground run logs to the
+console.
+
 The control socket path is derived per
 [control-socket.md](control-socket.md).
 

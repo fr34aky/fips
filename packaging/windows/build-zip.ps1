@@ -113,6 +113,11 @@ Configuration:
 
   fipsctl keygen writes to C:\ProgramData\fips by default and
   needs an elevated prompt.
+
+Logs:
+  The service logs to C:\ProgramData\fips\fips.log, rolled at
+  10 MiB with four old files kept. A foreground run logs to the
+  console.
 "@ | Out-File -FilePath "$StagingDir\README.txt" -Encoding UTF8
 
 # Create ZIP
