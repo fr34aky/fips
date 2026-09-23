@@ -100,8 +100,19 @@ Control Socket:
   fipsctl and fipstop connect to this port automatically.
 
 Configuration:
-  Edit fips.yaml before starting. Place it in the same directory
-  as fips.exe, or in %APPDATA%\fips\, or set FIPS_CONFIG.
+  The service reads C:\ProgramData\fips\fips.yaml, where
+  install-service.ps1 puts it, and keeps fips.key, hosts,
+  peers.allow and peers.deny beside it. Edit fips.yaml there
+  before starting the service.
+
+  A foreground run takes -c <file>, or reads
+  C:\ProgramData\fips\fips.yaml and then, as per-user overrides
+  the service does not read, %APPDATA%\fips\fips.yaml,
+  %USERPROFILE%\.fips.yaml and .\fips.yaml. The key file sits
+  beside the last config loaded.
+
+  fipsctl keygen writes to C:\ProgramData\fips by default and
+  needs an elevated prompt.
 "@ | Out-File -FilePath "$StagingDir\README.txt" -Encoding UTF8
 
 # Create ZIP

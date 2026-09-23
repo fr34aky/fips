@@ -130,6 +130,12 @@ async fn run_daemon(
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     fips::node::warn_on_legacy_config_paths();
 
+    // Windows moved its config, key and ACL files from %APPDATA%\fips and
+    // /etc/fips to C:\ProgramData\fips; flag a config left behind. The peer
+    // ACL reloader reports ACL files left at the old location.
+    #[cfg(windows)]
+    fips::config::warn_legacy(&loaded_paths);
+
     // Identity provisioning: config nsec > key file > generate ephemeral
     let mut resolved = match resolve_identity(&config, &loaded_paths) {
         Ok(r) => r,
@@ -414,10 +420,12 @@ mod service {
         println!("Service '{}' installed successfully.", SERVICE_NAME);
         println!("Start it with: sc start {}", SERVICE_NAME);
         println!();
-        println!("Configuration: place fips.yaml in one of:");
-        println!("  - Current directory");
-        println!("  - %APPDATA%\\fips\\fips.yaml");
-        println!("  - Set FIPS_CONFIG environment variable");
+        let dir = std::path::Path::new(fips::config::SYSTEM_CONFIG_DIR);
+        println!(
+            "Configuration: the service reads {}",
+            dir.join("fips.yaml").display()
+        );
+        println!("  keep fips.key, hosts, peers.allow and peers.deny beside it.");
         Ok(())
     }
 
