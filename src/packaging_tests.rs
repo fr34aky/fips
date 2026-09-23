@@ -6,6 +6,7 @@
 //! a compile error. Lines are trimmed at the end before matching, so a CRLF
 //! checkout reads the same as an LF one.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Reads `rel`, a path relative to the crate root, panicking with the path on
@@ -87,6 +88,79 @@ fn bash_array(pkgbuild: &str, name: &str) -> Vec<String> {
     panic!("`{open}` is never closed");
 }
 
+/// Returns the variables a FreeBSD rc script sets: `name="value"` assignments
+/// at column 0 and `: ${name:="value"}` defaults.
+///
+/// `${var}` references in a value are expanded from the variables set on
+/// earlier lines; an unset variable expands to nothing, as in sh.
+fn rc_vars(rc: &str) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    for line in rc.lines().map(str::trim_end) {
+        let assignment = line
+            .strip_prefix(": ${")
+            .and_then(|rest| rest.strip_suffix('}'))
+            .and_then(|rest| rest.split_once(":="))
+            .or_else(|| line.split_once('='));
+        let Some((name, value)) = assignment else {
+            continue;
+        };
+        let is_name = !name.is_empty()
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !name.starts_with(|c: char| c.is_ascii_digit());
+        let Some(value) = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|_| is_name)
+        else {
+            continue;
+        };
+        let expanded = expand_vars(value, &vars);
+        vars.insert(name.to_string(), expanded);
+    }
+    vars
+}
+
+/// Expands each `${name}` in `value` from `vars`, an unset name giving the
+/// empty string.
+fn expand_vars(value: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .unwrap_or_else(|| panic!("unclosed ${{ in {value:?}"));
+        out.push_str(vars.get(&after[..end]).map_or("", String::as_str));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Returns the lines of a shell script with trailing-backslash continuations
+/// joined into one line each.
+fn logical_lines(sh: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending = String::new();
+    for line in sh.lines().map(str::trim_end) {
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                pending.push_str(head);
+                pending.push(' ');
+            }
+            None => {
+                pending.push_str(line);
+                out.push(std::mem::take(&mut pending));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        out.push(pending);
+    }
+    out
+}
+
 #[test]
 fn deb_and_aur_packages_declare_nftables_for_the_firewall_units_nft() {
     let unit = repo_file("packaging/debian/fips-firewall.service");
@@ -145,5 +219,100 @@ fn deb_and_aur_packages_declare_nftables_for_the_firewall_units_nft() {
         "fips-firewall.service runs /usr/sbin/nft, but nftables is declared in neither \
          the required nor the optional dependencies of:\n  {}",
         undeclared.join("\n  ")
+    );
+}
+
+#[test]
+fn freebsd_newsyslog_entry_signals_the_daemon8_supervisor_started_with_sighup_reopen() {
+    let rc = repo_file("packaging/freebsd/fips.rc");
+    let vars = rc_vars(&rc);
+    let args = vars
+        .get("command_args")
+        .unwrap_or_else(|| panic!("fips.rc sets no command_args"));
+    let procname = vars
+        .get("procname")
+        .unwrap_or_else(|| panic!("fips.rc sets no procname"));
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    // daemon(8)'s own options are the tokens before the command it runs.
+    let daemon_opts = tokens
+        .iter()
+        .position(|t| t == procname)
+        .map(|i| &tokens[..i])
+        .unwrap_or_else(|| panic!("fips.rc command_args does not run {procname}: {args}"));
+    let operand = |flag: &str, what: &str| -> String {
+        daemon_opts
+            .iter()
+            .position(|t| *t == flag)
+            .and_then(|i| daemon_opts.get(i + 1))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| panic!("fips.rc starts daemon(8) without {flag} <{what}>: {args}"))
+    };
+    let child_pidfile = operand("-p", "child pidfile");
+    let supervisor_pidfile = operand("-P", "supervisor pidfile");
+    let logfile = operand("-o", "log file");
+    assert!(
+        daemon_opts.contains(&"-H"),
+        "fips.rc starts daemon(8) without -H, so a SIGHUP from newsyslog does not \
+         reopen {logfile} and the daemon keeps writing into the rotated file: {args}"
+    );
+    assert_ne!(
+        child_pidfile, supervisor_pidfile,
+        "fips.rc gives daemon(8) the same pidfile for -p and -P"
+    );
+
+    let rel = "packaging/freebsd/fips.newsyslog";
+    let entry = repo_file(rel);
+    let entries: Vec<&str> = entry
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim_start().is_empty() && !l.trim_start().starts_with('#'))
+        .collect();
+    let [line] = entries[..] else {
+        panic!("{rel}: expected exactly one entry, found {entries:?}");
+    };
+    let mut fields = line.split_whitespace().peekable();
+    let entry_logfile = fields.next().unwrap_or_default();
+    fields.next_if(|f| f.contains(':'));
+    let mode = fields.next().unwrap_or_default();
+    let entry_pidfile = fields.find(|f| f.starts_with('/'));
+    assert_eq!(
+        entry_logfile, logfile,
+        "{rel} rotates a different file from the one fips.rc passes to daemon(8) -o"
+    );
+    assert_eq!(
+        mode, "600",
+        "{rel} creates the rotated log with a mode other than daemon(8)'s 600"
+    );
+    assert_eq!(
+        entry_pidfile,
+        Some(supervisor_pidfile.as_str()),
+        "{rel} must signal the daemon(8) supervisor (-P), the only process that \
+         reopens the log on SIGHUP; the child pidfile (-p) is {child_pidfile}"
+    );
+
+    let build = repo_file("packaging/freebsd/build-pkg.sh");
+    let installed = "/usr/local/etc/newsyslog.conf.d/fips.conf";
+    assert!(
+        logical_lines(&build)
+            .iter()
+            .any(|l| l.starts_with("install")
+                && l.contains("fips.newsyslog")
+                && l.contains(installed)),
+        "build-pkg.sh does not install fips.newsyslog as {installed}"
+    );
+    let plist: Vec<&str> = build
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|l| *l != r#"cat > "${STAGE}/pkg-plist" <<'EOF'"#)
+        .skip(1)
+        .take_while(|l| *l != "EOF")
+        .collect();
+    assert!(
+        plist.contains(&"etc/rc.d/fips"),
+        "control: build-pkg.sh pkg-plist heredoc not found or lacks etc/rc.d/fips: {plist:?}"
+    );
+    assert!(
+        plist.contains(&"etc/newsyslog.conf.d/fips.conf"),
+        "build-pkg.sh pkg-plist does not list etc/newsyslog.conf.d/fips.conf: {plist:?}"
     );
 }
