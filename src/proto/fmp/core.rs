@@ -523,8 +523,7 @@ impl Fmp {
     }
 
     /// Decide the per-tick rekey choreography for the peers the shell
-    /// snapshotted. Reproduces the pre-refactor priority and phase grouping
-    /// exactly:
+    /// snapshotted, in this priority:
     ///
     /// - **Cutover** takes precedence: a peer with a pending session this node
     ///   initiated and no in-flight rekey cuts over and is considered for
@@ -536,7 +535,7 @@ impl Fmp {
     ///   trigger fires when the peer is neither mid-rekey, dampened, nor
     ///   holding a pending session, and its jittered time threshold or send
     ///   counter is reached. A draining peer can thus both drain and
-    ///   re-trigger in the same tick, as before.
+    ///   re-trigger in the same tick.
     ///
     /// Actions are returned phase-grouped (all cutovers, then all drains, then
     /// all retirements, then all rekey initiations) to preserve the global
