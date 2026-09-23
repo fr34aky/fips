@@ -61,7 +61,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Node lifecycle
+
+- A DNS responder or TUN thread that dies now degrades the node's published
+  health, and a dead responder's address is retracted. The responder's exit
+  report followed a loop that never returns, so it could not run, and a panic
+  in the responder or in either TUN thread unwound past its report. The node
+  kept reporting healthy with the child gone and kept publishing the DNS
+  address with nothing answering on it. Each child now runs inside a wrapper
+  that catches a panic, logs it, and reports the exit either way. A deliberate
+  stop still reports nothing.
+
 #### Data plane and transports
+
+- A configured `ble:` transport that this build cannot construct is now
+  reported. The only warning for it was compiled into test builds alone, where
+  logging is compiled out, so macOS, Windows, FreeBSD, OpenWrt and other musl
+  builds, and Android without a BLE radio armed before start, dropped the block
+  silently while reporting healthy. The daemon now warns once per configured
+  instance at startup, naming the reason.
 
 - Two inbound TCP connections that share a peer address but arrive on different
   local addresses no longer share one pool entry. The kernel names a connection
@@ -100,6 +118,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanly, and a peer whose send failed is retried after a shorter fixed
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
+
+#### Routing and discovery
+
+- A node now re-announces its bloom filter when a peer starts or stops using
+  it as parent. A node's outgoing filter merges only its tree peers' filters,
+  and nothing re-marked the other peers when a peer's tree announce changed
+  whether it named us as parent, so our parent kept the old filter.
+  Destinations under a new child stayed missing from discovery, and a departed
+  child's stayed advertised, until some unrelated change. The re-announce fires
+  only when that relation flips and only to peers whose filter actually
+  changed, so ordinary tree churn does not multiply announce traffic.
 
 #### Session setup
 
