@@ -435,6 +435,7 @@ mod tests {
             handshake_timeout_ms: 30_000,
             open_discovery_enabled: false,
             open_discovery_max_pending: 32,
+            open_discovery_max_peers: 0,
             open_discovery_expires_ms: 600_000,
         }
     }

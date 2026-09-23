@@ -1915,6 +1915,7 @@ fn the_startup_sweep_age_filter_measures_advert_age_on_the_wall_clock() {
         handshake_timeout_ms: 5_000,
         open_discovery_enabled: true,
         open_discovery_max_pending: 32,
+        open_discovery_max_peers: 0,
         open_discovery_expires_ms: 600_000,
     };
     let budget = Budget {
