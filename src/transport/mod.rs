@@ -1112,9 +1112,32 @@ impl TransportHandle {
 /// Fast path: if the address parses as a numeric IP:port, returns
 /// immediately with no DNS lookup. Otherwise, treats the address as
 /// `hostname:port` and performs async DNS resolution via the system
-/// resolver.
+/// resolver, taking the first result. A caller that will send from an
+/// already-bound socket uses [`resolve_socket_addr_for`] instead, so the
+/// result is one that socket can actually reach.
 pub(crate) async fn resolve_socket_addr(
     addr: &TransportAddr,
+) -> Result<SocketAddr, TransportError> {
+    resolve_socket_addr_for(addr, None).await
+}
+
+/// [`resolve_socket_addr`], restricted to the address family of `local`
+/// when given.
+///
+/// A UDP socket bound to `0.0.0.0` cannot `sendto` an IPv6 address (the
+/// kernel answers EAFNOSUPPORT, "Address family not supported by protocol")
+/// and vice versa, and the resolver's answer order is not ours to choose:
+/// on a DNS64/NAT64 network — IPv6-only mobile carriers — a name with only an
+/// A record comes back with a synthesized AAAA sorted FIRST, so "take the
+/// first result" picked an address the socket could not use and every
+/// handshake to the bootstrap peer failed. A name that resolves to nothing
+/// in the socket's family is an error naming both families, so the log
+/// says what is missing rather than an errno.
+///
+/// A numeric address is returned as-is; the caller checks that one.
+pub(crate) async fn resolve_socket_addr_for(
+    addr: &TransportAddr,
+    local: Option<SocketAddr>,
 ) -> Result<SocketAddr, TransportError> {
     let s = addr
         .as_str()
@@ -1126,18 +1149,48 @@ pub(crate) async fn resolve_socket_addr(
     }
 
     // Slow path: DNS resolution
-    tokio::net::lookup_host(s)
+    let results: Vec<SocketAddr> = tokio::net::lookup_host(s)
         .await
         .map_err(|e| {
             TransportError::InvalidAddress(format!("DNS resolution failed for {}: {}", s, e))
         })?
-        .next()
-        .ok_or_else(|| {
-            TransportError::InvalidAddress(format!(
-                "DNS resolution returned no addresses for {}",
-                s
-            ))
-        })
+        .collect();
+    pick_for_family(&results, local).ok_or_else(|| match local {
+        Some(local) if !results.is_empty() => TransportError::InvalidAddress(format!(
+            "DNS resolution for {} returned no {} address (got {}); this transport is bound \
+             to {} and can only send {}",
+            s,
+            family_name(local),
+            results
+                .iter()
+                .map(|a| a.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            local,
+            family_name(local),
+        )),
+        _ => TransportError::InvalidAddress(format!(
+            "DNS resolution returned no addresses for {}",
+            s
+        )),
+    })
+}
+
+/// The first of `results` in `local`'s address family, or simply the first
+/// when there is no socket to match.
+fn pick_for_family(results: &[SocketAddr], local: Option<SocketAddr>) -> Option<SocketAddr> {
+    match local {
+        None => results.first().copied(),
+        Some(local) => results
+            .iter()
+            .copied()
+            .find(|r| r.is_ipv4() == local.is_ipv4()),
+    }
+}
+
+/// "IPv4" / "IPv6", for messages.
+pub(crate) fn family_name(addr: SocketAddr) -> &'static str {
+    if addr.is_ipv4() { "IPv4" } else { "IPv6" }
 }
 
 // ============================================================================
@@ -1147,6 +1200,24 @@ pub(crate) async fn resolve_socket_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolver's order is not ours: a DNS64 answer sorts the synthesized
+    /// AAAA first. A bound socket must get a result of its own family, and a
+    /// caller with no socket keeps the first result as before.
+    #[test]
+    fn pick_for_family_matches_the_bound_socket() {
+        let v6: SocketAddr = "[64:ff9b::c000:201]:2121".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.1:2121".parse().unwrap();
+        let dns64_order = [v6, v4];
+        let bound_v4: SocketAddr = "0.0.0.0:37259".parse().unwrap();
+        let bound_v6: SocketAddr = "[::]:37259".parse().unwrap();
+
+        assert_eq!(pick_for_family(&dns64_order, Some(bound_v4)), Some(v4));
+        assert_eq!(pick_for_family(&dns64_order, Some(bound_v6)), Some(v6));
+        assert_eq!(pick_for_family(&dns64_order, None), Some(v6));
+        assert_eq!(pick_for_family(&[v6], Some(bound_v4)), None);
+        assert_eq!(pick_for_family(&[], None), None);
+    }
 
     #[test]
     fn test_transport_id() {
