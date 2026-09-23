@@ -2930,6 +2930,7 @@ impl Node {
             open_discovery_enabled: nostr.enabled
                 && nostr.policy == crate::config::NostrRendezvousPolicy::Open,
             open_discovery_max_pending: nostr.open_discovery_max_pending,
+            open_discovery_max_peers: nostr.open_discovery_max_peers,
             open_discovery_expires_ms: nostr
                 .advert_ttl_secs
                 .saturating_mul(1000)

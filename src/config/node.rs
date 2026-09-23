@@ -481,6 +481,13 @@ pub struct NostrRendezvousConfig {
     /// at once. Prevents unbounded queue growth from ambient advert traffic.
     #[serde(default = "NostrRendezvousConfig::default_open_discovery_max_pending")]
     pub open_discovery_max_pending: usize,
+    /// Ceiling on peers that came from open discovery — queued, connecting or
+    /// connected — beyond which the sweep enqueues nothing more. `0` (the
+    /// default) means no ceiling of its own: `node.limits.max_peers` is the
+    /// only bound, which is right for a server but lets a phone fill every
+    /// slot it has with ambient adverts. Only used under `policy: open`.
+    #[serde(default)]
+    pub open_discovery_max_peers: usize,
     /// Max concurrent inbound traversal offers processed at once.
     /// Acts as a rate limit against offer spam from relays.
     #[serde(default = "NostrRendezvousConfig::default_max_concurrent_incoming_offers")]
@@ -577,6 +584,7 @@ impl Default for NostrRendezvousConfig {
             signal_ttl_secs: Self::default_signal_ttl_secs(),
             policy: NostrRendezvousPolicy::default(),
             open_discovery_max_pending: Self::default_open_discovery_max_pending(),
+            open_discovery_max_peers: 0,
             max_concurrent_incoming_offers: Self::default_max_concurrent_incoming_offers(),
             max_concurrent_offers_per_npub: Self::default_max_concurrent_offers_per_npub(),
             advert_cache_max_entries: Self::default_advert_cache_max_entries(),

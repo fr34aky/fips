@@ -262,6 +262,10 @@ pub(crate) struct Policy {
     pub open_discovery_enabled: bool,
     /// `nostr.open_discovery_max_pending`.
     pub open_discovery_max_pending: usize,
+    /// `nostr.open_discovery_max_peers`: ceiling on overlay-originated peers
+    /// in total (queued, connecting or connected), `0` = none. Still a
+    /// ceiling, not a set-point: nothing dials to *reach* it.
+    pub open_discovery_max_peers: usize,
     /// `advert_ttl_secs * 1000 * OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER`.
     // NOTE: there is deliberately NO set-point N knob. The overlay pool is
     // CEILING-ONLY.
@@ -335,6 +339,11 @@ pub(crate) struct PeeringReconciler {
     /// survives a fresh connection per re-dial. Keyed
     /// by [`NodeAddr`].
     pub(in crate::node) retry_pending: HashMap<NodeAddr, RetryState>,
+    /// Peers the overlay sweep enqueued, so `open_discovery_max_peers` can
+    /// count the ones still queued, connecting or connected. Pruned to that
+    /// live set on every sweep; an entry that dropped out of all three is
+    /// forgotten and may be rediscovered like any other advert.
+    overlay_peers: HashSet<NodeAddr>,
 }
 
 impl PeeringReconciler {
@@ -599,6 +608,22 @@ impl PeeringReconciler {
             .saturating_sub(current_open_discovery_pending);
         let available_outbound = budget.handshake_slots.min(budget.peer_slots);
         let mut enqueue_budget = cap_remaining.min(available_outbound);
+        if policy.open_discovery_max_peers > 0 {
+            // Ceiling on the overlay pool as a whole. `max_pending` above
+            // bounds the queue, and a queued peer leaves it the moment it
+            // connects, so on its own it bounds the *rate* of growth, not the
+            // size: a phone would go on collecting links until max_peers.
+            self.overlay_peers.retain(|addr| {
+                observed.connected.contains(addr)
+                    || observed.connecting.contains(addr)
+                    || self.retry_pending.contains_key(addr)
+            });
+            enqueue_budget = enqueue_budget.min(
+                policy
+                    .open_discovery_max_peers
+                    .saturating_sub(self.overlay_peers.len()),
+            );
+        }
         if enqueue_budget == 0 {
             tally.budget_zero = true;
             return;
@@ -693,6 +718,7 @@ impl PeeringReconciler {
             state.retry_after_ms = now;
             state.expires_at_ms = Some(now.saturating_add(policy.open_discovery_expires_ms));
             self.retry_pending.insert(addr, state);
+            self.overlay_peers.insert(addr);
             actions.push(PeeringAction::ScheduleRetry {
                 peer: addr,
                 backoff_ms: 0,
@@ -970,6 +996,7 @@ mod tests {
             handshake_timeout_ms: HS_TIMEOUT_MS,
             open_discovery_enabled: false,
             open_discovery_max_pending: 32,
+            open_discovery_max_peers: 0,
             open_discovery_expires_ms: 600_000,
         }
     }
@@ -1307,6 +1334,88 @@ mod tests {
             count_connects(&phase2),
             1,
             "phase 2 dials the enqueued entry"
+        );
+    }
+
+    /// `open_discovery_max_peers` is a ceiling on the overlay pool as a
+    /// whole: with a ceiling of 1, two advertised candidates yield one
+    /// enqueue; once that peer is connected (and so no longer queued) a
+    /// third candidate is still refused; and after it is gone the slot
+    /// frees up again.
+    #[test]
+    fn overlay_max_peers_ceilings_the_pool_not_just_the_queue() {
+        let (_, addr_a, npub_a) = mk_peer();
+        let (_, addr_b, npub_b) = mk_peer();
+        let advert = |npub: &str| {
+            (
+                npub.to_string(),
+                vec![OverlayEndpointAdvert {
+                    transport: crate::nostr::OverlayTransportKind::Udp,
+                    addr: "203.0.113.7:2121".to_string(),
+                }],
+                0,
+            )
+        };
+        let mut policy = base_policy();
+        policy.open_discovery_enabled = true;
+        policy.open_discovery_max_peers = 1;
+
+        let mut r = PeeringReconciler::default();
+        let both = DiscoveryPools {
+            overlay: vec![advert(&npub_a), advert(&npub_b)],
+            ..DiscoveryPools::default()
+        };
+        r.reconcile(
+            &policy,
+            &Observed::default(),
+            &ample_budget(),
+            &both,
+            10_000,
+            Gate::Reconciling,
+        );
+        assert_eq!(r.retry_pending.len(), 1, "one of two candidates enqueued");
+        let first = *r.retry_pending.keys().next().unwrap();
+        let other = if first == addr_a {
+            (addr_b, npub_b.clone())
+        } else {
+            (addr_a, npub_a.clone())
+        };
+
+        // The first connects: it leaves the queue, but still occupies the pool.
+        r.retry_pending.remove(&first);
+        let connected = Observed {
+            connected: [first].into_iter().collect(),
+            ..Observed::default()
+        };
+        let only_other = DiscoveryPools {
+            overlay: vec![advert(&other.1)],
+            ..DiscoveryPools::default()
+        };
+        r.reconcile(
+            &policy,
+            &connected,
+            &ample_budget(),
+            &only_other,
+            20_000,
+            Gate::Reconciling,
+        );
+        assert!(
+            r.retry_pending.is_empty(),
+            "pool full: connected peer counts"
+        );
+
+        // The first drops off: the slot is free again.
+        r.reconcile(
+            &policy,
+            &Observed::default(),
+            &ample_budget(),
+            &only_other,
+            30_000,
+            Gate::Reconciling,
+        );
+        assert!(
+            r.retry_pending.contains_key(&other.0),
+            "slot freed once the peer is gone"
         );
     }
 
