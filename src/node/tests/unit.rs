@@ -3630,6 +3630,74 @@ fn app_owned_ble_radio_seam_is_absent_until_armed() {
     assert!(node.ble_radio.is_none());
 }
 
+/// A configured `ble:` block that this build cannot turn into a transport is
+/// named in a warning, once per instance, rather than dropped silently.
+///
+/// `BleConfig` parses on every platform, so a node on a build with no BLE
+/// backend (macOS, Windows, FreeBSD, musl, and a test build) would otherwise
+/// start and report healthy with the configured radio simply absent. Not
+/// `cfg`-gated: the warning is for exactly the builds that lack BLE.
+#[tokio::test]
+async fn configured_ble_instances_each_draw_a_warning_when_no_backend_can_build_them() {
+    let mut config = crate::Config::new();
+    config.node.control.enabled = false;
+    config.transports.ble = crate::config::TransportInstances::Named(
+        [
+            ("alpha".to_string(), crate::config::BleConfig::default()),
+            ("beta".to_string(), crate::config::BleConfig::default()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let mut node = make_node_with(config);
+    let (tx, _rx) = packet_channel(8);
+
+    let (logs, guard) = crate::testutil::capture_logs_scoped();
+    let transports = node.create_transports(&tx).await;
+    drop(guard);
+
+    assert!(
+        transports.is_empty(),
+        "no transport can be built from a BLE block on this build",
+    );
+    let warnings = logs.warnings();
+    for instance in ["alpha", "beta"] {
+        let field = format!("instance=\"{instance}\"");
+        let hits = warnings
+            .iter()
+            .filter(|line| line.contains("ignoring configured instance") && line.contains(&field))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "expected one warning naming BLE instance {instance}, got {warnings:?}",
+        );
+    }
+}
+
+/// The healthy side of the check above: with no `ble:` block there is nothing
+/// to warn about, so the new warning must not fire on an ordinary config.
+#[tokio::test]
+async fn a_node_without_ble_config_draws_no_ble_warning() {
+    let mut config = crate::Config::new();
+    config.node.control.enabled = false;
+    let mut node = make_node_with(config);
+    let (tx, _rx) = packet_channel(8);
+
+    let (logs, guard) = crate::testutil::capture_logs_scoped();
+    let transports = node.create_transports(&tx).await;
+    drop(guard);
+
+    assert!(
+        transports.is_empty(),
+        "the default config builds no transport"
+    );
+    let warnings = logs.warnings();
+    assert!(
+        !warnings.iter().any(|line| line.contains("BLE transport")),
+        "no BLE block is configured, got {warnings:?}",
+    );
+}
+
 #[cfg(all(ble_available, any(target_os = "android", test)))]
 mod test_radio {
     use crate::transport::ble::addr::BleAddr;
