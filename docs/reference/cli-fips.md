@@ -81,7 +81,7 @@ writes, on first start) the identity files:
 
 | File | Mode | Purpose |
 | ---- | ---- | ------- |
-| `fips.key` | `0600` | Bech32 nsec for the persistent identity (Unix only; Windows inherits parent ACLs). |
+| `fips.key` | `0600` | Bech32 nsec for the persistent identity (Unix; on Windows the file takes its directory's ACL, which `install-service.ps1` restricts to SYSTEM and Administrators). |
 | `fips.pub` | `0644` | Bech32 npub corresponding to `fips.key`. |
 
 When `node.identity.persistent` is `false` (the default), a fresh

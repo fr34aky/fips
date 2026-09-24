@@ -417,3 +417,344 @@ fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_w
         missing.join("\n  ")
     );
 }
+
+/// Returns the lines of a PowerShell script, trimmed, without blank lines and
+/// without lines that are only a `#` comment.
+fn ps_lines(ps1: &str) -> Vec<String> {
+    ps1.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Guards the order in which install-service.ps1 secures `C:\ProgramData\fips`.
+///
+/// The directory inherits `C:\ProgramData`'s access, under which any local
+/// user can read the files in it and create missing ones, and a user can
+/// create the directory, or a junction in its place, before the installer
+/// runs, or turn an empty one into a junction. So the installer must build
+/// the restricted ACL and create a new directory with it in one step, refuse
+/// a link and a directory owned by another account, take ownership, check the
+/// directory and the entries inside for links and folders before replacing
+/// the ACL (applying it propagates into them) and again after it, reset each
+/// file, check once more, and only then name any path inside the directory.
+#[test]
+fn windows_installer_restricts_config_dir_before_any_path_inside_it() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let nth = |what: &str, n: usize, pred: &dyn Fn(&str) -> bool| -> usize {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| pred(l))
+            .nth(n)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                panic!(
+                    "install-service.ps1: no {} line {what}",
+                    ["first", "second", "third"][n]
+                )
+            })
+    };
+    let is_check = |l: &str| l == "& $refuseEntries";
+    let is_create = |l: &str| l.contains("CreateDirectory(") && l.contains("$ConfigDir");
+
+    let order = [
+        (
+            "SetAccessRuleProtection",
+            nth(
+                "containing SetAccessRuleProtection($true, $false)",
+                0,
+                &|l| l.contains("SetAccessRuleProtection($true, $false)"),
+            ),
+        ),
+        (
+            "creation of $ConfigDir",
+            nth("containing CreateDirectory( and $ConfigDir", 0, &is_create),
+        ),
+        (
+            "ReparsePoint check on $ConfigDir",
+            nth("containing ReparsePoint", 0, &|l| {
+                l.contains("ReparsePoint")
+            }),
+        ),
+        (
+            "owner check",
+            nth("containing GetOwner", 0, &|l| l.contains("GetOwner")),
+        ),
+        (
+            "directory /setowner",
+            nth("containing /setowner", 0, &|l| l.contains("/setowner")),
+        ),
+        (
+            "$refuseEntries definition",
+            nth("starting $refuseEntries =", 0, &|l| {
+                l.starts_with("$refuseEntries =")
+            }),
+        ),
+        (
+            "check before the lock",
+            nth("that is & $refuseEntries", 0, &is_check),
+        ),
+        (
+            "Set-Acl of $ConfigDir",
+            nth("containing Set-Acl and $ConfigDir", 0, &|l| {
+                l.contains("Set-Acl") && l.contains("$ConfigDir")
+            }),
+        ),
+        (
+            "check after the lock",
+            nth("that is & $refuseEntries", 1, &is_check),
+        ),
+        (
+            "child /setowner",
+            nth("containing /setowner", 1, &|l| l.contains("/setowner")),
+        ),
+        (
+            "child /reset",
+            nth("containing /reset", 0, &|l| l.contains("/reset")),
+        ),
+        (
+            "check after the reset",
+            nth("that is & $refuseEntries", 2, &is_check),
+        ),
+        (
+            "first path inside $ConfigDir",
+            nth("containing $ConfigDir\\", 0, &|l| {
+                l.contains("$ConfigDir\\")
+            }),
+        ),
+    ];
+    for pair in order.windows(2) {
+        let [(a, ia), (b, ib)] = pair else {
+            unreachable!("windows(2) yields pairs")
+        };
+        assert!(
+            ia < ib,
+            "install-service.ps1: {a} (code line {ia}) must come before {b} (code line {ib})"
+        );
+    }
+
+    let (protect, create) = (order[0].1, order[1].1);
+    for needle in [
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "ContainerInherit",
+        "ObjectInherit",
+    ] {
+        assert!(
+            lines[protect..create].iter().any(|l| l.contains(needle)),
+            "install-service.ps1: the ACL built between SetAccessRuleProtection and \
+             the creation of $ConfigDir does not name {needle}"
+        );
+    }
+    for l in lines.iter().filter(|l| l.contains("CreateDirectory")) {
+        assert!(
+            l.contains("$acl") && l.contains("$ConfigDir"),
+            "install-service.ps1: $ConfigDir must be created with $acl in one step: {l}"
+        );
+    }
+    if let Some(l) = lines
+        .iter()
+        .find(|l| l.contains("New-Item") && l.contains("$ConfigDir"))
+    {
+        panic!("install-service.ps1: New-Item creates $ConfigDir without its ACL: {l}");
+    }
+    let set_acl = &lines[order[7].1];
+    assert!(
+        set_acl.contains("-AclObject $acl"),
+        "install-service.ps1: Set-Acl does not apply the ACL built for creation: {set_acl}"
+    );
+
+    let (def, first_check) = (order[5].1, order[6].1);
+    let block = &lines[def..first_check];
+    assert!(
+        block
+            .iter()
+            .any(|l| l.contains("Get-Item -LiteralPath $ConfigDir") && l.contains("ReparsePoint")),
+        "install-service.ps1: the $refuseEntries script block does not test whether \
+         $ConfigDir itself has become a link"
+    );
+    assert!(
+        block.iter().any(|l| l.contains("Get-ChildItem -LiteralPath $ConfigDir")
+            && !l.contains("-Recurse")),
+        "install-service.ps1: the $refuseEntries script block does not list $ConfigDir's entries"
+    );
+    for needle in ["ReparsePoint", "PSIsContainer"] {
+        assert!(
+            block
+                .iter()
+                .any(|l| l.contains("$item") && l.contains(needle)),
+            "install-service.ps1: the $refuseEntries script block does not test {needle} \
+             on each entry"
+        );
+    }
+
+    let checks = lines.iter().filter(|l| is_check(l)).count();
+    assert_eq!(
+        checks, 3,
+        "install-service.ps1: expected exactly three & $refuseEntries lines, found {checks}"
+    );
+    let setowners = lines.iter().filter(|l| l.contains("/setowner")).count();
+    assert_eq!(
+        setowners, 2,
+        "install-service.ps1: expected exactly two /setowner lines, found {setowners}"
+    );
+    if let Some(l) = lines.iter().find(|l| l.contains("-Recurse")) {
+        panic!("install-service.ps1: -Recurse is not allowed: {l}");
+    }
+}
+
+/// Guards the conditions under which install-service.ps1 refuses its config
+/// directory, not only their position.
+///
+/// Each refusal must be an `if` whose body is `Write-Error` then `exit 1`: an
+/// owner outside SYSTEM, Administrators and the installing account; the
+/// directory being a link, both at the start and inside every recheck; and an
+/// entry that is a link or a folder, either of which is enough. A condition
+/// that can never hold, or that needs both a link and a folder, would pass an
+/// ordering check while refusing nothing.
+#[test]
+fn windows_installer_refusal_conditions_stop_the_install() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let refuses_at = |i: usize, what: &str| {
+        let cond = &lines[i];
+        assert!(
+            cond.starts_with("if (") && cond.ends_with('{'),
+            "install-service.ps1: the {what} is not an if statement: {cond}"
+        );
+        let body = lines.get(i + 1..i + 3).unwrap_or_default();
+        assert!(
+            body.len() == 2 && body[0].starts_with("Write-Error ") && body[1] == "exit 1",
+            "install-service.ps1: the {what} is not followed by Write-Error then exit 1: \
+             {cond}\n  then: {body:?}"
+        );
+    };
+    let find = |what: &str, pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        let found: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| pred(l))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "install-service.ps1: no line found for the {what}"
+        );
+        found
+    };
+
+    let trusted = find("list of trusted owners", &|l| {
+        l.starts_with("$trustedOwners = @(")
+    });
+    for needle in [
+        "\"S-1-5-18\"",
+        "\"S-1-5-32-544\"",
+        "WindowsIdentity]::GetCurrent().User.Value",
+    ] {
+        assert!(
+            lines[trusted[0]].contains(needle),
+            "install-service.ps1: the trusted owners do not include {needle}: {}",
+            lines[trusted[0]]
+        );
+    }
+    for i in find("owner refusal", &|l| {
+        l == "if ($trustedOwners -notcontains $ownerSid) {"
+    }) {
+        refuses_at(i, "owner refusal");
+    }
+
+    let dir_links = find("refusal of $ConfigDir as a link", &|l| {
+        l.starts_with("if (") && l.contains("ReparsePoint") && !l.contains("$item")
+    });
+    assert_eq!(
+        dir_links.len(),
+        2,
+        "install-service.ps1: expected the directory's link check once at the start and \
+         once in $refuseEntries, found {}",
+        dir_links.len()
+    );
+    for i in dir_links {
+        refuses_at(i, "refusal of $ConfigDir as a link");
+    }
+
+    for i in find("refusal of a link or folder entry", &|l| {
+        l.starts_with("if (") && l.contains("$item")
+    }) {
+        let cond = &lines[i];
+        assert!(
+            cond.contains("ReparsePoint")
+                && cond.contains("PSIsContainer")
+                && cond.contains(" -or ")
+                && !cond.contains(" -and "),
+            "install-service.ps1: an entry must be refused if it is a link or a folder, \
+             either one: {cond}"
+        );
+        refuses_at(i, "refusal of a link or folder entry");
+    }
+}
+
+/// Guards the recovery install-service.ps1 gives for a directory it refuses.
+///
+/// A user who created `C:\ProgramData\fips` holds full control of it through
+/// an inherited entry for their own account. Taking ownership changes only the
+/// owner, so the installer's owner check would then pass while that user could
+/// still swap the directory for a junction. The recovery must be to delete the
+/// directory, and the installer must not offer `takeown` as a way through.
+#[test]
+fn windows_installer_refusals_never_offer_takeown_as_the_recovery() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    if let Some(l) = lines
+        .iter()
+        .find(|l| l.to_ascii_lowercase().contains("takeown"))
+    {
+        panic!("install-service.ps1: a refusal offers takeown as the recovery: {l}");
+    }
+    let owner_refusals = lines
+        .iter()
+        .filter(|l| l.contains("Write-Error") && l.contains("delete the directory"))
+        .count();
+    assert!(
+        owner_refusals >= 2,
+        "install-service.ps1: expected the owner refusals to say to delete the directory, \
+         found {owner_refusals} such lines"
+    );
+}
+
+/// Guards every icacls call in install-service.ps1: each acts on a link itself
+/// rather than its target (`/L`), never walks a tree (`/T`), and has its exit
+/// code checked on the next line, since `$ErrorActionPreference = "Stop"` does
+/// not cover a native command's exit code in Windows PowerShell 5.1.
+#[test]
+fn windows_installer_icacls_calls_act_on_links_and_check_exit_codes() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let calls: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("& $icacls"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        calls.len() >= 3,
+        "install-service.ps1: expected at least three & $icacls calls, found {}",
+        calls.len()
+    );
+    for i in calls {
+        let call = &lines[i];
+        let tokens: Vec<&str> = call.split_whitespace().collect();
+        assert!(
+            tokens.iter().any(|t| t.eq_ignore_ascii_case("/L")),
+            "install-service.ps1: icacls call without /L follows a link: {call}"
+        );
+        assert!(
+            !tokens.iter().any(|t| t.eq_ignore_ascii_case("/T")),
+            "install-service.ps1: icacls call with /T walks the tree: {call}"
+        );
+        let next = lines.get(i + 1).map(String::as_str).unwrap_or_default();
+        assert!(
+            next.contains("$LASTEXITCODE"),
+            "install-service.ps1: icacls call not followed by a $LASTEXITCODE check: \
+             {call}\n  next line: {next}"
+        );
+    }
+}

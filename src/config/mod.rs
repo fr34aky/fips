@@ -541,9 +541,11 @@ fn warn_unmanaged_key_file(path: &Path) {
 /// only) before any key material is written, so an existing file at a looser
 /// mode is corrected rather than inherited.
 ///
-/// Coverage gap: on Windows the file inherits default ACLs from the parent
+/// Coverage gap: on Windows the file takes the ACL inherited from its
 /// directory, and neither the mode enforcement nor the symlink protection
-/// applies. The exclusion is deliberate.
+/// applies. `install-service.ps1` restricts `C:\ProgramData\fips` to SYSTEM
+/// and Administrators, but a key written anywhere else gets whatever that
+/// directory grants.
 pub fn write_key_file(path: &Path, nsec: &str) -> Result<(), ConfigError> {
     use std::io::Write;
 
