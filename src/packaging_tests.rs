@@ -161,6 +161,33 @@ fn logical_lines(sh: &str) -> Vec<String> {
     out
 }
 
+/// Returns the logical lines of a shell script, trimmed at both ends, without
+/// the lines that are comments.
+fn code_lines(sh: &str) -> Vec<String> {
+    logical_lines(sh)
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.starts_with('#'))
+        .collect()
+}
+
+/// Returns the code lines of the `case` branch `label)` in a shell script:
+/// those after the line that trims to `label)`, up to the next line that trims
+/// to `;;`.
+fn case_branch(sh: &str, label: &str) -> Vec<String> {
+    let open = format!("{label})");
+    let lines = code_lines(sh);
+    let start = 1 + lines
+        .iter()
+        .position(|l| *l == open)
+        .unwrap_or_else(|| panic!("no `{open}` branch found"));
+    let len = lines[start..]
+        .iter()
+        .position(|l| l == ";;")
+        .unwrap_or_else(|| panic!("`{open}` branch is never closed with `;;`"));
+    lines[start..start + len].to_vec()
+}
+
 #[test]
 fn deb_and_aur_packages_declare_nftables_for_the_firewall_units_nft() {
     let unit = repo_file("packaging/debian/fips-firewall.service");
@@ -314,5 +341,79 @@ fn freebsd_newsyslog_entry_signals_the_daemon8_supervisor_started_with_sighup_re
     assert!(
         plist.contains(&"etc/newsyslog.conf.d/fips.conf"),
         "build-pkg.sh pkg-plist does not list etc/newsyslog.conf.d/fips.conf: {plist:?}"
+    );
+}
+
+/// Pins the DNS cleanup in `postrm purge` and `uninstall.sh` to the files
+/// `fips-dns-setup` writes, so a purge after a `fips-dns` that never ran its
+/// teardown does not leave the resolver sending `.fips` to a dead responder.
+///
+/// This is a text test. Each path must appear on an `rm -f` line, but a
+/// resolver command passes wherever it appears on a code line, including in a
+/// message. What `postrm` actually does is covered by the deb-install purge
+/// check. No suite runs `uninstall.sh`: its two resolved paths were run once,
+/// by hand in a container, and its dnsmasq and NetworkManager paths by nothing.
+#[test]
+fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_writes_and_restarts_its_resolver()
+ {
+    let setup = rc_vars(&repo_file("packaging/common/fips-dns-setup"));
+    let teardown = rc_vars(&repo_file("packaging/common/fips-dns-teardown"));
+    let paths: Vec<&str> = [
+        "DNS_DELEGATE_FILE",
+        "RESOLVED_DROPIN_FILE",
+        "DNSMASQ_CONF",
+        "NM_DNSMASQ_CONF",
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = setup
+            .get(name)
+            .filter(|p| p.starts_with('/'))
+            .unwrap_or_else(|| panic!("fips-dns-setup sets no absolute {name}"));
+        assert_eq!(
+            teardown.get(name),
+            Some(path),
+            "fips-dns-teardown's {name} is not the file fips-dns-setup writes"
+        );
+        path.as_str()
+    })
+    .collect();
+    let commands = [
+        "restart systemd-resolved",
+        "reload dnsmasq",
+        "nmcli general reload",
+    ];
+
+    let scripts = [
+        (
+            "packaging/debian/postrm purge)",
+            case_branch(&repo_file("packaging/debian/postrm"), "purge"),
+        ),
+        (
+            "packaging/systemd/uninstall.sh",
+            code_lines(&repo_file("packaging/systemd/uninstall.sh")),
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (script, lines) in &scripts {
+        for path in &paths {
+            if !lines
+                .iter()
+                .any(|l| l.contains("rm -f") && l.contains(path))
+            {
+                missing.push(format!("{script}: no `rm -f` of {path}"));
+            }
+        }
+        for command in commands {
+            if !lines.iter().any(|l| l.contains(command)) {
+                missing.push(format!("{script}: never runs `{command}`"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "DNS cleanup does not match the files fips-dns-setup writes and the resolvers \
+         fips-dns-teardown restarts:\n  {}",
+        missing.join("\n  ")
     );
 }
