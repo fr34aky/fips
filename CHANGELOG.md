@@ -326,6 +326,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the msg1 it was made for. Any other msg1 replaces the session as a peer
   restart does, once nothing authenticated has arrived from the peer for 15 s.
 
+- A link rekey the peer starts within 30 s of the previous one, as the
+  message-count trigger does on a busy link, is now answered once 10 s have
+  passed since that rekey. Until 30 s had passed it was dropped, or, from a
+  peer silent for 15 s, taken as a fresh dial that replaced the link. The
+  30 s that keeps a crossing dial from being taken for a rekey now runs from
+  when the link came up, or from a peer restart our rekey revealed, instead
+  of restarting at every rekey.
+
 #### Windows
 
 - The ZIP's `README.txt` lists `\etc\fips\fips.yaml` as the first file a
