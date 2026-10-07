@@ -251,6 +251,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs the digest of the msg1 that armed it (`held_dg`) and how long it has
   been held (`pending_age_s`). Message texts and levels are unchanged.
 
+- A peer that keeps sending msg1s the node has already answered or refused no
+  longer draws one debug line per msg1. Each such outcome (a resend of the
+  stored msg2 or of a held rekey msg2, a rekey msg1 refused while a pending
+  session is held or already answered, a msg1 off the established link, one
+  dropped by the restart and replacement interval, and one refused during the
+  silent-session back-off) is logged three times per peer and session, then
+  once as "Suppressing repeated handshake lines for this peer" with its
+  `kind`, and after that only counted. "Suppressed repeated handshake lines"
+  reports by kind how many lines were not logged, with the first repeated
+  line after a session change and when the peer is removed, and for back-off
+  refusals when a frame from the peer first authenticates. The line that
+  starts a back-off refusal now carries the number of msg1s the previous
+  refusal refused (`prior_refused`). Nothing sent, decided or counted in the
+  handshake statistics changes.
+
 - Decryption-failure lines now say which of the peer's sessions a failing
   frame named and what key state each end held. "Decryption failed" and
   "Worker FMP AEAD decryption failed" carry the frame's receiver index
