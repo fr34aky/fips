@@ -4,7 +4,7 @@ use crate::NodeAddr;
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
-use crate::node::diag::{self, Msg1Path, OrNone};
+use crate::node::diag::{self, HsLine, Msg1Path, OrNone, Shown, Withheld};
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
@@ -135,6 +135,76 @@ impl EstablishView for Node {
                 peer_addr,
                 true,
             ),
+        }
+    }
+}
+
+/// Repeated handshake lines: a peer that keeps sending msg1s with one outcome
+/// logs that outcome a bounded number of times per session, and the number
+/// not logged is reported later.
+impl Node {
+    /// Count a line of `kind` for `peer` and say whether to log it. On the
+    /// first counted line after a session change, logs what earlier sessions
+    /// withheld. A msg1 with no peer entry is always logged.
+    fn shown(&mut self, peer: &NodeAddr, kind: HsLine) -> bool {
+        let Some(entry) = self.peers.get_mut(peer) else {
+            return true;
+        };
+        let counts = entry.hs_lines_mut();
+        let carried = counts.take_carried();
+        let count = counts.count(kind);
+        if let Some(withheld) = carried {
+            self.log_withheld(peer, &withheld);
+        }
+        self.show(peer, kind, count)
+    }
+
+    /// Whether to log the `count`th line of `kind` for `peer`, logging the
+    /// notice that replaces the first one suppressed.
+    fn show(&self, peer: &NodeAddr, kind: HsLine, count: u32) -> bool {
+        match Shown::of(count) {
+            Shown::Line => true,
+            Shown::Notice => {
+                debug!(
+                    peer = %self.peer_display_name(peer),
+                    kind = %kind,
+                    "Suppressing repeated handshake lines for this peer"
+                );
+                false
+            }
+            Shown::Nothing => false,
+        }
+    }
+
+    /// Log how many of `peer`'s repeated handshake lines were not logged,
+    /// by kind.
+    pub(in crate::node) fn log_withheld(&self, peer: &NodeAddr, withheld: &Withheld) {
+        debug!(
+            peer = %self.peer_display_name(peer),
+            resend = withheld.of(HsLine::Resend),
+            resend_failed = withheld.of(HsLine::ResendFailed),
+            rekey_resend = withheld.of(HsLine::RekeyResend),
+            rekey_resend_failed = withheld.of(HsLine::RekeyResendFailed),
+            pending = withheld.of(HsLine::Pending),
+            answered = withheld.of(HsLine::Answered),
+            off_link = withheld.of(HsLine::OffLink),
+            replace = withheld.of(HsLine::Replace),
+            restart = withheld.of(HsLine::Restart),
+            "Suppressed repeated handshake lines"
+        );
+    }
+
+    /// A session of `peer` carried its first authenticated frame: drop the
+    /// identity's silent-session record, and log how many of its refusal
+    /// lines were not logged.
+    pub(in crate::node) fn note_peer_heard(&mut self, peer: &NodeAddr) {
+        let refused = diag::withheld(self.silent_sessions.heard(peer));
+        if refused > 0 {
+            debug!(
+                peer = %self.peer_display_name(peer),
+                refused,
+                "Suppressed repeated handshake lines"
+            );
         }
     }
 }
@@ -777,15 +847,23 @@ impl Node {
                 // were never registered, so dropping the msg1 unanswered is
                 // the whole effect.
                 debug_assert!(actions.is_empty());
-                debug!(
-                    peer = %self.peer_display_name(&peer_node_addr),
-                    transport_id = %packet.transport_id,
-                    remote_addr = %packet.remote_addr,
-                    msg1_dg = %msg1_dg,
-                    silent = %OrNone(silent_backoff.map(|b| b.silent)),
-                    remaining_s = %OrNone(silent_backoff.map(|b| b.remaining_ms.div_ceil(1000))),
-                    "Msg1 from a peer whose recent sessions carried no frame, refusing during its back-off"
-                );
+                // Counted on the identity's record, since a refused msg1
+                // may have no peer entry to count on.
+                let shown = self
+                    .silent_sessions
+                    .note_refused(&peer_node_addr)
+                    .is_none_or(|n| self.show(&peer_node_addr, HsLine::Refused, n));
+                if shown {
+                    debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        msg1_dg = %msg1_dg,
+                        silent = %OrNone(silent_backoff.map(|b| b.silent)),
+                        remaining_s = %OrNone(silent_backoff.map(|b| b.remaining_ms.div_ceil(1000))),
+                        "Msg1 from a peer whose recent sessions carried no frame, refusing during its back-off"
+                    );
+                }
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::SilentBackoff));
             }
@@ -800,42 +878,53 @@ impl Node {
                 // fresh-context fail path (no actions) and the local machine is
                 // dropped; the reject bookkeeping below is the whole effect.
                 debug_assert!(actions.is_empty());
-                match reason {
-                    InboundReject::PendingSession => debug!(
-                        peer = %self.peer_display_name(&peer_node_addr),
-                        transport_id = %packet.transport_id,
-                        remote_addr = %packet.remote_addr,
-                        same_path = path.same_path(),
-                        msg1_dg = %msg1_dg,
-                        held_dg = %held_dg,
-                        pending_age_s = %pending_age_s,
-                        "Rekey msg1 received but already have pending session, dropping"
-                    ),
-                    InboundReject::DualRekeyWon => debug!(
-                        peer = %self.peer_display_name(&peer_node_addr),
-                        transport_id = %packet.transport_id,
-                        remote_addr = %packet.remote_addr,
-                        same_path = path.same_path(),
-                        msg1_dg = %msg1_dg,
-                        "Dual rekey initiation: we win (smaller addr), dropping their msg1"
-                    ),
-                    InboundReject::AnsweredBefore => debug!(
-                        peer = %self.peer_display_name(&peer_node_addr),
-                        remote_addr = %packet.remote_addr,
-                        transport_id = %packet.transport_id,
-                        same_path = path.same_path(),
-                        msg1_dg = %msg1_dg,
-                        "Rekey msg1 answered in an ended cycle, dropping the copy"
-                    ),
-                    InboundReject::OffLink => debug!(
-                        peer = %self.peer_display_name(&peer_node_addr),
-                        transport_id = %packet.transport_id,
-                        remote_addr = %packet.remote_addr,
-                        same_path = path.same_path(),
-                        msg1_dg = %msg1_dg,
-                        "Same-epoch msg1 off the established link while that link is up, dropping"
-                    ),
-                    InboundReject::AtMaxPeers | InboundReject::SilentBackoff => unreachable!(),
+                let shown = match reason {
+                    InboundReject::PendingSession => self.shown(&peer_node_addr, HsLine::Pending),
+                    InboundReject::AnsweredBefore => self.shown(&peer_node_addr, HsLine::Answered),
+                    InboundReject::OffLink => self.shown(&peer_node_addr, HsLine::OffLink),
+                    // Never suppressed: an integration check counts this line
+                    // to detect a dual-initiation loop, which holds one
+                    // session and so would never restart a per-session count.
+                    _ => true,
+                };
+                if shown {
+                    match reason {
+                        InboundReject::PendingSession => debug!(
+                            peer = %self.peer_display_name(&peer_node_addr),
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            same_path = path.same_path(),
+                            msg1_dg = %msg1_dg,
+                            held_dg = %held_dg,
+                            pending_age_s = %pending_age_s,
+                            "Rekey msg1 received but already have pending session, dropping"
+                        ),
+                        InboundReject::DualRekeyWon => debug!(
+                            peer = %self.peer_display_name(&peer_node_addr),
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            same_path = path.same_path(),
+                            msg1_dg = %msg1_dg,
+                            "Dual rekey initiation: we win (smaller addr), dropping their msg1"
+                        ),
+                        InboundReject::AnsweredBefore => debug!(
+                            peer = %self.peer_display_name(&peer_node_addr),
+                            remote_addr = %packet.remote_addr,
+                            transport_id = %packet.transport_id,
+                            same_path = path.same_path(),
+                            msg1_dg = %msg1_dg,
+                            "Rekey msg1 answered in an ended cycle, dropping the copy"
+                        ),
+                        InboundReject::OffLink => debug!(
+                            peer = %self.peer_display_name(&peer_node_addr),
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            same_path = path.same_path(),
+                            msg1_dg = %msg1_dg,
+                            "Same-epoch msg1 off the established link while that link is up, dropping"
+                        ),
+                        InboundReject::AtMaxPeers | InboundReject::SilentBackoff => unreachable!(),
+                    }
                 }
                 // `conn`/`link_id` were never inserted into the registry, so the
                 // local drop suffices — no cleanup needed.
@@ -854,8 +943,10 @@ impl Node {
                 // (`answer_msg1`).
                 debug_assert!(actions.is_empty());
                 if let Some(msg2) = msg2.as_deref() {
+                    // Each guard counts the line its arm logs; a suppressed
+                    // line falls through to the empty arm.
                     match self.answer_msg1(&peer_node_addr, &packet, msg2).await {
-                        Ok(_) => debug!(
+                        Ok(_) if self.shown(&peer_node_addr, HsLine::Resend) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             transport_id = %packet.transport_id,
                             remote_addr = %packet.remote_addr,
@@ -869,7 +960,7 @@ impl Node {
                             answers_it = %answers_it,
                             "Resent msg2 for duplicate msg1 (same epoch)"
                         ),
-                        Err(e) => debug!(
+                        Err(e) if self.shown(&peer_node_addr, HsLine::ResendFailed) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             error = %e,
                             transport_id = %packet.transport_id,
@@ -884,6 +975,7 @@ impl Node {
                             answers_it = %answers_it,
                             "Failed to resend msg2"
                         ),
+                        _ => {}
                     }
                 }
             }
@@ -892,15 +984,16 @@ impl Node {
                 // msg2 was lost, so give the same answer again, routed as the
                 // first answer was (`answer_msg1`).
                 debug_assert!(actions.is_empty());
+                // Each guard counts the line its arm logs, as above.
                 match self.answer_msg1(&peer, &packet, &msg2).await {
-                    Ok(_) => debug!(
+                    Ok(_) if self.shown(&peer, HsLine::RekeyResend) => debug!(
                         peer = %self.peer_display_name(&peer),
                         transport_id = %packet.transport_id,
                         remote_addr = %packet.remote_addr,
                         same_path = path.same_path(),
                         "Resent rekey msg2 for a resent msg1"
                     ),
-                    Err(e) => debug!(
+                    Err(e) if self.shown(&peer, HsLine::RekeyResendFailed) => debug!(
                         peer = %self.peer_display_name(&peer),
                         error = %e,
                         transport_id = %packet.transport_id,
@@ -908,6 +1001,7 @@ impl Node {
                         same_path = path.same_path(),
                         "Failed to resend rekey msg2"
                     ),
+                    _ => {}
                 }
             }
             InboundDecision::RekeyRespond {
@@ -1084,13 +1178,15 @@ impl Node {
                     .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS);
                 if peering_idle_ms < EPOCH_RESTART_MIN_INTERVAL_SECS * 1000 || dampened {
                     if replacing {
-                        debug!(
-                            peer = %self.peer_display_name(&peer),
-                            idle_ms = peering_idle_ms,
-                            dampened,
-                            "Same-epoch msg1 from a peer heard from within the interval, dropping"
-                        );
-                    } else {
+                        if self.shown(&peer, HsLine::Replace) {
+                            debug!(
+                                peer = %self.peer_display_name(&peer),
+                                idle_ms = peering_idle_ms,
+                                dampened,
+                                "Same-epoch msg1 from a peer heard from within the interval, dropping"
+                            );
+                        }
+                    } else if self.shown(&peer, HsLine::Restart) {
                         debug!(
                             peer = %self.peer_display_name(&peer),
                             idle_ms = peering_idle_ms,

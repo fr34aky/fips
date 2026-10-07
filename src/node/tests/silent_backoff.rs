@@ -12,6 +12,7 @@ use super::heartbeat::set_link_dead_timeout;
 use super::spanning_tree::{TestNode, cleanup_nodes, drain_all_packets, initiate_handshake};
 use super::*;
 use crate::config::Config;
+use crate::testutil::{capture_logs_scoped, log_field};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
@@ -20,6 +21,10 @@ const EPOCH: [u8; 8] = [7u8; 8];
 
 /// The same peer after a restart.
 const NEW_EPOCH: [u8; 8] = [8u8; 8];
+
+/// The line each refused msg1 logs.
+const REFUSAL: &str =
+    "Msg1 from a peer whose recent sessions carried no frame, refusing during its back-off";
 
 /// Idle long enough for a same-epoch msg1 to replace the session: past the
 /// 15 s liveness interval.
@@ -178,6 +183,31 @@ async fn three_silent_sessions_ended_by_link_dead_refuse_the_next_same_epoch_msg
 }
 
 #[tokio::test]
+async fn refused_msg1s_during_a_back_off_log_three_lines_then_one_suppression_notice() {
+    let mut rig = Rig::new().await;
+    three_reaped(&mut rig).await;
+    let refused = rig.silent_rejects();
+
+    let (logs, guard) = capture_logs_scoped();
+    for _ in 0..8 {
+        let data = rig.msg1(EPOCH);
+        rig.deliver(data).await;
+    }
+    drop(guard);
+
+    assert_eq!(logs.lines_with(REFUSAL).len(), 3, "{:#?}", logs.lines());
+    let notices = logs.lines_with("Suppressing repeated handshake lines for this peer");
+    assert_eq!(notices.len(), 1, "{:#?}", logs.lines());
+    assert_eq!(log_field(&notices[0], "kind"), Some("refused"));
+    assert_eq!(
+        rig.silent_rejects(),
+        refused + 8,
+        "every refusal is counted"
+    );
+    assert!(rig.link().is_none(), "nothing was promoted");
+}
+
+#[tokio::test]
 async fn three_silent_sessions_ended_by_replacement_refuse_the_next_same_epoch_msg1() {
     let mut rig = Rig::new().await;
     three_replaced(&mut rig).await;
@@ -321,6 +351,37 @@ async fn one_authenticated_frame_clears_the_count_so_three_more_silent_sessions_
         silent_session_of_node0(&mut nodes, 7).await,
         "the count went on from before the authenticated frame"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn the_first_frame_after_a_back_off_reports_how_many_refusal_lines_were_suppressed() {
+    let mut nodes = vec![
+        spanning_tree::make_test_node_with_config(Config::new(), 1280).await,
+        spanning_tree::make_test_node_with_config(Config::new(), 1280).await,
+    ];
+    let a = *nodes[0].node.node_addr();
+    set_link_dead_timeout(&mut nodes[1].node, 0);
+    for index in 1..=3 {
+        assert!(silent_session_of_node0(&mut nodes, index).await);
+        reap_node0(&mut nodes).await;
+    }
+    for index in 4..=8 {
+        assert!(!silent_session_of_node0(&mut nodes, index).await);
+    }
+
+    // Node 1's own dial completes, and node 0's first frame on it clears
+    // the record that refused five msg1s.
+    let (logs, guard) = capture_logs_scoped();
+    initiate_handshake(&mut nodes, 1, 0).await;
+    drain_all_packets(&mut nodes, false).await;
+    drop(guard);
+    assert!(nodes[1].node.get_peer(&a).is_some_and(|p| p.heard()));
+
+    let summaries = logs.lines_with("Suppressed repeated handshake lines");
+    assert_eq!(summaries.len(), 1, "{:#?}", logs.lines());
+    assert_eq!(log_field(&summaries[0], "refused"), Some("2"));
 
     cleanup_nodes(&mut nodes).await;
 }

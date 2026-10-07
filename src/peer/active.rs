@@ -5,6 +5,7 @@
 
 use crate::config::MmpConfig;
 use crate::node::REKEY_JITTER_SECS;
+use crate::node::diag::HsLineCounts;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
 use crate::proto::fmp::{AnsweredMsg1s, Msg1Digest, RekeyAnswer, RekeyRole};
@@ -300,6 +301,9 @@ pub struct ActivePeer {
     /// can be answered again, and the digests of ended cycles, so a copy of
     /// one is refused. Not cycle state: it outlives every pending.
     answered: AnsweredMsg1s,
+    /// Repeated handshake lines logged for this peer, by kind, so a peer
+    /// repeating one msg1 outcome logs it a bounded number of times.
+    hs_lines: HsLineCounts,
     /// Test-only: hold this peer entry on the K-bit-only pending trial, as a
     /// peer running the earlier gate would.
     #[cfg(test)]
@@ -350,6 +354,7 @@ impl ActivePeer {
             pending_since: None,
             pending_restart: false,
             answered: AnsweredMsg1s::default(),
+            hs_lines: HsLineCounts::default(),
             #[cfg(test)]
             old_gate: false,
             send: PeerSendState::new(link_id, now, authenticated_at),
@@ -436,6 +441,7 @@ impl ActivePeer {
             pending_since: None,
             pending_restart: false,
             answered: AnsweredMsg1s::default(),
+            hs_lines: HsLineCounts::default(),
             #[cfg(test)]
             old_gate: false,
             send,
@@ -579,7 +585,8 @@ impl ActivePeer {
     /// This replaces the entire session so both nodes use matching keys.
     ///
     /// Returns the old our_index so the caller can update peers_by_index.
-    /// Also resets the replay suppression counter since the session changed.
+    /// Also resets the replay suppression counter and the repeated handshake
+    /// line counts since the session changed.
     pub fn replace_session(
         &mut self,
         new_session: NoiseSession,
@@ -587,6 +594,7 @@ impl ActivePeer {
         new_their_index: SessionIndex,
     ) -> Option<SessionIndex> {
         self.reset_replay_suppressed();
+        self.hs_lines.roll();
         let old_our_index = self.send.our_index;
         self.send.noise_session = Some(new_session);
         self.send.our_index = Some(new_our_index);
@@ -654,6 +662,18 @@ impl ActivePeer {
     /// Current replay suppression count.
     pub fn replay_suppressed_count(&self) -> u32 {
         self.send.replay_suppressed_count
+    }
+
+    // === Repeated Handshake Lines ===
+
+    /// This peer's repeated handshake line counts.
+    pub(crate) fn hs_lines(&self) -> &HsLineCounts {
+        &self.hs_lines
+    }
+
+    /// This peer's repeated handshake line counts, to count a line.
+    pub(crate) fn hs_lines_mut(&mut self) -> &mut HsLineCounts {
+        &mut self.hs_lines
     }
 
     // === Decryption Failure Tracking ===
@@ -1333,6 +1353,7 @@ impl ActivePeer {
         self.rekey_msg1_resend_count = 0;
         self.rekey_jitter_secs = draw_rekey_jitter();
         self.reset_replay_suppressed();
+        self.hs_lines.roll();
 
         // Reset MMP counters to avoid metric discontinuity
         let now_ms = crate::time::mono_ms();
@@ -1378,6 +1399,7 @@ impl ActivePeer {
         self.rekey_msg1_resend_count = 0;
         self.rekey_jitter_secs = draw_rekey_jitter();
         self.reset_replay_suppressed();
+        self.hs_lines.roll();
 
         // Reset MMP counters to avoid metric discontinuity
         let now_ms = crate::time::mono_ms();
@@ -1576,6 +1598,7 @@ impl ActivePeer {
 mod tests {
     use super::*;
     use crate::Identity;
+    use crate::node::diag::HsLine;
 
     fn make_peer_identity() -> PeerIdentity {
         let identity = Identity::generate();
@@ -1974,6 +1997,41 @@ mod tests {
             &MmpConfig::default(),
             None,
         )
+    }
+
+    /// Count `n` pending-refusal lines on `peer` this session.
+    fn count_pending_lines(peer: &mut ActivePeer, n: u32) {
+        for _ in 0..n {
+            peer.hs_lines_mut().count(HsLine::Pending);
+        }
+    }
+
+    // Each session change carries what the session withheld and restarts the
+    // count, whichever side made the change.
+    #[test]
+    fn every_session_change_carries_the_withheld_handshake_lines_and_restarts_the_count() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+
+        count_pending_lines(&mut peer, 5);
+        let (_s, pend_recv) = ik_session_pair();
+        peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert!(peer.handle_peer_kbit_flip().is_some());
+        assert_eq!(peer.hs_lines_mut().count(HsLine::Pending), 1);
+
+        count_pending_lines(&mut peer, 3);
+        let (_s, pend_recv) = ik_session_pair();
+        peer.set_pending_session(pend_recv, SessionIndex::new(5), SessionIndex::new(6));
+        assert!(peer.cutover_to_new_session().is_some());
+
+        count_pending_lines(&mut peer, 6);
+        let (_s, next_recv) = ik_session_pair();
+        peer.replace_session(next_recv, SessionIndex::new(7), SessionIndex::new(8));
+
+        // 2 from the first session, 1 from the second, 3 from the third.
+        let carried = peer.hs_lines_mut().take_carried().expect("lines withheld");
+        assert_eq!(carried.of(HsLine::Pending), 6);
+        assert_eq!(peer.hs_lines().unreported(), None);
     }
 
     // A genuine new-epoch frame authenticates against `pending` and the

@@ -22,7 +22,7 @@ use crate::transport::{PacketRx, TransportHandle, packet_channel};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
-const EPOCH: [u8; 8] = [4u8; 8];
+pub(super) const EPOCH: [u8; 8] = [4u8; 8];
 
 /// The first four bytes of `bytes` as 8 lowercase hex characters.
 fn hex4(bytes: &[u8]) -> String {
@@ -30,7 +30,7 @@ fn hex4(bytes: &[u8]) -> String {
 }
 
 /// The tag a line should carry for the msg1 whose wire bytes are `wire`.
-fn msg1_tag(wire: &[u8]) -> String {
+pub(super) fn msg1_tag(wire: &[u8]) -> String {
     hex4(&Sha256::digest(wire))
 }
 
@@ -58,7 +58,12 @@ pub(super) fn field(line: &str, name: &str) -> String {
         .to_string()
 }
 
-fn packet(tid: TransportId, from: &TransportAddr, data: Vec<u8>, ts: u64) -> ReceivedPacket {
+pub(super) fn packet(
+    tid: TransportId,
+    from: &TransportAddr,
+    data: Vec<u8>,
+    ts: u64,
+) -> ReceivedPacket {
     ReceivedPacket {
         transport_id: tid,
         remote_addr: from.clone(),
@@ -68,7 +73,7 @@ fn packet(tid: TransportId, from: &TransportAddr, data: Vec<u8>, ts: u64) -> Rec
 }
 
 /// Discard every datagram already queued for `sock`.
-async fn drain(sock: &tokio::net::UdpSocket) {
+pub(super) async fn drain(sock: &tokio::net::UdpSocket) {
     let mut buf = [0u8; 2048];
     while timeout(Duration::from_millis(150), sock.recv_from(&mut buf))
         .await
@@ -77,7 +82,7 @@ async fn drain(sock: &tokio::net::UdpSocket) {
 }
 
 /// Stop the node's transport `tid`, so a send on it fails with `NotStarted`.
-async fn stop_transport(node: &mut Node, tid: TransportId) {
+pub(super) async fn stop_transport(node: &mut Node, tid: TransportId) {
     node.transports
         .get_mut(&tid)
         .expect("transport registered")
@@ -87,7 +92,7 @@ async fn stop_transport(node: &mut Node, tid: TransportId) {
 }
 
 /// Run `node.handle_msg1(p)` with its log lines captured.
-async fn msg1_logged(node: &mut Node, p: ReceivedPacket) -> LogCapture {
+pub(super) async fn msg1_logged(node: &mut Node, p: ReceivedPacket) -> LogCapture {
     let (logs, guard) = capture_logs_scoped();
     node.handle_msg1(p).await;
     drop(guard);
@@ -104,15 +109,15 @@ async fn msg2_logged(node: &mut Node, p: ReceivedPacket) -> LogCapture {
 
 /// A node with a UDP transport 1 and a peer promoted on it, its session aged
 /// `age` seconds.
-struct Established {
-    node: Node,
-    sock: tokio::net::UdpSocket,
-    addr: TransportAddr,
-    sender: Identity,
-    peer: NodeAddr,
+pub(super) struct Established {
+    pub(super) node: Node,
+    pub(super) sock: tokio::net::UdpSocket,
+    pub(super) addr: TransportAddr,
+    pub(super) sender: Identity,
+    pub(super) peer: NodeAddr,
 }
 
-async fn established(age: u64) -> Established {
+pub(super) async fn established(age: u64) -> Established {
     let mut node = make_node();
     let tid = TransportId::new(1);
     let (sock, addr) = register_udp_with_peer_socket(&mut node, tid).await;
@@ -133,7 +138,7 @@ async fn established(age: u64) -> Established {
 
 /// Arm a responder pending on `e` with a rekey msg1 carrying `sender_index`,
 /// returning that msg1's wire bytes.
-async fn arm_pending(e: &mut Established, sender_index: u32) -> Vec<u8> {
+pub(super) async fn arm_pending(e: &mut Established, sender_index: u32) -> Vec<u8> {
     let tid = TransportId::new(1);
     let x = craft_msg1_wire(
         &e.node,

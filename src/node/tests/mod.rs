@@ -23,6 +23,7 @@ mod discovery;
 mod establish_chartests;
 mod forwarding;
 mod handshake;
+mod handshake_lines;
 mod heartbeat;
 mod link_session_diag;
 mod link_setup_diag;
