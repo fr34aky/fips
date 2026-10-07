@@ -1,14 +1,15 @@
 //! A same-epoch msg1 from an established peer that arrives off the peer's
 //! established link, and copies of the msg1 a peering was set up from.
 //!
-//! Once a link session is 30 s old, a same-epoch msg1 from the peer is
-//! classified as a rekey. A peer that is already linked and dials a second
-//! path sends a link-setup msg1 there; answered as a rekey on the established
-//! link, it arms a responder pending the dialing peer never adopts, which
-//! refuses the peer's genuine rekeys for the whole hold. These tests drive
-//! real msg1s through `handle_msg1` from a second address or transport while
-//! the established UDP link works, and replay a peering's own setup msg1
-//! after the session has aged.
+//! Once a link is 30 s old, and 10 s have passed since its last rekey
+//! cutover, a same-epoch msg1 from the peer is classified as a rekey. A peer
+//! that is already linked and dials a second path sends a link-setup msg1
+//! there; answered as a rekey on the established link, it arms a responder
+//! pending the dialing peer never adopts, which refuses the peer's genuine
+//! rekeys for the whole hold. These tests drive real msg1s through
+//! `handle_msg1` from a second address or transport while the established
+//! UDP link works, and replay a peering's own setup msg1 after the session
+//! has aged.
 
 use super::establish_chartests::{
     arm_local_rekey, craft_msg1_wire, establish_active_peer_via_msg1,
@@ -68,9 +69,9 @@ fn bad_state(node: &Node) -> u64 {
 }
 
 /// A node peered over UDP transport 1 with a fresh sender at socket A, the
-/// session aged past the 30 s rekey floor, and a second socket B reachable
-/// on `second_transport`: transport 1 itself, or a second UDP transport the
-/// node also runs.
+/// link and session aged past the 30 s rekey floor, and a second socket B
+/// reachable on `second_transport`: transport 1 itself, or a second UDP
+/// transport the node also runs.
 struct SecondPath {
     node: Node,
     sender: Identity,
@@ -407,6 +408,92 @@ async fn a_link_setup_msg1_replayed_on_the_link_after_30_s_is_refused_and_arms_n
     let mut found = Vec::new();
     for setup in [Setup::Promote, Setup::Restart] {
         found.extend(replay_setup_msg1(setup).await);
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// Form the peering as `setup` says, with the peering a restart replaces
+/// aged 31 s, then backdate the new peering 12 s and resend its setup msg1
+/// on the link. Report what went wrong, if anything.
+async fn resend_setup_msg1_12_s_after_promotion(setup: Setup) -> Vec<String> {
+    let mut node = make_node();
+    let tid = TransportId::new(1);
+    let (sock_a, addr_a) = register_udp_with_peer_socket(&mut node, tid).await;
+    let sender = Identity::generate();
+    let sender_addr = *PeerIdentity::from_pubkey_full(sender.pubkey_full()).node_addr();
+    let first_epoch = [1u8; 8];
+    let restart_epoch = [2u8; 8];
+
+    let setup_msg1 = match setup {
+        Setup::Promote => {
+            let data = craft_msg1_wire(&node, &sender, first_epoch, SessionIndex::new(0x01), 1000);
+            deliver_msg1(&mut node, tid, &addr_a, data.clone(), 1000).await;
+            data
+        }
+        Setup::Restart => {
+            establish_active_peer_via_msg1(
+                &mut node,
+                &sender,
+                first_epoch,
+                tid,
+                &addr_a,
+                &sock_a,
+                1000,
+            )
+            .await;
+            node.get_peer_mut(&sender_addr)
+                .unwrap()
+                .test_backdate_session_established(Duration::from_secs(31));
+            let link_before = node.get_peer(&sender_addr).unwrap().link_id();
+            let data =
+                craft_msg1_wire(&node, &sender, restart_epoch, SessionIndex::new(0x02), 2000);
+            deliver_msg1(&mut node, tid, &addr_a, data.clone(), 2000).await;
+            assert_ne!(
+                node.get_peer(&sender_addr)
+                    .expect("precondition: the restart re-peers")
+                    .link_id(),
+                link_before,
+                "precondition: the restart formed a new link"
+            );
+            data
+        }
+    };
+    drain(&sock_a).await;
+    node.get_peer_mut(&sender_addr)
+        .expect("precondition: the peering was formed")
+        .test_backdate_session_established(Duration::from_secs(12));
+    let bad_before = bad_state(&node);
+
+    deliver_msg1(&mut node, tid, &addr_a, setup_msg1, 3000).await;
+
+    let mut found = Vec::new();
+    if node
+        .get_peer(&sender_addr)
+        .is_some_and(|p| p.pending_new_session().is_some())
+    {
+        found.push(format!("{setup:?}: the setup msg1 resend armed a pending"));
+    }
+    if !receives(&sock_a).await {
+        found.push(format!(
+            "{setup:?}: the setup msg1 resend drew no stored msg2"
+        ));
+    }
+    if bad_state(&node) != bad_before {
+        found.push(format!("{setup:?}: the setup msg1 resend was refused"));
+    }
+    stop_all(&mut node).await;
+    found
+}
+
+/// Within 30 s of a promotion, a resend of the setup msg1 draws the stored
+/// msg2, on a net-new peering and on one that replaced an aged peering at
+/// the peer's restart: the new peering's link is as young as it is.
+#[tokio::test]
+async fn a_resend_of_the_setup_msg1_within_30_s_of_a_net_new_or_restart_promotion_draws_the_stored_msg2_even_when_the_replaced_peering_was_aged()
+ {
+    let mut found = Vec::new();
+    for setup in [Setup::Promote, Setup::Restart] {
+        found.extend(resend_setup_msg1_12_s_after_promotion(setup).await);
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
 }

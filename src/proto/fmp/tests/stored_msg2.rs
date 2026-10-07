@@ -155,3 +155,45 @@ fn an_epoch_change_restarts_whatever_the_setup_match() {
         );
     }
 }
+
+#[test]
+fn a_link_under_30_s_old_follows_the_three_rules_even_with_a_session_over_10_s() {
+    let young_link = || {
+        let mut snap = young_snapshot();
+        snap.existing_link_age_secs = 29;
+        snap.existing_session_age_secs = 29;
+        snap
+    };
+    let found = three_rules(young_link, "link 29 s");
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn a_session_under_10_s_on_a_link_over_30_s_follows_the_three_rules() {
+    let young_session = || {
+        let mut snap = young_snapshot();
+        snap.existing_link_age_secs = 31;
+        snap.existing_session_age_secs = 9;
+        snap
+    };
+    let found = three_rules(young_session, "session 9 s");
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn a_link_of_30_s_with_a_session_of_10_s_is_classified_as_a_rekey() {
+    let mut snap = young_snapshot();
+    snap.existing_link_age_secs = 30;
+    snap.existing_session_age_secs = 10;
+    let decision = classify(&snap);
+    assert!(
+        matches!(
+            decision,
+            InboundDecision::RekeyRespond {
+                abandon_first: false,
+                ..
+            }
+        ),
+        "got {decision:?}"
+    );
+}

@@ -175,11 +175,12 @@ pub(crate) struct RekeyAnswer {
 
 /// How many msg1s of ended cycles one peer's [`AnsweredMsg1s`] remembers.
 ///
-/// A msg1 is answered as a rekey only on a session at least
-/// [`REKEY_MIN_SESSION_AGE_SECS`] old, so this covers at least two hours of
-/// the peer's cycles, and eight and a half at the default 120 s interval when
-/// the message-count trigger does not fire first. 32 bytes each, so 8 KiB per
-/// peer at most.
+/// A msg1 is answered as a rekey only once [`REKEY_MIN_CUTOVER_AGE_SECS`]
+/// have passed since the last cutover, so answered cycles are at least 10 s
+/// apart and this covers at least 43 minutes of the peer's cycles. Only a
+/// peer whose message-count trigger fires every 10 s, on a busy link, cycles
+/// that fast; at the default 120 s interval it covers eight and a half hours.
+/// 32 bytes each, so 8 KiB per peer at most.
 pub(crate) const ENDED_MSG1_RECORD: usize = 256;
 
 /// The rekey msg1s this node answered as the link-rekey responder for one
@@ -340,17 +341,24 @@ pub(crate) struct WireOutcome {
 /// core decides without touching live `Node` state or reading a clock.
 ///
 /// Produced by the [`EstablishView`] read-seam. Every clock read
-/// (`existing_session_age_secs`) is resolved shell-side into a plain `u64`, the
-/// same monotonic-ages asymmetry the rekey snapshot uses.
+/// (`existing_session_age_secs`, `existing_link_age_secs`) is resolved
+/// shell-side into a plain `u64`, the same monotonic-ages asymmetry the rekey
+/// snapshot uses.
 pub(crate) struct EstablishSnapshot {
     /// The peer is already an active peer in the registry.
     pub has_existing_peer: bool,
     /// The existing active peer's captured remote startup epoch, if any.
     pub existing_peer_epoch: Option<[u8; 8]>,
     /// Monotonic age in seconds of the existing peer's session
-    /// (`session_established_at().elapsed()`), resolved shell-side. `0` when
-    /// there is no existing peer.
+    /// (`session_established_at().elapsed()`), resolved shell-side: the time
+    /// since the last rekey cutover or adoption, or since promotion when
+    /// there has been none. `0` when there is no existing peer.
     pub existing_session_age_secs: u64,
+    /// Monotonic age in seconds of the existing peer's link
+    /// (`link_established_at().elapsed()`), resolved shell-side: the time
+    /// since promotion, or since a peer restart our rekey revealed. A rekey
+    /// cutover does not reset it. `0` when there is no existing peer.
+    pub existing_link_age_secs: u64,
     /// The existing peer has an established Noise session.
     pub has_session: bool,
     /// The existing peer's session is healthy.
@@ -536,12 +544,13 @@ pub(crate) enum InboundDecision {
     /// authorize → … → promote sequence as [`Promote`](InboundDecision::Promote).
     /// `peer` is the teardown / reconnect target.
     RestartThenPromote { peer: NodeAddr },
-    /// Same-epoch rekey msg1 on an aged, healthy session: respond as the rekey
-    /// responder. The shell extracts the fresh Noise session from the live
-    /// connection, allocates a new index, sends the rekey msg2, and stores the
-    /// session as the peer's pending (post-rekey) session. `abandon_first` is set
-    /// only on the dual-initiation *loser* path, where we first abandon our own
-    /// in-flight rekey. `peer` is the rekey target.
+    /// Same-epoch rekey msg1 on an aged, healthy link, past the drain window of
+    /// the last cutover: respond as the rekey responder. The shell extracts the
+    /// fresh Noise session from the live connection, allocates a new index,
+    /// sends the rekey msg2, and stores the session as the peer's pending
+    /// (post-rekey) session. `abandon_first` is set only on the
+    /// dual-initiation *loser* path, where we first abandon our own in-flight
+    /// rekey. `peer` is the rekey target.
     RekeyRespond { peer: NodeAddr, abandon_first: bool },
     /// A resend of the rekey msg1 that armed the responder pending this node
     /// holds: send `msg2`, the answer already given, again. The shell sends it
@@ -577,12 +586,12 @@ pub(crate) enum InboundReject {
     DualRekeyWon,
     /// The msg1 armed a rekey cycle with this peer that has already ended: a
     /// copy, not a fresh request, and it must not arm a pending. Also refused
-    /// on a session too young to rekey, where it would otherwise replace the
-    /// session.
+    /// on a link or session too young to rekey, where it would otherwise
+    /// replace the session.
     AnsweredBefore,
-    /// A same-epoch msg1 on a session old enough to rekey arrived off the
-    /// peer's established link while that link works: a second path, not a
-    /// rekey of this link.
+    /// A same-epoch msg1 on a link and session old enough to rekey arrived off
+    /// the peer's established link while that link works: a second path, not
+    /// a rekey of this link.
     OffLink,
 }
 
@@ -610,14 +619,23 @@ pub(crate) enum OutboundDecision {
     CrossConnectionKeep,
 }
 
-/// Minimum session age (seconds) before a same-epoch msg1 from an established
+/// Minimum link age (seconds) before a same-epoch msg1 from an established
 /// peer is treated as a rekey rather than a duplicate. Guards against
 /// misreading a simultaneous cross-connection msg1 as a rekey (both sides
-/// promote within a tick, so a genuine rekey cannot fire that fast). Unchanged
-/// from the pre-refactor literal. The age separates only that simultaneous
-/// case; a second path the peer opens later is told by where its msg1
-/// arrived.
-const REKEY_MIN_SESSION_AGE_SECS: u64 = 30;
+/// promote within a tick, so a genuine rekey cannot fire that fast). The age
+/// is the link's, from promotion or from a peer restart our rekey revealed;
+/// a rekey cutover does not restart it, since a crossing dial follows a
+/// promotion, not a rekey. The age separates only that simultaneous case; a
+/// second path the peer opens later is told by where its msg1 arrived.
+const REKEY_MIN_LINK_AGE_SECS: u64 = 30;
+
+/// Minimum time (seconds) since the last rekey cutover or adoption before a
+/// same-epoch msg1 from an established peer is treated as a rekey. A new
+/// cycle is not answered while the session that cutover replaced may still
+/// be draining: adopting it would overwrite the previous slot that session
+/// holds. Equal to the drain window, so the responder completing a drain as
+/// it arms a pending never retires a previous session early.
+pub(crate) const REKEY_MIN_CUTOVER_AGE_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SECS;
 
 /// Read-only view of the `Node` registry state the inbound establish decision
 /// needs about a peer whose msg1 has just been processed.
@@ -630,8 +648,8 @@ const REKEY_MIN_SESSION_AGE_SECS: u64 = 30;
 pub(crate) trait EstablishView {
     /// Snapshot the registry state relevant to classifying an inbound msg1 from
     /// `peer_addr`: the existing peer's epoch/session/rekey state (with the
-    /// session age resolved shell-side), the max-peers cap, and this node's own
-    /// address for the tie-break.
+    /// session and link ages resolved shell-side), the max-peers cap, and this
+    /// node's own address for the tie-break.
     /// `msg1` is the digest of the msg1 being classified, checked against the
     /// peer's record of answered msg1s. `arrival` is where it arrived and
     /// whether the peer's established link is reachable, from which the
@@ -834,7 +852,8 @@ impl Fmp {
                     let is_rekey = snap.rekey_enabled
                         && snap.has_session
                         && snap.is_healthy
-                        && snap.existing_session_age_secs >= REKEY_MIN_SESSION_AGE_SECS;
+                        && snap.existing_link_age_secs >= REKEY_MIN_LINK_AGE_SECS
+                        && snap.existing_session_age_secs >= REKEY_MIN_CUTOVER_AGE_SECS;
                     if !is_rekey {
                         // The stored msg2 names the setup msg1's sender index
                         // and completes no other handshake, so it answers only

@@ -1,8 +1,9 @@
 //! What a same-epoch msg1 from an established peer draws while the link
-//! session is too young to rekey.
+//! or its session is too young to rekey.
 //!
-//! For the first 30 s of a link session, and with rekeying off, a same-epoch
-//! msg1 from the peer is not a rekey. The msg2 stored when the link was set
+//! For the first 30 s after a link comes up, for the first 10 s after each
+//! rekey cutover, and with rekeying off, a same-epoch msg1 from the peer is
+//! not a rekey. The msg2 stored when the link was set
 //! up answers only the msg1 it was built for: it names that msg1's sender
 //! index and completes no other handshake. A peer that lost its side of the
 //! link and dials again sends a fresh msg1, which the stored msg2 cannot
@@ -24,8 +25,8 @@ use super::spanning_tree::{
     make_test_node_with_config, restarted_node,
 };
 use super::*;
-use crate::proto::fmp::Msg1Digest;
 use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG1};
+use crate::proto::fmp::{Msg1Digest, RekeyRole};
 
 /// How far back a silent peer's last authenticated frame is stamped: past
 /// the 15 s liveness interval.
@@ -680,4 +681,374 @@ async fn a_sibling_dial_arriving_3_s_after_promotion_on_a_slow_first_path_leaves
     heartbeat_decrypts(&mut nodes, l, s, "L to S").await;
     heartbeat_decrypts(&mut nodes, s, l, "S to L").await;
     cleanup_nodes(&mut nodes).await;
+}
+
+/// Which rekey put B's current session in place.
+#[derive(Clone, Copy, Debug)]
+enum LastCycle {
+    /// B rekeyed as the initiator and cut over.
+    OurCutover,
+    /// A rekeyed, and B adopted the session it answered.
+    OurAdoption,
+}
+
+/// A pair one rekey cycle past a link aged beyond the rekey trigger, B
+/// draining the session that cycle replaced.
+struct AfterCycle {
+    nodes: Vec<TestNode>,
+    a: usize,
+    b: usize,
+    a_addr: NodeAddr,
+    b_addr: NodeAddr,
+    /// B's index for the session it is draining.
+    p0: SessionIndex,
+    label: String,
+}
+
+/// Link A and B with B the dialler when `b_dialled`, age the link past the
+/// rekey trigger, and run one rekey cycle as `last` says, both ends ending
+/// on the new session. With `age` set, B's session and the drain the cycle
+/// began are then backdated together by it, the state a production node is
+/// in once that long has passed and no rekey tick has yet run.
+async fn after_cycle(last: LastCycle, b_dialled: bool, age: Option<Duration>) -> AfterCycle {
+    let (a, b) = if b_dialled { (1, 0) } else { (0, 1) };
+    let label = format!("{last:?}, B dialled {b_dialled}");
+    let mut nodes = linked_pair(rekey_config(60), rekey_config(60)).await;
+    let a_addr = addr(&nodes, a);
+    let b_addr = addr(&nodes, b);
+    age_link(&mut nodes, a, b, trigger_age());
+    match last {
+        LastCycle::OurCutover => {
+            rekey_to_pending(&mut nodes, b, a).await;
+            cutover(&mut nodes[b], &a_addr).await;
+            heartbeat(&mut nodes[b], &a_addr).await;
+            deliver(&mut nodes[a]).await;
+        }
+        LastCycle::OurAdoption => {
+            rekey_to_pending(&mut nodes, a, b).await;
+            cutover(&mut nodes[a], &b_addr).await;
+            heartbeat(&mut nodes[a], &b_addr).await;
+            deliver(&mut nodes[b]).await;
+        }
+    }
+    for (x, peer) in [(a, b_addr), (b, a_addr)] {
+        let p = nodes[x].node.get_peer(&peer).unwrap();
+        assert!(
+            p.pending_new_session().is_none() && p.is_draining(),
+            "precondition ({label}): both ends are on the new session and draining the old"
+        );
+    }
+    let p0 = nodes[b]
+        .node
+        .get_peer(&a_addr)
+        .unwrap()
+        .previous_our_index()
+        .expect("precondition: B holds the index of the session it is draining");
+    if let Some(age) = age {
+        let p = nodes[b].node.get_peer_mut(&a_addr).unwrap();
+        p.test_backdate_session_established(age);
+        p.test_backdate_drain_started(age);
+    }
+    AfterCycle {
+        nodes,
+        a,
+        b,
+        a_addr,
+        b_addr,
+        p0,
+        label,
+    }
+}
+
+/// Refresh A at B with a heartbeat, then make A start its next rekey. A's
+/// own drain is backdated past its window first, so its tick completes that
+/// drain before it initiates. Returns A's rekey msg1, the one packet left
+/// queued at B.
+async fn peer_rekeys(c: &mut AfterCycle) -> ReceivedPacket {
+    let (a, b) = (c.a, c.b);
+    heartbeat(&mut c.nodes[a], &c.b_addr).await;
+    assert_eq!(
+        deliver(&mut c.nodes[b]).await,
+        1,
+        "precondition ({}): only A's heartbeat is queued at B",
+        c.label
+    );
+    assert!(
+        idle_ms(&c.nodes[b], &c.a_addr) < 15_000,
+        "precondition ({}): B heard from A within 15 s",
+        c.label
+    );
+    {
+        let p = c.nodes[a].node.get_peer_mut(&c.b_addr).unwrap();
+        p.test_backdate_session_established(trigger_age());
+        p.test_backdate_drain_started(Duration::from_secs(12));
+        p.backdate_dampener(Duration::from_secs(31));
+    }
+    c.nodes[a].node.check_rekey().await;
+    let p = c.nodes[a].node.get_peer(&c.b_addr).unwrap();
+    assert!(
+        p.rekey_in_progress() && !p.is_draining(),
+        "precondition ({}): A completed its drain and started a rekey",
+        c.label
+    );
+    let msg1 = c.nodes[b]
+        .packet_rx
+        .try_recv()
+        .expect("precondition: A's rekey msg1 is queued at B");
+    assert_eq!(
+        CommonPrefix::parse(&msg1.data).map(|p| p.phase),
+        Some(PHASE_MSG1),
+        "precondition ({}): the packet queued at B is a msg1",
+        c.label
+    );
+    assert!(
+        c.nodes[b].packet_rx.is_empty(),
+        "precondition ({}): only A's rekey msg1 is queued at B",
+        c.label
+    );
+    msg1
+}
+
+/// How many `peers_by_index` entries at `tn` name `peer`.
+fn index_entries(tn: &TestNode, peer: &NodeAddr) -> usize {
+    tn.node
+        .peers_by_index
+        .values()
+        .filter(|p| *p == peer)
+        .count()
+}
+
+/// Whether `tn` still maps `index` on `peer`'s transport.
+fn maps_index(tn: &TestNode, peer: &NodeAddr, index: SessionIndex) -> bool {
+    let tid = tn.node.get_peer(peer).unwrap().transport_id().unwrap();
+    tn.node.peers_by_index.contains_key(&(tid, index.as_u32()))
+}
+
+/// B has just handled A's rekey msg1, which it must have answered: check B
+/// armed a responder pending, retired its expired drain and freed its index,
+/// sent exactly the msg2, and then adopted the session on A's first frame.
+/// Returns what went wrong.
+async fn answered_and_adopted(c: &mut AfterCycle, bad_before: u64) -> Vec<String> {
+    let (a, b, label) = (c.a, c.b, c.label.clone());
+    let mut found = Vec::new();
+    let pending = {
+        let p = c.nodes[b].node.get_peer(&c.a_addr).unwrap();
+        if p.pending_role() != Some(RekeyRole::Responder) {
+            found.push(format!(
+                "{label}: B holds pending role {:?}, not a responder pending",
+                p.pending_role()
+            ));
+        }
+        if p.is_draining() {
+            found.push(format!("{label}: B is still draining after arming"));
+        }
+        p.pending_our_index()
+    };
+    if maps_index(&c.nodes[b], &c.a_addr, c.p0) {
+        found.push(format!("{label}: B still maps the drained session's index"));
+    }
+    if bad_state(&c.nodes[b]) != bad_before {
+        found.push(format!("{label}: B counted the rekey msg1 as refused"));
+    }
+    let queued = deliver(&mut c.nodes[a]).await;
+    let a_role = c.nodes[a].node.get_peer(&c.b_addr).unwrap().pending_role();
+    if queued != 1 || a_role != Some(RekeyRole::Initiator) {
+        found.push(format!(
+            "{label}: {queued} packet(s) reached A, leaving it with pending role {a_role:?}"
+        ));
+    }
+    if !found.is_empty() {
+        return found;
+    }
+
+    let link = c.nodes[b].node.get_peer(&c.a_addr).unwrap().link_id();
+    cutover(&mut c.nodes[a], &c.b_addr).await;
+    heartbeat(&mut c.nodes[a], &c.b_addr).await;
+    deliver(&mut c.nodes[b]).await;
+    let p = c.nodes[b].node.get_peer(&c.a_addr).unwrap();
+    if p.our_index() != pending {
+        found.push(format!(
+            "{label}: A's first frame did not promote B's pending"
+        ));
+    }
+    if p.link_id() != link {
+        found.push(format!("{label}: B's link changed"));
+    }
+    if failures(&c.nodes[b], &c.a_addr) != 0 {
+        found.push(format!("{label}: B failed to decrypt A's frame"));
+    }
+    let entries = index_entries(&c.nodes[b], &c.a_addr);
+    if entries != 2 {
+        found.push(format!(
+            "{label}: B maps {entries} indices to A, not its current and previous"
+        ));
+    }
+    found
+}
+
+/// Every combination of the last cycle's kind and which end dialled.
+fn cycle_cases() -> [(LastCycle, bool); 4] {
+    [
+        (LastCycle::OurCutover, false),
+        (LastCycle::OurCutover, true),
+        (LastCycle::OurAdoption, false),
+        (LastCycle::OurAdoption, true),
+    ]
+}
+
+/// On a link far older than 30 s, A rekeys 12 s after B's last cutover or
+/// adoption. B must answer it as a rekey, retiring the drain that has
+/// passed but that no tick has completed, and adopt the new session on A's
+/// first frame, leaving only its current and previous indices mapped.
+#[tokio::test]
+async fn a_peers_rekey_msg1_12_s_after_our_last_cutover_on_a_link_older_than_30_s_is_answered_adopted_and_leaks_no_index()
+ {
+    let mut found = Vec::new();
+    for (last, b_dialled) in cycle_cases() {
+        let mut c = after_cycle(last, b_dialled, Some(Duration::from_secs(12))).await;
+        let msg1 = peer_rekeys(&mut c).await;
+        let bad_before = bad_state(&c.nodes[c.b]);
+        c.nodes[c.b].node.handle_msg1(msg1).await;
+        found.extend(answered_and_adopted(&mut c, bad_before).await);
+        cleanup_nodes(&mut c.nodes).await;
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// B has just handled A's rekey msg1 inside the drain window: check it was
+/// dropped, and that B's draining session is still registered. Returns what
+/// went wrong.
+fn dropped_inside_the_drain(c: &AfterCycle, bad_before: u64) -> Vec<String> {
+    let label = &c.label;
+    let mut found = Vec::new();
+    let p = c.nodes[c.b].node.get_peer(&c.a_addr).unwrap();
+    if p.pending_new_session().is_some() {
+        found.push(format!("{label}: B armed a pending inside the drain"));
+    }
+    if !p.is_draining() || !maps_index(&c.nodes[c.b], &c.a_addr, c.p0) {
+        found.push(format!(
+            "{label}: B's draining session lost its registration"
+        ));
+    }
+    if !c.nodes[c.a].packet_rx.is_empty() {
+        found.push(format!("{label}: B answered the msg1"));
+    }
+    if bad_state(&c.nodes[c.b]) != bad_before + 1 {
+        found.push(format!("{label}: B did not count the dropped msg1"));
+    }
+    found
+}
+
+/// Under 10 s after B's last cutover or adoption, A's rekey msg1 is dropped
+/// while A is live, and the session B is draining stays registered.
+#[tokio::test]
+async fn a_peers_rekey_msg1_inside_10_s_of_our_last_cutover_is_dropped_and_leaves_the_draining_session_registered()
+ {
+    let mut found = Vec::new();
+    for (last, b_dialled) in cycle_cases() {
+        let mut c = after_cycle(last, b_dialled, None).await;
+        let msg1 = peer_rekeys(&mut c).await;
+        let bad_before = bad_state(&c.nodes[c.b]);
+        c.nodes[c.b].node.handle_msg1(msg1).await;
+        found.extend(dropped_inside_the_drain(&c, bad_before));
+        cleanup_nodes(&mut c.nodes).await;
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// A's rekey msg1, dropped under 10 s after B's last cutover or adoption, is
+/// resent once B's session and drain read 12 s. The resend must be answered
+/// and adopted: the dropped copy left nothing in B's record of answered
+/// msg1s.
+#[tokio::test]
+async fn a_peers_rekey_msg1_dropped_inside_10_s_of_our_cutover_is_answered_and_adopted_when_resent_after_10_s()
+ {
+    let mut found = Vec::new();
+    for (last, b_dialled) in cycle_cases() {
+        let mut c = after_cycle(last, b_dialled, None).await;
+        let msg1 = peer_rekeys(&mut c).await;
+        let (source, bytes) = (msg1.remote_addr.clone(), msg1.data.clone());
+        let bad_before = bad_state(&c.nodes[c.b]);
+        c.nodes[c.b].node.handle_msg1(msg1).await;
+        let dropped = dropped_inside_the_drain(&c, bad_before);
+        if !dropped.is_empty() {
+            found.extend(dropped);
+            cleanup_nodes(&mut c.nodes).await;
+            continue;
+        }
+
+        {
+            let p = c.nodes[c.b].node.get_peer_mut(&c.a_addr).unwrap();
+            p.test_backdate_session_established(Duration::from_secs(12));
+            p.test_backdate_drain_started(Duration::from_secs(12));
+        }
+        let bad_before = bad_state(&c.nodes[c.b]);
+        msg1_at(&mut c.nodes[c.b], &source, bytes).await;
+        found.extend(answered_and_adopted(&mut c, bad_before).await);
+        cleanup_nodes(&mut c.nodes).await;
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// 12 s after B's own cutover on an aged link, a fresh msg1 with A's
+/// identity and epoch arrives off the link while the link works. Whether A
+/// is silent at B or live, it must be refused: B keeps its link and index,
+/// arms nothing and answers nothing, and B's frames still decrypt at A.
+#[tokio::test]
+async fn an_off_link_msg1_from_a_peer_silent_for_16_s_12_s_after_our_cutover_on_an_aged_link_is_refused_and_keeps_the_peering()
+ {
+    let mut found = Vec::new();
+    for b_dialled in [false, true] {
+        for (heard, ago_ms) in [("silent", SILENT_MS), ("live", RECENT_MS)] {
+            let mut c = after_cycle(
+                LastCycle::OurCutover,
+                b_dialled,
+                Some(Duration::from_secs(12)),
+            )
+            .await;
+            let (a, b) = (c.a, c.b);
+            let label = format!("{}, {heard}", c.label);
+            let (link, ours) = {
+                let p = c.nodes[b].node.get_peer(&c.a_addr).unwrap();
+                (p.link_id(), p.our_index())
+            };
+            let bad_before = bad_state(&c.nodes[b]);
+            last_heard(&mut c.nodes[b], &c.a_addr, ago_ms);
+            let a_identity = c.nodes[a].node.identity().clone();
+            let a_epoch = c.nodes[a].node.startup_epoch();
+            let off_link = add_loopback_alias(&c.nodes[a].addr);
+            let data = craft_msg1_wire(
+                &c.nodes[b].node,
+                &a_identity,
+                a_epoch,
+                SessionIndex::new(0x5353),
+                Node::now_ms(),
+            );
+            msg1_at(&mut c.nodes[b], &off_link, data).await;
+
+            let before = found.len();
+            match c.nodes[b].node.get_peer(&c.a_addr) {
+                Some(p) if p.link_id() == link && p.our_index() == ours => {
+                    if p.pending_new_session().is_some() {
+                        found.push(format!("{label}: B armed a pending"));
+                    }
+                }
+                _ => found.push(format!("{label}: B's peering changed")),
+            }
+            if !c.nodes[a].packet_rx.is_empty() {
+                found.push(format!("{label}: the off-link msg1 drew an answer"));
+            }
+            if c.nodes[b].node.connection_count() != 0 {
+                found.push(format!("{label}: the msg1 left a connection at B"));
+            }
+            if bad_state(&c.nodes[b]) != bad_before + 1 {
+                found.push(format!("{label}: B did not count the refused msg1"));
+            }
+            if found.len() == before {
+                heartbeat_decrypts(&mut c.nodes, b, a, &label).await;
+            }
+            cleanup_nodes(&mut c.nodes).await;
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
 }
