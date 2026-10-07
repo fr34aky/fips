@@ -41,7 +41,8 @@ mod tests;
 pub(crate) use core::{
     AnsweredMsg1s, ConnAction, ConnSnapshot, EstablishSnapshot, EstablishView, InboundDecision,
     InboundReject, LifecycleView, Msg1Arrival, Msg1Digest, OutboundDecision, OutboundSnapshot,
-    PeerSnapshot, RekeyAnswer, RekeyCfg, RekeyResendSnapshot, RekeyRole, WireOutcome,
+    PeerSnapshot, REKEY_MIN_CUTOVER_AGE_SECS, RekeyAnswer, RekeyCfg, RekeyResendSnapshot,
+    RekeyRole, WireOutcome,
 };
 pub use core::{PromotionResult, cross_connection_winner};
 pub(crate) use limits::backoff_ms;

@@ -2359,8 +2359,9 @@ async fn replay_link_msg1_after_its_cycle(
 }
 
 /// [`replay_link_msg1_after_its_cycle`], with the replay sent either past the
-/// 30 s floor (`past_floor`) or straight after the last cutover, while a
-/// same-epoch msg1 is still taken as a duplicate of the link setup.
+/// rekey floors (`past_floor`) or straight after the last cutover, inside the
+/// 10 s in which a same-epoch msg1 is still taken as a duplicate of the link
+/// setup.
 async fn replay_link_msg1(
     source: ReplaySource,
     probe: ReplayProbe,
@@ -2590,7 +2591,7 @@ async fn a_link_msg1_replayed_from_an_earlier_cycle_does_not_block_the_peers_nex
 }
 
 /// A link msg1 replayed from an address the node has no link with, inside the
-/// 30 s after a cutover, is taken as a duplicate of the link setup. The stored
+/// 10 s after a cutover, is taken as a duplicate of the link setup. The stored
 /// setup msg2 it draws goes to the peer's established link, never to the
 /// address the copy came from, and nothing else changes.
 #[tokio::test]

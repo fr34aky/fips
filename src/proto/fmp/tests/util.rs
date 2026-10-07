@@ -81,6 +81,7 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
         has_existing_peer: false,
         existing_peer_epoch: None,
         existing_session_age_secs: 0,
+        existing_link_age_secs: 0,
         has_session: false,
         pending_new_session: false,
         rekey_in_progress: false,

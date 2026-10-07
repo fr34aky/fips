@@ -27,6 +27,11 @@ use tracing::{debug, info, trace, warn};
 /// in `crate::proto::fsp::limits`.
 const DRAIN_WINDOW_SECS: u64 = 10;
 
+// A rekey msg1 is answered only once this drain window has passed since the
+// last cutover; a shorter floor would let the responder arm complete a drain
+// early.
+const _: () = assert!(DRAIN_WINDOW_SECS <= crate::proto::fmp::REKEY_MIN_CUTOVER_AGE_SECS);
+
 /// Suppress local rekey initiation for this long after receiving
 /// a peer's rekey msg1. FMP-scoped copy for `check_rekey`.
 const REKEY_DAMPENING_SECS: u64 = 30;
@@ -208,7 +213,11 @@ impl Node {
     /// between snapshot and effect, the old inline body was a no-op, so we do
     /// nothing; if the machine is absent (which should be impossible) we fall
     /// back to the byte-identical inline body under a `debug_assert`.
-    async fn route_rekey_cadence(&mut self, node_addr: NodeAddr, action: ConnAction) {
+    pub(in crate::node) async fn route_rekey_cadence(
+        &mut self,
+        node_addr: NodeAddr,
+        action: ConnAction,
+    ) {
         let link = match self.peers.get(&node_addr) {
             Some(peer) => peer.link_id(),
             None => return,

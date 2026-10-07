@@ -431,6 +431,7 @@ fn establish_inbound_aged_session_rekey_responds() {
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     let wire = wire_outcome(Some([7u8; 8]));
     let peer = *wire.peer_identity.node_addr();
     assert!(matches!(
@@ -449,6 +450,7 @@ fn establish_inbound_rekey_gate_requires_enabled() {
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap.rekey_enabled = false;
     snap.setup_match = true;
     let wire = wire_outcome(Some([7u8; 8]));
@@ -460,7 +462,7 @@ fn establish_inbound_rekey_gate_requires_enabled() {
 
 #[test]
 fn establish_inbound_rekey_gate_boundary_at_30s() {
-    // Exactly 30s satisfies `>= 30` → rekey; 29s does not → duplicate.
+    // A link of exactly 30s satisfies `>= 30` → rekey; 29s does not → duplicate.
     let fmp = Fmp::new();
     let mut snap = establish_snapshot();
     snap.has_existing_peer = true;
@@ -470,12 +472,40 @@ fn establish_inbound_rekey_gate_boundary_at_30s() {
     snap.setup_match = true;
 
     snap.existing_session_age_secs = 30;
+    snap.existing_link_age_secs = 30;
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),
         InboundDecision::RekeyRespond { .. }
     ));
 
     snap.existing_session_age_secs = 29;
+    snap.existing_link_age_secs = 29;
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::ResendMsg2 { .. }
+    ));
+}
+
+#[test]
+fn establish_inbound_rekey_gate_boundary_at_10s_of_session_age_on_a_31s_link() {
+    // On a link past 30s, 10s since the last cutover satisfies `>= 10` →
+    // rekey; 9s does not → duplicate.
+    let fmp = Fmp::new();
+    let mut snap = establish_snapshot();
+    snap.has_existing_peer = true;
+    snap.existing_peer_epoch = Some([7u8; 8]);
+    snap.has_session = true;
+    snap.existing_link_age_secs = 31;
+    let wire = wire_outcome(Some([7u8; 8]));
+    snap.setup_match = true;
+
+    snap.existing_session_age_secs = 10;
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::RekeyRespond { .. }
+    ));
+
+    snap.existing_session_age_secs = 9;
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),
         InboundDecision::ResendMsg2 { .. }
@@ -490,6 +520,7 @@ fn establish_inbound_pending_session_rejects() {
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap.pending_new_session = true;
     let wire = wire_outcome(Some([7u8; 8]));
     assert!(matches!(
@@ -508,6 +539,7 @@ fn snapshot_holding_an_answer(armed_by: &[u8]) -> crate::proto::fmp::EstablishSn
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap.pending_new_session = true;
     snap.held_answer = Some(RekeyAnswer {
         msg1: Msg1Digest::of(armed_by),
@@ -662,6 +694,7 @@ fn establish_inbound_dual_init_we_win_rejects() {
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap.rekey_in_progress = true;
     snap.our_node_addr = make_node_addr(0x00); // minimal → strictly smaller
     let wire = wire_outcome(Some([7u8; 8]));
@@ -683,6 +716,7 @@ fn establish_inbound_dual_init_we_lose_responds_with_abandon() {
     snap.existing_peer_epoch = Some([7u8; 8]);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap.rekey_in_progress = true;
     snap.our_node_addr = max_node_addr(); // strictly larger than any peer addr
     let wire = wire_outcome(Some([7u8; 8]));

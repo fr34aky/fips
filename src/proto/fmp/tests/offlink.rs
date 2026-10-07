@@ -12,15 +12,16 @@ use crate::proto::fmp::{
 /// The epoch the existing peer and the msg1 share.
 const EPOCH: [u8; 8] = [7u8; 8];
 
-/// An existing peer at [`EPOCH`] with a session aged past the 30 s rekey
-/// floor and nothing pending: the state in which a same-epoch msg1 is
-/// classified as a rekey.
+/// An existing peer at [`EPOCH`] with a link aged past the 30 s rekey floor,
+/// a session past the 10 s drain floor, and nothing pending: the state in
+/// which a same-epoch msg1 is classified as a rekey.
 pub(super) fn aged_snapshot() -> EstablishSnapshot {
     let mut snap = establish_snapshot();
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some(EPOCH);
     snap.has_session = true;
     snap.existing_session_age_secs = 31;
+    snap.existing_link_age_secs = 31;
     snap
 }
 
@@ -150,6 +151,7 @@ fn an_off_link_msg1_under_30_s_still_gets_the_stored_msg2() {
     let fmp = Fmp::new();
     let mut snap = aged_snapshot();
     snap.existing_session_age_secs = 29;
+    snap.existing_link_age_secs = 29;
     snap.existing_msg2 = Some(vec![0x02; 4]);
     snap.setup_match = true;
     snap.msg1_on_link = false;
@@ -180,4 +182,26 @@ fn a_link_setup_msg1_recorded_at_promotion_is_answered_before() {
     );
     assert!(record.ended(&digest(0)));
     assert!(record.ended(&digest(ENDED_MSG1_RECORD - 1)));
+}
+
+#[test]
+fn an_off_link_msg1_on_a_link_over_30_s_with_a_session_over_10_s_is_refused_as_off_link() {
+    // A cutover 12 s ago on a link long up: the msg1 is classified as a
+    // rekey, and off the working link it is refused as a second path.
+    let fmp = Fmp::new();
+    let mut snap = aged_snapshot();
+    snap.existing_link_age_secs = 31;
+    snap.existing_session_age_secs = 12;
+    snap.msg1_on_link = false;
+    snap.link_reachable = true;
+    let decision = fmp.establish_inbound(&snap, &wire_outcome(Some(EPOCH)));
+    assert!(
+        matches!(
+            decision,
+            InboundDecision::Reject {
+                reason: InboundReject::OffLink
+            }
+        ),
+        "got {decision:?}"
+    );
 }

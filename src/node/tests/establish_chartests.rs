@@ -20,13 +20,14 @@
 //!   * rekey dual-init (we lose)  → `chartest_msg1_rekey_dual_init_we_lose_becomes_responder`
 //!
 //! The three rekey branches sit behind the hardcoded
-//! `existing_session_age_secs >= 30` guard in `handle_msg1`, resolved from
-//! `ActivePeer::session_established_at()` (a monotonic `std::time::Instant`
-//! with no natural test seam — the field is private and `tokio::time` cannot
-//! advance a std `Instant`). They are unblocked by the sole `#[cfg(test)]`
-//! production seam `ActivePeer::test_backdate_session_established(age)`, which
-//! only shifts that private timestamp — it changes no decision logic and no
-//! threshold, and is compiled out of release builds.
+//! `existing_link_age_secs >= 30` and `existing_session_age_secs >= 10`
+//! guards in `handle_msg1`, resolved from `ActivePeer::link_established_at()`
+//! and `session_established_at()` (monotonic `std::time::Instant`s with no
+//! natural test seam — the fields are private and `tokio::time` cannot
+//! advance a std `Instant`). They are unblocked by the `#[cfg(test)]` seam
+//! `ActivePeer::test_backdate_session_established(age)`, which only shifts
+//! those private timestamps — it changes no decision logic and no threshold,
+//! and is compiled out of release builds.
 
 use super::*;
 use crate::config::UdpConfig;
@@ -673,7 +674,7 @@ async fn chartest_cross_connection_tiebreak_winner_and_loser() {
 // ===========================================================================
 // Rekey establish branches (unblocked by the `#[cfg(test)]`
 // `ActivePeer::test_backdate_session_established` seam that lets a test age a
-// real session past the hardcoded 30s rekey gate in `handle_msg1`).
+// real link and session past the hardcoded rekey gates in `handle_msg1`).
 // ===========================================================================
 
 /// Drive a real inbound msg1 through `handle_msg1` so `node` promotes an active

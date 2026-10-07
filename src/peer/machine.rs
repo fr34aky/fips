@@ -1934,6 +1934,7 @@ mod tests {
             has_existing_peer: false,
             existing_peer_epoch: None,
             existing_session_age_secs: 0,
+            existing_link_age_secs: 0,
             has_session: false,
             pending_new_session: false,
             rekey_in_progress: false,
@@ -2187,6 +2188,7 @@ mod tests {
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
             est.existing_session_age_secs = 120;
+            est.existing_link_age_secs = 120;
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);
 
@@ -2225,6 +2227,7 @@ mod tests {
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
             est.existing_session_age_secs = 120;
+            est.existing_link_age_secs = 120;
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);
 

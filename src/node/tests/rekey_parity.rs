@@ -40,8 +40,9 @@ pub(super) fn rekey_config(after_secs: u64) -> crate::config::Config {
     config
 }
 
-/// A session age past the jittered rekey trigger, and past the 30 s floor
-/// below which a msg1 from an established peer is a duplicate, not a rekey.
+/// A session age past the jittered rekey trigger, and past the 30 s link
+/// floor below which a msg1 from an established peer is a duplicate, not a
+/// rekey. Backdating a session this far ages its link with it.
 pub(super) fn trigger_age() -> Duration {
     Duration::from_secs(REKEY_AFTER_SECS + crate::node::REKEY_JITTER_SECS as u64 + 1)
 }
@@ -685,4 +686,103 @@ async fn an_alternate_path_dial_on_an_aged_session_leaves_both_ends_able_to_auth
     );
 
     cleanup_nodes(&mut nodes).await;
+}
+
+/// Hand A a fresh msg1 with the restarted B's identity and startup epoch,
+/// arriving from B's address on A's established link, after discarding
+/// whatever was queued at B. Returns whether anything A sent in answer is a
+/// msg2 queued at B.
+async fn crossing_dial_from_restarted_peer(r: &mut RestartedPeer) -> bool {
+    while r.nodes[1].packet_rx.try_recv().is_ok() {}
+    let b_identity = r.nodes[1].node.identity().clone();
+    let b_epoch = r.nodes[1].node.startup_epoch();
+    let source = r.nodes[0]
+        .node
+        .get_peer(&r.b_addr)
+        .unwrap()
+        .current_addr()
+        .cloned()
+        .expect("precondition: A holds B's link address");
+    let data = super::establish_chartests::craft_msg1_wire(
+        &r.nodes[0].node,
+        &b_identity,
+        b_epoch,
+        SessionIndex::new(0x7171),
+        Node::now_ms(),
+    );
+    let transport_id = r.nodes[0].transport_id;
+    r.nodes[0]
+        .node
+        .handle_msg1(ReceivedPacket::with_timestamp(
+            transport_id,
+            source,
+            data,
+            Node::now_ms(),
+        ))
+        .await;
+    std::iter::from_fn(|| r.nodes[1].packet_rx.try_recv().ok())
+        .any(|p| CommonPrefix::parse(&p.data).map(|c| c.phase) == Some(PHASE_MSG2))
+}
+
+/// Our rekey revealed B's restart, and A has cut over to the session it
+/// produced. 12 s later a crossing dial from B, which promoted A's msg1 as
+/// a fresh link, must not be taken for a rekey: the link A shares with the
+/// restarted B is 12 s old, however old A's peering is.
+#[tokio::test]
+async fn a_peer_restart_revealed_by_our_rekey_restarts_our_link_age_so_its_crossing_dial_is_not_taken_for_a_rekey()
+ {
+    let mut r = restart_revealed_by_our_rekey().await;
+    let b_addr = r.b_addr;
+    cutover(&mut r.nodes[0], &b_addr).await;
+    deliver_held(&mut r).await;
+    let link = {
+        let p = r.nodes[0].node.get_peer_mut(&b_addr).unwrap();
+        p.test_backdate_session_established(Duration::from_secs(12));
+        p.test_backdate_drain_started(Duration::from_secs(12));
+        p.link_id()
+    };
+
+    let answered = crossing_dial_from_restarted_peer(&mut r).await;
+
+    let p = r.nodes[0].node.get_peer(&b_addr).expect("A keeps B");
+    assert!(
+        p.pending_new_session().is_none(),
+        "the crossing dial must arm no pending"
+    );
+    assert_eq!(p.link_id(), link, "A's peering must keep its link");
+    assert!(!answered, "the crossing dial must draw no msg2");
+    cleanup_nodes(&mut r.nodes).await;
+}
+
+/// Our rekey revealed B's restart, and A still holds the pending it
+/// produced. A crossing dial from B, silent at A for 16 s, must be refused
+/// while the pending is held: A keeps its pending and its link, and the
+/// cutover then proceeds.
+#[tokio::test]
+async fn a_resent_dial_from_a_silent_restarted_peer_while_our_restart_pending_is_held_is_refused_and_keeps_the_link()
+ {
+    let mut r = restart_revealed_by_our_rekey().await;
+    let b_addr = r.b_addr;
+    let link = {
+        let p = r.nodes[0].node.get_peer_mut(&b_addr).unwrap();
+        p.touch(Node::now_ms() - 16_000);
+        p.link_id()
+    };
+
+    let answered = crossing_dial_from_restarted_peer(&mut r).await;
+
+    let p = r.nodes[0]
+        .node
+        .get_peer(&b_addr)
+        .expect("A must keep its peering with B");
+    assert_eq!(p.link_id(), link, "A's peering must keep its link");
+    assert_eq!(
+        p.pending_our_index(),
+        Some(r.pending_index),
+        "A must keep the pending its rekey produced"
+    );
+    assert!(!answered, "the crossing dial must draw no msg2");
+    cutover(&mut r.nodes[0], &b_addr).await;
+    deliver_held(&mut r).await;
+    cleanup_nodes(&mut r.nodes).await;
 }

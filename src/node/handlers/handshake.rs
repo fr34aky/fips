@@ -89,6 +89,9 @@ impl EstablishView for Node {
             existing_session_age_secs: existing
                 .map(|p| p.session_established_at().elapsed().as_secs())
                 .unwrap_or(0),
+            existing_link_age_secs: existing
+                .map(|p| p.link_established_at().elapsed().as_secs())
+                .unwrap_or(0),
             has_session: existing.map(|p| p.has_session()).unwrap_or(false),
             pending_new_session: existing
                 .map(|p| p.pending_new_session().is_some())
@@ -1029,6 +1032,18 @@ impl Node {
                         }
                         let _ = self.index_allocator.free(idx);
                     }
+                }
+
+                // A pending must not be armed beside a drain: its adoption
+                // moves the current session into the previous slot, and the
+                // session still there would keep its index registered with
+                // nothing left to free it. The classifier answers only once
+                // the drain window has passed, but the drain is completed
+                // on the next rekey tick, so complete it here, by the same
+                // route the tick takes.
+                if self.peers.get(&peer).is_some_and(|p| p.is_draining()) {
+                    self.route_rekey_cadence(peer, crate::proto::fmp::ConnAction::Drain { peer })
+                        .await;
                 }
 
                 // Rekey: process as responder, store new session as pending.

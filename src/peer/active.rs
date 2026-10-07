@@ -267,6 +267,11 @@ pub struct ActivePeer {
     // === Rekey (Key Rotation) ===
     /// When the current Noise session was established (for rekey timer).
     session_established_at: Instant,
+    /// When this peering's link came up: set at promotion, and again when a
+    /// pending session whose msg2 revealed a peer restart leaves the slot.
+    /// A rekey cutover, an adoption or a cross-connection swap does not
+    /// move it.
+    link_established_at: Instant,
     /// Per-session symmetric jitter applied to the rekey timer trigger.
     /// Drawn once at construction (and at each cutover) uniformly from
     /// `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`. Desynchronizes
@@ -342,6 +347,7 @@ impl ActivePeer {
             handshake_msg2: None,
             setup_msg1: None,
             session_established_at: now,
+            link_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
             rekey_in_progress: false,
             last_peer_rekey: None,
@@ -429,6 +435,7 @@ impl ActivePeer {
             handshake_msg2: None,
             setup_msg1: None,
             session_established_at: now,
+            link_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
             rekey_in_progress: false,
             last_peer_rekey: None,
@@ -1018,16 +1025,39 @@ impl ActivePeer {
         self.session_established_at
     }
 
+    /// When this peering's link came up: at promotion, or when a pending
+    /// session that revealed a peer restart left the slot. Unlike
+    /// [`session_established_at`](Self::session_established_at), a rekey
+    /// cutover does not move it.
+    pub fn link_established_at(&self) -> Instant {
+        self.link_established_at
+    }
+
     /// Test-only seam: backdate the session-established instant so a test can
-    /// construct a session that reads as `age`-old. This only shifts the
-    /// private timestamp field; it changes no decision logic, no threshold, and
-    /// is compiled out of release builds.
+    /// construct a session that reads as `age`-old. The link instant is moved
+    /// back with it when it would otherwise be the younger of the two, since
+    /// a link is never younger than its session. This only shifts the private
+    /// timestamp fields; it changes no decision logic, no threshold, and is
+    /// compiled out of release builds.
     #[cfg(test)]
     pub(crate) fn test_backdate_session_established(&mut self, age: std::time::Duration) {
         self.session_established_at = self
             .session_established_at
             .checked_sub(age)
             .unwrap_or_else(Instant::now);
+        self.link_established_at = self.link_established_at.min(self.session_established_at);
+    }
+
+    /// Test-only seam: backdate the start of the drain a cutover began, so a
+    /// test can stand up a drain window that has passed but that no rekey
+    /// tick has completed yet. A no-op when no drain is in progress. Compiled
+    /// out of release builds.
+    #[cfg(test)]
+    pub(crate) fn test_backdate_drain_started(&mut self, age: Duration) {
+        self.send.drain_started = self
+            .send
+            .drain_started
+            .map(|t| t.checked_sub(age).unwrap_or_else(Instant::now));
     }
 
     /// Test-only seam: backdate the pending session's install time so a test
@@ -1279,7 +1309,17 @@ impl ActivePeer {
     /// Clear what is recorded beside the pending slot: its role and install
     /// time, and the answer that armed it, of which only the msg1 digest is
     /// kept, as an ended cycle. Every path that empties the slot calls this.
+    ///
+    /// A pending whose msg2 revealed a peer restart
+    /// ([`note_restart`](Self::note_restart)) restarts the link's age as it
+    /// leaves: the restarted peer promoted our msg1 as a fresh link, so its
+    /// dials may cross ours for the next 30 s. While it is held, the old
+    /// link age stands and a msg1 from that peer is refused as arriving
+    /// with a pending held.
     fn release_pending(&mut self) {
+        if self.pending_restart {
+            self.link_established_at = Instant::now();
+        }
         self.pending_role = None;
         self.pending_since = None;
         self.pending_restart = false;
@@ -2110,6 +2150,102 @@ mod tests {
                 .ok()
         });
         assert_eq!(cur_pt.as_deref(), Some(&b"steady"[..]));
+    }
+
+    /// Whether `peer`'s link instant reads at least `age` old.
+    fn link_at_least(peer: &ActivePeer, age: Duration) -> bool {
+        peer.link_established_at().elapsed() >= age
+    }
+
+    /// The link instant is set at construction and is not moved by an
+    /// initiator cutover, an adoption of the peer's rekey, or a
+    /// cross-connection swap, each of which restarts the session instant.
+    /// A pending whose msg2 revealed a peer restart leaves it alone while
+    /// held, and restarts it when it is cut over, adopted or abandoned.
+    #[test]
+    fn the_link_instant_is_set_at_construction_and_kept_through_initiator_cutover_peer_adoption_and_cross_connection_swap_but_reset_when_a_revealed_restart_leaves_the_slot()
+     {
+        let aged = Duration::from_secs(5);
+        let fresh = Duration::from_secs(1);
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        assert!(
+            peer.link_established_at().elapsed() < fresh,
+            "construction sets the link instant"
+        );
+        peer.test_backdate_session_established(aged);
+
+        let (_s, pend_recv) = ik_session_pair();
+        peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert!(peer.cutover_to_new_session().is_some());
+        assert!(peer.session_established_at().elapsed() < fresh);
+        assert!(
+            link_at_least(&peer, aged),
+            "initiator cutover kept the link"
+        );
+
+        let (_s, pend_recv) = ik_session_pair();
+        peer.answer_rekey(
+            pend_recv,
+            SessionIndex::new(5),
+            SessionIndex::new(6),
+            answer(),
+        );
+        assert!(peer.adopt_pending(false).is_some());
+        assert!(peer.session_established_at().elapsed() < fresh);
+        assert!(link_at_least(&peer, aged), "adoption kept the link");
+
+        let (_s, swap) = ik_session_pair();
+        peer.replace_session(swap, SessionIndex::new(7), SessionIndex::new(8));
+        assert!(
+            link_at_least(&peer, aged),
+            "a cross-connection swap kept the link"
+        );
+
+        type Exit = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let exits: [(&str, Exit); 3] = [
+            ("cutover", ActivePeer::cutover_to_new_session),
+            ("adopt", |p| p.adopt_pending(false)),
+            ("abandon", ActivePeer::abandon_rekey),
+        ];
+        for (name, exit) in exits {
+            let (_cur_send, cur_recv) = ik_session_pair();
+            let mut peer = peer_with_current(cur_recv);
+            peer.test_backdate_session_established(aged);
+            let (_s, pend_recv) = ik_session_pair();
+            peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+            peer.note_restart();
+            assert!(
+                link_at_least(&peer, aged),
+                "{name}: the link keeps its age while the restart pending is held"
+            );
+            assert!(exit(&mut peer).is_some(), "{name}: the pending must exit");
+            assert!(
+                peer.link_established_at().elapsed() < fresh,
+                "{name}: the restart pending leaving the slot restarts the link"
+            );
+        }
+    }
+
+    /// Backdating the session moves the link instant back with it when the
+    /// link would otherwise read younger, and never moves it forward.
+    #[test]
+    fn backdating_the_session_never_leaves_the_link_younger_than_the_session() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.test_backdate_session_established(Duration::from_secs(40));
+        assert!(peer.link_established_at() <= peer.session_established_at());
+        assert!(link_at_least(&peer, Duration::from_secs(40)));
+
+        let (_s, pend_recv) = ik_session_pair();
+        peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert!(peer.cutover_to_new_session().is_some());
+        peer.test_backdate_session_established(Duration::from_secs(12));
+        assert!(
+            link_at_least(&peer, Duration::from_secs(40)),
+            "a smaller backdate after a cutover leaves the older link as it was"
+        );
+        assert!(peer.link_established_at() <= peer.session_established_at());
     }
 
     /// A stand-in for the answer a responder records when it arms a pending.
