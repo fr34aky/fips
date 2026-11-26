@@ -595,7 +595,8 @@ impl Node {
                     let better = match best_scoped {
                         None => true,
                         Some((best_plen, best_id, _)) => {
-                            plen > best_plen || (plen == best_plen && id.as_u32() < best_id.as_u32())
+                            plen > best_plen
+                                || (plen == best_plen && id.as_u32() < best_id.as_u32())
                         }
                     };
                     if better {
@@ -1683,16 +1684,15 @@ impl Node {
     fn record_lan_sighting(&mut self, peer: &crate::mdns::LanDiscoveredPeer) {
         const LAN_SEEN_CAP: usize = 256;
         let now_ms = Self::now_ms();
-        let entry = self
-            .lan_seen
-            .entry(peer.npub.clone())
-            .or_insert_with(|| crate::control::snapshot::LanSeenRow {
+        let entry = self.lan_seen.entry(peer.npub.clone()).or_insert_with(|| {
+            crate::control::snapshot::LanSeenRow {
                 npub: peer.npub.clone(),
                 addr: String::new(),
                 scope: None,
                 first_seen_ms: now_ms,
                 last_seen_ms: now_ms,
-            });
+            }
+        });
         entry.addr = peer.addr.to_string();
         entry.scope = peer.scope.clone();
         entry.last_seen_ms = now_ms;
