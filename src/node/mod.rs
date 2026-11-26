@@ -4086,6 +4086,12 @@ impl Node {
     /// same channel. The embedder should push only `fd00::/8`-destined IPv6
     /// packets, expect ICMPv6 errors on `app_inbound_rx`, and clamp TCP MSS on
     /// SYN-flagged segments in both directions.
+    ///
+    /// For the outbound direction, [`Self::tun_packet_processor`] does that
+    /// filtering and clamping exactly as the system-TUN reader would: run it
+    /// on each packet read from the fd before pushing into `app_outbound_tx`.
+    /// It does not cover the inbound direction; packets from `app_inbound_rx`
+    /// still reach the fd unclamped unless the embedder clamps them.
     pub fn enable_app_owned_tun(&mut self) -> (TunOutboundTx, std::sync::mpsc::Receiver<Vec<u8>>) {
         let tun_channel_size = self.config().node.buffers.tun_channel;
         // app → mesh: the app pushes; `run_rx_loop` drains `tun_outbound_rx`.
@@ -4284,6 +4290,25 @@ impl Node {
     /// that rebuilds the node must fetch it again.
     pub fn netmon_trigger(&self) -> NetmonTrigger {
         self.netmon_trigger.clone()
+    }
+
+    /// The outbound per-packet pipeline for an app-owned TUN embedder
+    /// ([`Self::enable_app_owned_tun`]): destination filter, self-hairpin,
+    /// per-flow TCP MSS clamp and ICMPv6 unreachable, the same decisions the
+    /// system-TUN reader makes. The clamp is what an embedder cannot do
+    /// alone: the ceiling for a destination is the path MTU the node has
+    /// learned for it (on a BLE link routinely below the IPv6 minimum, where
+    /// no Packet Too Big can bring a host's TCP down to it), and that map is
+    /// the node's. Call after [`Self::start`]; cheap to clone. It reads the
+    /// node's live ceiling, which tracks the bound transports' MTU floor
+    /// exactly as the system-TUN reader's does, so one processor stays
+    /// correct for the node's whole run.
+    pub fn tun_packet_processor(&self) -> crate::ipv6tun::tun::TunPacketProcessor {
+        crate::ipv6tun::tun::TunPacketProcessor::new(
+            self.tun_mss_ceiling.clone(),
+            *self.identity().address(),
+            self.path_mtu_lookup.clone(),
+        )
     }
 
     // === Sending ===

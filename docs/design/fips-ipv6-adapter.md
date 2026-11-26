@@ -360,10 +360,18 @@ system TUN's reader and writer. Nor does FIPS refuse an off-mesh destination up
 front: `handle_tun_outbound` looks up bytes 1 to 15 of any destination in the
 identity cache, and on a miss answers with ICMPv6
 Destination Unreachable on `app_inbound_rx`, sourced from the node's own mesh
-address. An oversize packet gets Packet Too Big on the same channel. The
-embedder is therefore responsible for routing only `fd00::/8` to its TUN, for
-expecting ICMPv6 errors on `app_inbound_rx`, and for clamping TCP MSS on
-SYN-flagged segments in both directions.
+address. An oversize packet gets Packet Too Big on the same channel.
+
+To restore the system TUN's outbound pipeline, the embedder calls
+`Node::tun_packet_processor()` after `start()` and runs
+`TunPacketProcessor::process()` on each packet read from its fd. The
+returned `TunPacketAction` says what the Reader Thread would have done:
+`Forward` (push into `app_outbound_tx`; TCP MSS already clamped in place, using
+the node's live per-destination path-MTU map), `Hairpin` / `Respond` (write back
+to the fd), or `Drop`. Alternatively the embedder may implement the filter and
+clamp itself — routing only `fd00::/8` to its TUN, expecting ICMPv6 errors on
+`app_inbound_rx`, and clamping TCP MSS on SYN-flagged segments in both
+directions — but the processor keeps the two paths byte-identical.
 
 ### App-Owned DNS Path (embedded hosts)
 
